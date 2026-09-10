@@ -17,6 +17,18 @@
 - **高性能**：缓存命中 p50 0.1ms，QPS 5.8 万，10 分钟 3500 万查询 0 错误
 - **稳定**：崩溃自动重启、缓存持久化跨重启恢复、上游熔断降级
 
+WEB运行截图
+<img width="2560" height="1294" alt="8b7fd55aebaabd3c6b02dbf5cebad588" src="https://github.com/user-attachments/assets/04e6dcbb-b222-491a-80c7-118b15af7561" />
+
+<img width="2560" height="1294" alt="a83d7ef15e3db57cb7e31a933e20700d" src="https://github.com/user-attachments/assets/1cb773c9-506b-420a-86f4-cc0b5c3a22e2" />
+
+<img width="2560" height="2303" alt="f30077ac6517da6edcd01c02f1c0602f" src="https://github.com/user-attachments/assets/34b6f35f-e5f5-4360-b761-395223d281b7" />
+
+<img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
+
+<img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
+
+
 ## 1. 架构（实际实现路径）
 
 ```
