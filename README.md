@@ -31,6 +31,8 @@ WEB运行截图
 <img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
 
 
+---
+
 ## 1. 架构（实际实现路径）
 
 ```
@@ -309,7 +311,7 @@ ebpdns/
 ## 12. 已知限制
 
 - 解析结果为“精简应答”（SmartDNS 风格，只返回目标类型地址并择优），不完整透传 CNAME 链；对大多数客户端无影响
-- DoH/DoT 上游使用 hostname 时依赖系统 DNS 解析（daemon 自身即可作为其解析来源，建议保留一个 UDP 上游）
+- DoH/DoT 上游使用 hostname 时依赖系统 DNS 解析 ~~（v1.9.42 已通过 Bootstrap 解析器解决：启动时用 UDP 上游预解析 hostname 为 IP，后续连接用 IP+SNI，不再依赖系统 DNS）~~
 - 真实 XDP 内核直答需内核与网卡支持，属预留/进阶选项（`bpf/` 参考实现未集成到 daemon）
 - 未实现 DNSSEC 验证（转发型解析器典型取舍）
 
@@ -317,6 +319,10 @@ ebpdns/
 
 ## 13. 版本历史（要点）
 
+- **v1.9.42**：**Bootstrap 解析器（解决已知限制2）**。启动时用 UDP 上游（默认 223.5.5.5:53，可配置 `bootstrap_dns`）预解析所有 DoH/DoT 的 hostname，缓存 IP；后续 DoH/DoT 连接直接用 IP + SNI，彻底摆脱系统 `/etc/resolv.conf` 依赖。解析失败的上游自动回退系统 getaddrinfo，不影响启动。修复 `_is_hostname` 对 IPv6 地址的误判。
+- **v1.9.41**：全面检查与性能优化。① 规则匹配性能优化——allow 白名单检查移到规则缓存未命中后，hot path 不再每次遍历 allow 通配；② 10 分钟压测验证：3509 万查询 0 错误，QPS 58484，p50 0.1ms，峰值内存 160MB 稳定；③ API 联动性全量检查（10 端点全部正常）、缓存持久化+预取+规则联动验证、日志实时性验证、遥测数据一致性验证。
+- **v1.9.40**：Python GIL/性能优化。LRUCache 单锁改 8 分桶锁——不同域名的查询并行读写不同分桶，消除高并发缓存命中时的全局锁竞争。DoH/DoT 连接复用经核实已实现（_ConnPool 4 连接/key，30s 空闲回收，失效自动重建）。
+- **v1.9.39**：基于 v1.9.31 干净基线，新增两项功能。① **截断 TCP 回退**：UDP 上游返回 TC=1（truncated）时自动用 TCP 重试同一上游，获取完整应答（DNSSEC/大记录场景）；② **白名单动作**（allow）：allow 规则单独建索引，匹配时优先于 block/group/forceIp，命中即放行。前端逐条规则/导入下拉框均已加"放行(白名单)"选项。负缓存和 Top N 经核实 v1.9.31 已有。
 - **v1.9.17**：**TinyLFU protected 段（Caffeine 分段式）**。TinyLFUCache 三段化 window(1%)/probation(40% main)/protected(60% main)：① 命中即晋升（probation 命中→protected，protected 满挤队首回 probation）；② 准入逻辑修复——probation 有空间直进、main 总容量未满直进 protected 回填（修复"准入比较拒绝低频 candidate 后 window 少 1 且无回填→缓存永久缩水"，实测 300 容量缩水至 129，修复后满 300）、main 满才与 probation 队首做 CMS 频率准入（修复"低频突发流量绕过比较冲刷高频候选"）；③ recordWrite 语义：put 也计频（Caffeine 一致，新条目首次写入不再以 freq≈0 在准入中必输）。实测：Zipf(400域名/300容量压力) LRU 94.1% vs TinyLFU 93.9% 持平；80%热点/500容量 98.9% 持平；高频 key 经 2000 个低频突发域名冲击仍驻留 protected（保护段生效）。验证：新增 test_tinylfu_protected_segment 单测（晋升/保护/容量守恒/序列化兼容），35 单测全 PASS，ft28 39/39（tinylfu 配置下），热重载 lru→tinylfu 缓存重建端到端 OK；7127 轮压测零 ERROR/零重启/12-17k q/s。
 - **v1.9.16**：九项增强功能"选最优实现"落地（前段 v1.9.14/v1.9.15 为 geosite/geoip 分流、0x20 投毒防护、JSON 日志+metrics、高级规则、连接级健康度、Python 性能优化，交付未发版记录）。① **配置热重载**（POST /api/reload 与 SIGHUP 等价）：原子换配置引用、缓存容量即时调整、cache_policy 切换重建容器、geo 数据文件变化重建 GeoDB、规则索引重建，返回 changed 明细；② **上游熔断周期化**：`health_check_interval` 周期主动探测（前 3 个启用上游轮转探测 health_probe_domain，2s 超时），喂入既有熔断器（circuit_fails=3 / circuit_open_s=30），0=关闭；③ **规则订阅自动更新**（rule_sub_interval，0=关闭）：按 config 元信息重拉订阅覆盖 rules_sub.json 明细（独立文件，不写 config.json）；④ **CNAME 链跟踪/展开**：上游 NODATA 含 CNAME 回链、A/AAAA miss 路径递归展开（深度<8 防环）、`_fill_cache` 取链尾真实 A/AAAA 落缓存（修复缓存命中返回 CNAME 链头 bug）；⑤ **缓存分区**：PartitionedCache（默认 group 分区：domestic/global/其余，serialize 3 元组 key，restore 兼容旧 2 元组）；⑥ **DoH 连接复用**（_ConnPool 空闲超龄 30s 惰性回收；HTTP/2 多路复用未引入——环境无 h2 库、零依赖偏好下连接复用已覆盖主要收益，README 记录取舍）；⑦ **Top N 统计**（top_domains/top_clients/top_upstreams，Counter 上限 2048 超限裁剪低频一半防随机域名无限增长）；⑧ **TinyLFU/W-TinyLFU 淘汰**（`cache_policy: "tinylfu"`，Count-Min Sketch 频率估计 + W-TinyLFU 分段，命中率与 LRU 相当（20k 查询/80% 热点均 98.5%），Zipf 单测 TinyLFU 93.9% vs LRU 94.1% 无显著差异）；⑨ **多进程/multi-worker 与性能剖析**：选最优为"单进程 + 有界线程池"（Python GIL 下多进程各自独立缓存/统计 = 命中率下降，SO_REUSEPORT 多进程收益有限且复杂度高）+ `/api/profile` 性能剖析端点（cProfile 采样 N 秒默认 5 上限 30，返回 Top 25）。附带：api.py 历史隐患 `log` 未定义修复（AppContext.reload 触发 NameError）、doctest 前 end-to-end 验证（Top N/热重载/订阅自动更新/geo 自动更新/CNAME 链展开）。新增单测 test_new_features.py 6 用例全 PASS，既有单测全过，ft28 39/39。
 - **v1.8.7**：控制台「重启服务」按钮取消 confirm 确认框，点击直接调用后端异步重启（立即返回、控制台自动重连）。

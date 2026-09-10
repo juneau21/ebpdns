@@ -142,6 +142,17 @@ class Resolver:
         self._rule_match_cache = {}         # domain -> rule/None(哨兵), 规则重建时清空
         self._rule_cache_max = 8192
         self._rebuild_rule_index()
+        # Bootstrap 预解析: 用 UDP 上游解析所有 DoH/DoT hostname, 缓存 IP,
+        # 后续连接用 IP+SNI, 彻底摆脱系统 /etc/resolv.conf 依赖(限制2解决)。
+        # 解析失败的上游回退系统 getaddrinfo, 不影响启动。
+        try:
+            from . import upstream as _up_mod
+            _bs = cfg.get("bootstrap_dns", "223.5.5.5:53")
+            _n = _up_mod.bootstrap_resolve_all(cfg.get("upstreams", []), _bs)
+            if _n:
+                log.info("bootstrap 预解析 %d 个 DoH/DoT hostname → IP+SNI (bootstrap=%s)", _n, _bs)
+        except Exception as _e:
+            log.warning("bootstrap 预解析失败(回退系统DNS): %s", _e)
         # 上游熔断器: 连续失败达阈值则临时跳过该上游(open 期间), 防止单个
         # 不可达/故障上游拖垮所有 miss 查询; 成功后自动重置。
         self._cb_lock = threading.Lock()

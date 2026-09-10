@@ -19,6 +19,103 @@ from .dnsmsg import parse_tcp_frame, tcp_frame
 DOH_DEFAULT_PATH = "/dns-query"
 UA = "ebpdns/1.0 (Debian; SmartDNS-style resolver)"
 
+# ---------------- Bootstrap 解析器（摆脱系统 DNS 依赖） ----------------
+# 启动时用 UDP 上游预解析 DoH/DoT hostname，缓存 IP；连接时用 IP + SNI
+_bootstrap_cache = {}
+_bootstrap_lock = threading.Lock()
+
+
+def _is_hostname(s):
+    """判断是否为 hostname（非 IP 地址）。"""
+    try:
+        socket.inet_pton(socket.AF_INET, s)
+        return False
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, s)
+        return False
+    except OSError:
+        pass
+    return bool(s) and not s.startswith("[")
+
+
+def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
+    """用 UDP bootstrap DNS 解析 hostname，返回 IP 字符串或 None。
+
+    不依赖系统 /etc/resolv.conf，直接向 bootstrap_dns 发 DNS 查询。
+    结果缓存到 _bootstrap_cache，后续连接直接用 IP + SNI。
+    """
+    if not _is_hostname(host):
+        return host  # 已经是 IP
+    with _bootstrap_lock:
+        if host in _bootstrap_cache:
+            return _bootstrap_cache[host]
+    try:
+        bp_host, _, bp_port = bootstrap_dns.partition(":")
+        bp_port = int(bp_port) if bp_port else 53
+        # 构造 A 查询
+        labels = b"".join(bytes([len(p)]) + p.encode() for p in host.split("."))
+        q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(q, (bp_host, bp_port))
+        data, _ = s.recvfrom(65535)
+        s.close()
+        # 解析响应中的 A 记录
+        pos = 12
+        while data[pos]:
+            pos += data[pos] + 1
+        pos += 5  # 跳过 qname 结尾 + qtype+qclass
+        ancount = struct.unpack(">H", data[6:8])[0]
+        for _ in range(ancount):
+            # 跳过 name（可能是压缩指针）
+            if data[pos] & 0xC0:
+                pos += 2
+            else:
+                while data[pos]:
+                    pos += data[pos] + 1
+                pos += 1
+            rtype = struct.unpack(">H", data[pos:pos+2])[0]
+            rdlength = struct.unpack(">H", data[pos+8:pos+10])[0]
+            if rtype == 1 and rdlength == 4:
+                ip = socket.inet_ntoa(data[pos+10:pos+14])
+                with _bootstrap_lock:
+                    _bootstrap_cache[host] = ip
+                return ip
+            pos += 10 + rdlength
+    except Exception:
+        pass
+    return None
+
+
+def bootstrap_resolve_all(upstreams, bootstrap_dns="223.5.5.5:53"):
+    """预解析所有 DoH/DoT 上游的 hostname，缓存 IP。
+
+    启动时调用一次，后续连接直接用 IP + SNI，不依赖系统 DNS。
+    解析失败的上游回退到系统 getaddrinfo（不影响启动）。
+    """
+    resolved = 0
+    for up in upstreams:
+        proto = str(up.get("proto", "")).lower()
+        if proto not in ("doh", "dot", "doh3", "doq"):
+            continue
+        host, _ = _host_port(up)
+        if not _is_hostname(host):
+            continue
+        ip = bootstrap_resolve(host, bootstrap_dns)
+        if ip:
+            resolved += 1
+    return resolved
+
+
+def _bootstrap_ip(host):
+    """获取 hostname 的 bootstrap 缓存 IP，无缓存返回 None。"""
+    if not _is_hostname(host):
+        return host
+    with _bootstrap_lock:
+        return _bootstrap_cache.get(host)
+
 
 def _host_port(up):
     addr = up.get("addr", "")
@@ -146,6 +243,15 @@ def discard_upstream_conns(up):
 
 
 def _doh_conn(host, port, timeout):
+    """创建 DoH HTTPS 连接。
+
+    若 hostname 已通过 bootstrap 预解析为 IP，用 IP 连接 + SNI=hostname，
+    彻底摆脱系统 DNS 依赖；否则回退到 hostname 直连（系统 getaddrinfo）。
+    """
+    ip = _bootstrap_ip(host)
+    if ip and ip != host:
+        # 用 IP 连接，SNI 设为原始 hostname（TLS 证书校验需要）
+        return http.client.HTTPSConnection(ip, port, timeout=timeout, server_hostname=host)
     return http.client.HTTPSConnection(host, port, timeout=timeout)
 
 
@@ -222,7 +328,14 @@ def _doh_query(up, query_bytes, timeout_ms):
 
 
 def _dot_conn(host, port, timeout):
-    sock = socket.create_connection((host, port), timeout=timeout)
+    """创建 DoT TLS 连接。
+
+    若 hostname 已通过 bootstrap 预解析为 IP，用 IP 连接 + SNI=hostname，
+    彻底摆脱系统 DNS 依赖；否则回退到 hostname 直连（系统 getaddrinfo）。
+    """
+    ip = _bootstrap_ip(host)
+    connect_host = ip if ip else host
+    sock = socket.create_connection((connect_host, port), timeout=timeout)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -293,10 +406,6 @@ def _dot_query(up, query_bytes, timeout_ms):
         except Exception:
             pass
         return False, None
-
-
-def _is_hostname(host):
-    return not host.replace(".", "").isdigit()
 
 
 # ---------------- UDP / TCP ---------------- #

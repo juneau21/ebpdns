@@ -25,6 +25,7 @@ DEFAULTS = {
     "health_check_interval": 30,     # 上游主动健康检查周期(秒), 0=关闭
     "health_probe_domain": "www.baidu.com",  # 健康检查探测域名(绕过分流规则直连上游)
     "health_probe_timeout_ms": 2000, # 健康检查探测超时(毫秒)
+    "bootstrap_dns": "223.5.5.5:53", # DoH/DoT hostname 预解析用的 UDP bootstrap DNS, 摆脱系统DNS依赖
     "rule_sub_interval": 3600,       # 规则订阅自动更新周期(秒), 0=关闭
     "ttl": 300,
     "ttl_min": 0,                # 下发 TTL 下限(秒), 0=不限制; 内网客户端收到的应答 TTL 不低于此值
