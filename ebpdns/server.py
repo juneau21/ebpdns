@@ -4,7 +4,9 @@ import logging
 import os
 import socket
 import socketserver
+import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import dnsmsg
@@ -184,6 +186,10 @@ class _TCPRequestHandler(socketserver.BaseRequestHandler):
 class TCPDNSServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # 绑定失败重试: 重启时旧进程 socket 可能仍在 TIME_WAIT, 重试 3 次(间隔 200ms)
+    # 覆盖绝大多数 systemd 快速重启场景, 避免 TCP6/TCP 端口冲突告警
+    _bind_retries = 3
+    _bind_retry_interval = 0.2
 
     def __init__(self, resolver, spec):
         self.resolver = resolver
@@ -191,6 +197,34 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
         if is_ipv6_host(host):
             self.address_family = socket.AF_INET6
         super().__init__((host, port), _TCPRequestHandler)
+
+    def server_bind(self):
+        """绑定 socket, 失败时自动重试(解决重启 TIME_WAIT 端口冲突)。"""
+        last_err = None
+        for attempt in range(self._bind_retries):
+            try:
+                # SO_REUSEPORT: 允许新旧进程同时绑定同一端口(内核负载均衡),
+                # 重启时新进程无需等待旧进程释放, 零停机切换
+                try:
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except (AttributeError, OSError):
+                    pass  # 内核不支持 SO_REUSEPORT 时跳过
+                super().server_bind()
+                return
+            except OSError as e:
+                last_err = e
+                if attempt < self._bind_retries - 1:
+                    time.sleep(self._bind_retry_interval)
+        raise last_err
+
+    def server_close(self):
+        """关闭时设置 SO_LINGER=0, 避免 TIME_WAIT 占用端口(加速重启)。"""
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                   struct.pack("ii", 1, 0))
+        except (AttributeError, OSError):
+            pass
+        super().server_close()
 
 
 class DNSServer:

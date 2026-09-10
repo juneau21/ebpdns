@@ -882,7 +882,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.42";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.43";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
 const API = {
   async req(method, path, body){

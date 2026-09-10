@@ -1,7 +1,5 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
-请注意！！！所有代码来源豆包模型，软件已稳定运行，后续几乎不会更新
-
 把「ebpdns · eBPF 版 SmartDNS 解析器控制台」从浏览器内仿真升级为**真实可部署的 DNS 解析软件**。
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT）
@@ -10,26 +8,6 @@
 - 内置 **HTTP JSON API + Web 控制台**：控制台连上后端即为真实数据（REAL 模式），后端不可达时自动降级为浏览器内仿真（SIM 模式）
 - 可选 **eBPF XDP 内核旁路**（`bpf/`）：`bpf/` 目录为参考实现、当前**未集成**到 daemon 运行路径，默认部署即为上方用户态路径
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
-
----
-- **六协议上游**：UDP/TCP/DoH/DoT/DoQ/DoH3，连接复用 + 熔断
-- **智能解析**：测速择优、域名分流、TTL 管控、预取、负缓存、双栈智能
-- **零依赖**：纯 Python 标准库，systemd 一键部署
-- **Web 控制台**：实时遥测、查询控制台、配置管理、分流规则
-- **高性能**：缓存命中 p50 0.1ms，QPS 5.8 万，10 分钟 3500 万查询 0 错误
-- **稳定**：崩溃自动重启、缓存持久化跨重启恢复、上游熔断降级
-
-WEB运行截图
-<img width="2560" height="1294" alt="8b7fd55aebaabd3c6b02dbf5cebad588" src="https://github.com/user-attachments/assets/04e6dcbb-b222-491a-80c7-118b15af7561" />
-
-<img width="2560" height="1294" alt="a83d7ef15e3db57cb7e31a933e20700d" src="https://github.com/user-attachments/assets/1cb773c9-506b-420a-86f4-cc0b5c3a22e2" />
-
-<img width="2560" height="2303" alt="f30077ac6517da6edcd01c02f1c0602f" src="https://github.com/user-attachments/assets/34b6f35f-e5f5-4360-b761-395223d281b7" />
-
-<img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
-
-<img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
-
 
 ---
 
@@ -319,6 +297,7 @@ ebpdns/
 
 ## 13. 版本历史（要点）
 
+- **v1.9.43**：**TCP 端口冲突自愈**。TCP 服务器新增三重机制解决重启时 `Address already in use`：① SO_REUSEPORT 允许新旧进程同时绑定（内核负载均衡，零停机切换）；② 绑定失败自动重试 3 次（间隔 200ms，覆盖 TIME_WAIT 场景）；③ 关闭时 SO_LINGER=0 避免 TIME_WAIT 占用端口。TCP6/TCP 重启不再端口冲突。
 - **v1.9.42**：**Bootstrap 解析器（解决已知限制2）**。启动时用 UDP 上游（默认 223.5.5.5:53，可配置 `bootstrap_dns`）预解析所有 DoH/DoT 的 hostname，缓存 IP；后续 DoH/DoT 连接直接用 IP + SNI，彻底摆脱系统 `/etc/resolv.conf` 依赖。解析失败的上游自动回退系统 getaddrinfo，不影响启动。修复 `_is_hostname` 对 IPv6 地址的误判。
 - **v1.9.41**：全面检查与性能优化。① 规则匹配性能优化——allow 白名单检查移到规则缓存未命中后，hot path 不再每次遍历 allow 通配；② 10 分钟压测验证：3509 万查询 0 错误，QPS 58484，p50 0.1ms，峰值内存 160MB 稳定；③ API 联动性全量检查（10 端点全部正常）、缓存持久化+预取+规则联动验证、日志实时性验证、遥测数据一致性验证。
 - **v1.9.40**：Python GIL/性能优化。LRUCache 单锁改 8 分桶锁——不同域名的查询并行读写不同分桶，消除高并发缓存命中时的全局锁竞争。DoH/DoT 连接复用经核实已实现（_ConnPool 4 连接/key，30s 空闲回收，失效自动重建）。
