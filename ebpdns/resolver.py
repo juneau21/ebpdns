@@ -148,9 +148,11 @@ class Resolver:
         try:
             from . import upstream as _up_mod
             _bs = cfg.get("bootstrap_dns", "223.5.5.5:53")
+            _total = len([u for u in cfg.get("upstreams", [])
+                          if str(u.get("proto", "")).lower() in ("doh","dot","doh3","doq")
+                          and _up_mod._is_hostname(_up_mod._host_port(u)[0])])
             _n = _up_mod.bootstrap_resolve_all(cfg.get("upstreams", []), _bs)
-            if _n:
-                log.info("bootstrap 预解析 %d 个 DoH/DoT hostname → IP+SNI (bootstrap=%s)", _n, _bs)
+            log.info("bootstrap 预解析: %d/%d 个 DoH/DoT hostname → IP+SNI (bootstrap=%s, 并发≤5s)", _n, _total, _bs)
         except Exception as _e:
             log.warning("bootstrap 预解析失败(回退系统DNS): %s", _e)
         # 上游熔断器: 连续失败达阈值则临时跳过该上游(open 期间), 防止单个

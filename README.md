@@ -1,5 +1,6 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
-请注意！！！所有代码来源豆包模型，软件已稳定运行，后续几乎不会更新
+
+请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT）
 - 复刻 SmartDNS 的**测速择优、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
@@ -25,6 +26,7 @@ WEB运行截图
 <img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
 
 <img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
+
 
 
 ---
@@ -315,6 +317,7 @@ ebpdns/
 
 ## 13. 版本历史（要点）
 
+- **v1.9.44**：**Bootstrap 并发解析（修复启动延迟 46 秒）**。Bootstrap 预解析从串行改为线程池并发，单查询超时 2s，总上限 5s；不可达 DNS 时 15 个 hostname 从 45 秒降至 5 秒。日志始终输出 `X/Y` 解析结果（0 个也输出，方便排查）。
 - **v1.9.43**：**TCP 端口冲突自愈**。TCP 服务器新增三重机制解决重启时 `Address already in use`：① SO_REUSEPORT 允许新旧进程同时绑定（内核负载均衡，零停机切换）；② 绑定失败自动重试 3 次（间隔 200ms，覆盖 TIME_WAIT 场景）；③ 关闭时 SO_LINGER=0 避免 TIME_WAIT 占用端口。TCP6/TCP 重启不再端口冲突。
 - **v1.9.42**：**Bootstrap 解析器（解决已知限制2）**。启动时用 UDP 上游（默认 223.5.5.5:53，可配置 `bootstrap_dns`）预解析所有 DoH/DoT 的 hostname，缓存 IP；后续 DoH/DoT 连接直接用 IP + SNI，彻底摆脱系统 `/etc/resolv.conf` 依赖。解析失败的上游自动回退系统 getaddrinfo，不影响启动。修复 `_is_hostname` 对 IPv6 地址的误判。
 - **v1.9.41**：全面检查与性能优化。① 规则匹配性能优化——allow 白名单检查移到规则缓存未命中后，hot path 不再每次遍历 allow 通配；② 10 分钟压测验证：3509 万查询 0 错误，QPS 58484，p50 0.1ms，峰值内存 160MB 稳定；③ API 联动性全量检查（10 端点全部正常）、缓存持久化+预取+规则联动验证、日志实时性验证、遥测数据一致性验证。

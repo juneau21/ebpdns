@@ -89,23 +89,34 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
     return None
 
 
-def bootstrap_resolve_all(upstreams, bootstrap_dns="223.5.5.5:53"):
-    """预解析所有 DoH/DoT 上游的 hostname，缓存 IP。
+def bootstrap_resolve_all(upstreams, bootstrap_dns="223.5.5.5:53", total_timeout=5.0):
+    """并发预解析所有 DoH/DoT 上游的 hostname，缓存 IP。
 
-    启动时调用一次，后续连接直接用 IP + SNI，不依赖系统 DNS。
+    使用线程池并发解析(替代串行), 总超时上限 total_timeout 秒,
+    避免 bootstrap DNS 不可达时逐个超时导致启动延迟几十秒。
     解析失败的上游回退到系统 getaddrinfo（不影响启动）。
     """
-    resolved = 0
+    hosts = []
     for up in upstreams:
         proto = str(up.get("proto", "")).lower()
         if proto not in ("doh", "dot", "doh3", "doq"):
             continue
         host, _ = _host_port(up)
-        if not _is_hostname(host):
-            continue
-        ip = bootstrap_resolve(host, bootstrap_dns)
-        if ip:
-            resolved += 1
+        if _is_hostname(host) and host not in hosts:
+            hosts.append(host)
+    if not hosts:
+        return 0
+    # 并发解析: 每个线程独立 socket, 单查询超时 2s, 总等待上限 total_timeout
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    resolved = 0
+    with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as ex:
+        futures = {ex.submit(bootstrap_resolve, h, bootstrap_dns, 2.0): h for h in hosts}
+        for fut in as_completed(futures, timeout=total_timeout):
+            try:
+                if fut.result():
+                    resolved += 1
+            except Exception:
+                pass
     return resolved
 
 

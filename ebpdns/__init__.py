@@ -7,5 +7,5 @@
   - 控制台:      内置 HTTP JSON API + Web 控制台
 """
 
-__version__ = "1.9.43"
+__version__ = "1.9.44"
 __appname__ = "ebpdns"
