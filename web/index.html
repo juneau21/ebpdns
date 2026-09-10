@@ -1,0 +1,2090 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ebpdns · eBPF 版 SmartDNS 解析器控制台 (Debian 部署版)</title>
+<script src="/echarts.min.js"></script>
+<style>
+
+/* ===================== 设计令牌 ===================== */
+:root{
+  --bg:#070b10; --bg2:#0a0f17; --panel:#0d141e; --panel2:#111a26; --panel3:#16212f;
+  --line:#1d2938; --line2:#2a3b4f;
+  --text:#e6eef6; --text2:#93a2b3; --text3:#5e6f82;
+  --cyan:#2ee6c8; --amber:#ffb454; --red:#ff6b5e; --green:#45d98c; --blue:#5b8def;
+  --font-ui:"Space Grotesk","Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text); font-family:var(--font-ui);
+  font-size:14px; line-height:1.55; overflow-x:auto;
+}
+body::before{ /* 微弱径向暗角 */
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:radial-gradient(1200px 700px at 22% -10%, rgba(46,230,200,0.05), transparent 60%),
+             radial-gradient(1000px 800px at 110% 110%, rgba(91,141,239,0.04), transparent 55%);
+}
+::selection{background:rgba(46,230,200,0.25)}
+a{color:var(--cyan); text-decoration:none}
+.mono{font-family:var(--font-mono)}
+
+/* ===================== 应用骨架 ===================== */
+.app{display:flex; min-width:1160px; height:100vh; position:relative; z-index:1}
+
+/* ---------- 侧栏 ---------- */
+.sidebar{
+  width:216px; flex:none; background:var(--bg2); border-right:1px solid var(--line);
+  display:flex; flex-direction:column; overflow-y:auto; position:relative;
+}
+.brand{display:flex; align-items:center; gap:10px; padding:18px 16px 14px; border-bottom:1px solid var(--line)}
+.brand-mark{width:34px;height:34px;flex:none;color:var(--cyan)}
+.brand-name{font-size:17px;font-weight:700;letter-spacing:.5px;line-height:1.1}
+.brand-name small{display:block;font-size:10px;font-weight:500;color:var(--text3);letter-spacing:1.5px;font-family:var(--font-mono)}
+.nav{padding:10px 8px; display:flex; flex-direction:column; gap:2px; flex:1}
+.nav-item{
+  display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:6px;
+  color:var(--text2); cursor:pointer; border:1px solid transparent; font-size:13px;
+  transition:background .15s,color .15s,border-color .15s;
+}
+.nav-item svg{width:17px;height:17px;flex:none;opacity:.85}
+.nav-item:hover{background:var(--panel); color:var(--text)}
+.nav-item.active{background:var(--panel); color:var(--text); border-color:var(--line2); box-shadow:inset 2px 0 0 var(--cyan)}
+.nav-item.active svg{color:var(--cyan); opacity:1}
+.side-foot{padding:12px 16px; border-top:1px solid var(--line); font-family:var(--font-mono); font-size:11px; color:var(--text3)}
+.side-foot .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px;vertical-align:1px}
+.side-foot .uptime{display:block;margin-top:3px}
+
+/* ---------- 主区 ---------- */
+.main{flex:1; min-width:0; display:flex; flex-direction:column; height:100vh}
+.topbar{
+  height:54px; flex:none; display:flex; align-items:center; gap:16px; padding:0 22px;
+  background:rgba(10,15,23,0.9); border-bottom:1px solid var(--line); position:relative;
+}
+.tb-title{font-size:15px; font-weight:700; letter-spacing:.3px}
+.tb-title small{display:block;font-size:11px;font-weight:400;color:var(--text3);font-family:var(--font-mono);letter-spacing:.3px}
+.tb-metrics{display:flex; align-items:center; gap:8px; margin-left:auto; flex-wrap:nowrap}
+.mchip{
+  display:flex; flex-direction:column; min-width:64px; padding:5px 10px; border:1px solid var(--line);
+  border-radius:6px; background:var(--panel); font-family:var(--font-mono);
+}
+.mchip .k{font-size:9px;color:var(--text3);letter-spacing:.8px;text-transform:uppercase}
+.mchip .v{font-size:13px;font-weight:500;color:var(--text)}
+.mchip .v.ok{color:var(--cyan)} .mchip .v.warn{color:var(--amber)}
+.tb-btn{
+  display:inline-flex; align-items:center; gap:6px; height:32px; padding:0 12px; border-radius:6px;
+  border:1px solid var(--line2); background:var(--panel2); color:var(--text2); cursor:pointer;
+  font-family:var(--font-ui); font-size:12px; transition:all .15s;
+}
+.tb-btn:hover{border-color:var(--cyan); color:var(--text)}
+.tb-btn svg{width:14px;height:14px}
+.tb-btn.primary{border-color:var(--cyan); color:var(--cyan)}
+.tb-btn.primary:hover{background:rgba(46,230,200,0.12)}
+
+/* ---------- 路由容器 ---------- */
+.routes{flex:1; min-height:0; overflow-y:auto; padding:22px; display:flex; flex-direction:column; gap:18px}
+.route{display:none; flex-direction:column; gap:18px; animation:fadein .22s ease}
+.route.active{display:flex}
+@keyframes fadein{from{opacity:0; transform:translateY(4px)} to{opacity:1; transform:none}}
+
+/* ---------- 卡片 ---------- */
+.card{background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden}
+.card-hd{display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line)}
+.card-hd .t{font-size:13px;font-weight:700}
+.card-hd .s{font-size:12px;color:var(--text2);font-family:var(--font-mono)}
+.card-hd .right{margin-left:auto; display:flex; align-items:center; gap:8px}
+.card-bd{padding:16px}
+.card-bd.flush{padding:0}
+.sec-label{
+  font-family:var(--font-mono); font-size:10px; letter-spacing:1.6px; text-transform:uppercase;
+  color:var(--text3); display:flex; align-items:center; gap:8px; margin-bottom:12px;
+}
+.sec-label::after{content:""; flex:1; height:1px; background:var(--line)}
+.kicker{font-family:var(--font-mono);font-size:10px;letter-spacing:1.8px;color:var(--cyan);text-transform:uppercase}
+
+/* ===================== 流水线视图 ===================== */
+.pl-card{position:relative; background:
+  linear-gradient(var(--line) 1px, transparent 1px) 0 0/100% 48px,
+  linear-gradient(90deg, var(--line) 1px, transparent 1px) 0 0/48px 100%,
+  var(--panel);
+}
+.pl-hd{display:flex; align-items:center; gap:14px; padding:14px 18px; border-bottom:1px solid var(--line); flex-wrap:wrap}
+.pl-hd .t{font-size:15px;font-weight:700}
+.pl-hd .s{font-family:var(--font-mono);font-size:11px;color:var(--text3)}
+.pl-hd .right{margin-left:auto; display:flex; align-items:center; gap:10px}
+.seg{display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden}
+.seg button{background:var(--panel2); color:var(--text2); border:none; padding:5px 12px; font-family:var(--font-mono); font-size:11px; cursor:pointer}
+.seg button.on{background:rgba(46,230,200,0.14); color:var(--cyan)}
+.seg button:not(:last-child){border-right:1px solid var(--line)}
+.status-pill{display:inline-flex; align-items:center; gap:6px; font-family:var(--font-mono); font-size:11px; padding:5px 10px; border-radius:20px; border:1px solid var(--line2)}
+.status-pill .dot{width:8px;height:8px;border-radius:50%}
+.status-pill.run .dot{background:var(--green); box-shadow:0 0 0 0 rgba(69,217,140,.5); animation:pulse 1.6s infinite}
+.status-pill.pause .dot{background:var(--amber)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(69,217,140,.45)} 70%{box-shadow:0 0 0 7px rgba(69,217,140,0)} 100%{box-shadow:0 0 0 0 rgba(69,217,140,0)}}
+
+#pipeline{position:relative; height:392px; overflow:hidden}
+#rail{position:absolute; inset:0}
+.stn{
+  position:absolute; transform:translate(-50%,-50%); text-align:center; z-index:2;
+  background:linear-gradient(180deg, var(--panel2), var(--panel)); border:1px solid var(--line2);
+  border-radius:7px; padding:9px 6px 8px;
+}
+.stn .ic{width:20px;height:20px;margin:0 auto 5px;color:var(--text2)}
+.stn .nm{font-size:12px;font-weight:700;line-height:1.15}
+.stn .sub{font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-top:3px;letter-spacing:.2px}
+.stn.hot .ic{color:var(--cyan)}
+.stn.hot .nm{color:var(--cyan)}
+.stn.warm .ic{color:var(--amber)}
+.stn.warm .nm{color:var(--amber)}
+.stn.small .nm{font-size:11px}
+.stn.dim{opacity:.5}
+.stn.bad .ic{color:var(--red)} .stn.bad .nm{color:var(--red)}
+.stn .rec{margin-top:4px; font-family:var(--font-mono); font-size:9px; color:var(--text3); background:rgba(0,0,0,.25); border:1px solid var(--line); border-radius:4px; padding:2px 5px; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.flow{position:absolute; z-index:1; pointer-events:none}
+.flow .ln{position:absolute; background:var(--text3)}
+.flow .hd{position:absolute; width:7px; height:7px; background:var(--text3); transform:rotate(45deg)}
+.flow.hit .ln,.flow.hit .hd{background:var(--cyan)}
+.flow.miss .ln,.flow.miss .hd{background:var(--amber)}
+.flow.back .ln,.flow.back .hd{background:var(--text3); opacity:.5}
+.flow.cyan .ln,.flow.cyan .hd{background:var(--cyan)}
+.flow.amber .ln,.flow.amber .hd{background:var(--amber)}
+.flow .ln.dash{background:none; border-top:1.5px dashed var(--text3); height:0}
+.flow.back .ln.dash{border-top-color:var(--text3)}
+.flow.cyan .ln.dash{border-top-color:var(--cyan)}
+.flow.amber .ln.dash{border-top-color:var(--amber)}
+
+/* 数据包 */
+.pkt{position:absolute; z-index:3; transform:translate(-50%,-50%); pointer-events:none; width:0; height:0}
+.pkt .pkt-dot{
+  position:absolute; left:-4.5px; top:-4.5px; width:9px; height:9px; border-radius:50%;
+  border:2px solid var(--cyan); background:var(--cyan);
+}
+.pkt .pkt-label{
+  position:absolute; left:0; top:-19px; transform:translateX(-50%); white-space:nowrap;
+  font-family:var(--font-mono); font-size:9.5px; color:var(--text); background:rgba(7,11,16,0.82);
+  border:1px solid var(--line2); padding:1px 5px; border-radius:3px;
+}
+.pl-legend{display:flex; gap:18px; flex-wrap:wrap; padding:10px 18px; border-top:1px solid var(--line); font-family:var(--font-mono); font-size:11px; color:var(--text3)}
+.pl-legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+
+/* ===================== 日志控制台 ===================== */
+.console{
+  background:#070b10; border:1px solid var(--line); border-radius:8px; overflow:hidden;
+  font-family:var(--font-mono); font-size:11.5px; line-height:1.7;
+}
+.console-hd{display:flex; align-items:center; gap:8px; padding:8px 14px; background:var(--panel2); border-bottom:1px solid var(--line); font-size:11px; color:var(--text3); font-family:var(--font-mono)}
+.console-hd .c-dot{width:8px;height:8px;border-radius:50%;background:var(--line2)}
+.console-hd .c-dot.r{background:var(--red)} .console-hd .c-dot.y{background:var(--amber)} .console-hd .c-dot.g{background:var(--green)}
+.console-hd .right{margin-left:auto; color:var(--text3)}
+#console-body{height:252px; overflow-y:auto; padding:4px 14px 10px; font-size:13px}
+/* 实时查询日志: 八列表格(查询时间|客户端IP|域名|类型|上游解析|解析值IP|响应时间|规则匹配)
+   log-head 与 logline 共享同一 grid 列宽且都不带左右 padding(#console-body 已含 14px) →
+   栏名/筛选框/行内容三行严格对齐, 且填满容器 */
+.log-head, .logline{display:grid; grid-template-columns:106px 132px minmax(190px,2.2fr) 54px minmax(140px,1.6fr) minmax(120px,1.15fr) 80px minmax(110px,1fr); gap:8px; align-items:center}
+.log-head{padding:6px 0 4px; border-bottom:1px solid var(--line, rgba(255,255,255,.08)); font-size:12px; color:var(--text3); position:sticky; top:0; background:var(--bg, #0f1419); z-index:2; align-items:stretch}
+.log-head .lc{font-weight:700; letter-spacing:.5px; display:block; width:100%; box-sizing:border-box}
+.log-tools{display:flex; align-items:center; gap:8px}
+.log-search{width:250px; background:var(--bg); border:1px solid var(--line2); border-radius:6px; color:var(--text); font-family:var(--font-mono); font-size:12px; padding:5px 10px; outline:none}
+.log-search:focus{border-color:var(--cyan)}
+.btn.mini{padding:4px 10px; font-size:11px; border-radius:5px}
+.lc{min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-sizing:border-box}
+.lc-col{min-width:0; display:flex; flex-direction:column; gap:4px}
+.lc-col .lc-filter{width:100%; box-sizing:border-box; background:var(--bg); border:1px solid var(--line2); border-radius:4px; color:var(--text2); font-family:var(--font-mono); font-size:11px; padding:3px 6px; outline:none}
+.lc-col .lc-filter:focus{border-color:var(--cyan); color:var(--text)}
+.logline{min-height:22px; border-bottom:1px solid rgba(255,255,255,.04)}
+.lc.ts{color:var(--text3); font-family:var(--font-mono, monospace); font-size:12px}
+.lc.ip{color:var(--text2); font-family:var(--font-mono, monospace); font-size:12px}
+.lc.dm{color:var(--text1, #e6e9ef)}
+.lc.qt{color:var(--blue); font-weight:700; font-size:12px}
+.lc.up{color:var(--text2); font-size:12px}
+.lc.an{color:var(--cyan); font-family:var(--font-mono, monospace); font-size:12px}
+.lc.an .nx{color:var(--orange, #ff9f43); font-weight:700}
+.lc.la{text-align:right; color:var(--text2); font-size:12px}
+.lc.la .latv.hi{color:var(--red)}
+.lc.rl{color:var(--blue); font-family:var(--font-mono, monospace); font-size:11.5px; border-left:1px solid var(--line, rgba(255,255,255,.08)); padding-left:10px}
+.lc.rl .rlb{display:inline-block; background:rgba(94,129,244,.12); border:1px solid rgba(94,129,244,.3); color:var(--blue); border-radius:4px; padding:0 6px; font-size:11px; line-height:16px}
+.logline.hit{border-left:2px solid var(--cyan)} .logline.miss{border-left:2px solid var(--amber)}
+.logline.err{border-left:2px solid var(--red)} .logline.sys{border-left:2px solid var(--green)} .logline.rule{border-left:2px solid var(--blue)} .logline.warn{border-left:2px solid var(--amber)}
+.logline .lm{color:var(--text2)}
+
+/* ===================== 查询控制台 ===================== */
+.q-row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+.q-input{
+  flex:1; min-width:260px; background:var(--bg); border:1px solid var(--line2); border-radius:6px;
+  color:var(--text); font-family:var(--font-mono); font-size:14px; padding:10px 12px; outline:none;
+}
+.q-input:focus{border-color:var(--cyan)}
+select.q-sel{
+  background:var(--panel2); border:1px solid var(--line2); color:var(--text); border-radius:6px;
+  font-family:var(--font-mono); font-size:12px; padding:9px 10px; outline:none; cursor:pointer;
+}
+.btn{
+  display:inline-flex; align-items:center; gap:7px; border-radius:6px; padding:9px 16px; cursor:pointer;
+  border:1px solid var(--line2); background:var(--panel2); color:var(--text2); font-family:var(--font-ui);
+  font-size:13px; font-weight:500; transition:all .15s;
+}
+.btn:hover{border-color:var(--cyan); color:var(--text)}
+.btn svg{width:14px;height:14px}
+.btn.primary{background:rgba(46,230,200,0.14); border-color:var(--cyan); color:var(--cyan)}
+.btn.primary:hover{background:rgba(46,230,200,0.22)}
+.q-grid{display:grid; grid-template-columns:1.15fr .85fr; gap:18px; align-items:start}
+.q-steps{display:flex; flex-direction:column; gap:0; padding:6px 0}
+.q-step{display:flex; gap:12px; padding:7px 16px; border-left:2px solid var(--line); margin-left:12px; opacity:0; animation:stepin .25s ease forwards; font-family:var(--font-mono); font-size:12px}
+.q-step .st-time{color:var(--text3); flex:none}
+.q-step .st-tag{flex:none; width:44px; font-weight:700}
+.q-step.xdp .st-tag{color:var(--blue)} .q-step.bpf .st-tag{color:var(--cyan)}
+.q-step.eng .st-tag{color:var(--amber)} .q-step.ans .st-tag{color:var(--text2)}
+.q-step.ans-fail .st-tag{color:var(--red)} .q-step.ok .st-tag{color:var(--green)}
+.q-step.rule .st-tag{color:var(--blue)} .q-step.warn .st-tag{color:var(--red)}
+.q-step .st-txt{color:var(--text2)}
+@keyframes stepin{from{opacity:0; transform:translateX(-6px)} to{opacity:1; transform:none}}
+.q-result{display:none}
+.q-result.show{display:block}
+.res-head{display:flex; align-items:baseline; gap:10px; margin-bottom:12px}
+.res-head .domain{font-family:var(--font-mono); font-size:16px; font-weight:700}
+.res-head .rtype{font-family:var(--font-mono); font-size:12px; color:var(--text3)}
+.res-head .lat{font-family:var(--font-mono); font-size:12px; color:var(--amber); margin-left:auto}
+.res-tag{display:inline-block; font-family:var(--font-mono); font-size:10px; padding:3px 8px; border-radius:12px; border:1px solid}
+.res-tag.hit{color:var(--cyan); border-color:var(--cyan)}
+.res-tag.miss{color:var(--amber); border-color:var(--amber)}
+.res-tag.err{color:var(--red); border-color:var(--red)}
+table.tbl{width:100%; border-collapse:collapse; font-family:var(--font-mono); font-size:12px}
+.tbl th{text-align:left; color:var(--text3); font-weight:500; font-size:10px; letter-spacing:.8px; text-transform:uppercase; padding:8px 10px; border-bottom:1px solid var(--line)}
+.tbl td{padding:8px 10px; border-bottom:1px solid var(--line); color:var(--text2)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl td.ip{color:var(--text)}
+.tbl tr.choosed td{background:rgba(46,230,200,0.06); color:var(--text)}
+.tbl tr.choosed td.ip{color:var(--cyan)}
+.q-history{max-height:300px; overflow-y:auto}
+.empty{color:var(--text3); font-family:var(--font-mono); font-size:12px; text-align:center; padding:26px 0}
+
+/* ===================== 配置视图 ===================== */
+.cfg-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(460px,1fr)); gap:18px; align-items:start}
+.cfg-row{display:flex; align-items:center; gap:12px; padding:9px 0; border-bottom:1px solid var(--line)}
+.cfg-row:last-child{border-bottom:none}
+.cfg-row .lab{flex:1; font-size:13px}
+.cfg-row .lab small{display:block; color:var(--text3); font-size:11px; font-family:var(--font-mono); margin-top:1px}
+.cfg-row .val{display:flex; align-items:center; gap:8px}
+input.num{
+  width:88px; background:var(--bg); border:1px solid var(--line2); border-radius:6px; color:var(--text);
+  font-family:var(--font-mono); font-size:12px; padding:7px 9px; outline:none;
+}
+input.num:focus{border-color:var(--cyan)}
+input.text{
+  background:var(--bg); border:1px solid var(--line2); border-radius:6px; color:var(--text);
+  font-family:var(--font-mono); font-size:12px; padding:7px 9px; outline:none; width:150px;
+}
+input.text:focus{border-color:var(--cyan)}
+input[type=range]{accent-color:var(--cyan); width:120px}
+.switch{position:relative; width:36px; height:20px; flex:none}
+.switch input{opacity:0; width:0; height:0}
+.switch .sl{position:absolute; inset:0; background:var(--panel3); border:1px solid var(--line2); border-radius:20px; transition:.18s; cursor:pointer}
+.switch .sl::before{content:""; position:absolute; width:14px; height:14px; border-radius:50%; background:var(--text3); top:2px; left:2px; transition:.18s}
+.switch input:checked + .sl{background:rgba(46,230,200,0.25); border-color:var(--cyan)}
+.switch input:checked + .sl::before{transform:translateX(16px); background:var(--cyan)}
+.up-row{display:grid; grid-template-columns:auto 1.1fr .9fr .62fr 1fr auto auto; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line)}
+.up-row:last-child{border-bottom:none}
+.up-row .nm{font-size:12px; font-weight:600; min-width:74px}
+.up-row input.text{width:100%; min-width:0}
+.up-row .del{background:none; border:none; color:var(--text3); cursor:pointer; font-family:var(--font-mono); font-size:13px; padding:4px}
+.up-row .del:hover{color:var(--red)}
+.hint{font-family:var(--font-mono); font-size:11px; color:var(--text3); margin-top:10px; line-height:1.7}
+.cfg-actions{display:flex; gap:10px; align-items:center; padding:14px 16px; border-top:1px solid var(--line)}
+.cfg-actions .note{font-family:var(--font-mono); font-size:13px; color:var(--text2); margin-left:auto}
+
+/* ===================== 遥测视图 ===================== */
+.kpi-grid{display:grid; grid-template-columns:repeat(7,1fr); gap:12px}
+.kpi{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px}
+.kpi .k{font-family:var(--font-mono); font-size:10px; color:var(--text3); letter-spacing:.8px; text-transform:uppercase}
+.kpi .v{font-family:var(--font-mono); font-size:22px; font-weight:700; margin-top:6px; color:var(--text)}
+.kpi .v.cy{color:var(--cyan)} .kpi .v.am{color:var(--amber)} .kpi .v.gn{color:var(--green)} .kpi .v.rd{color:var(--red)} .kpi .v.bl{color:var(--blue)}
+.kpi .u{font-size:11px; color:var(--text3); margin-left:4px; font-weight:400}
+.kpi-rule .rs{display:flex; gap:12px; margin-top:8px; font-family:var(--font-mono); font-size:13px; color:var(--text3); flex-wrap:wrap}
+.kpi-rule .rs span.rd{color:var(--red)} .kpi-rule .rs span.cy{color:var(--cyan)} .kpi-rule .rs span.am{color:var(--amber)} .kpi-rule .rs span.gy{color:var(--text3)}
+.chart-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(380px,1fr)); gap:18px}
+.chart{width:100%; min-height:280px}
+.mapbar{height:14px; background:var(--bg); border:1px solid var(--line2); border-radius:8px; overflow:hidden; position:relative}
+.mapbar > span{display:block; height:100%; background:linear-gradient(90deg,var(--cyan),#2fb8a4); transition:width .4s}
+.map-info{display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:11px; color:var(--text3); margin-top:6px}
+
+/* ===================== 架构说明 ===================== */
+.arch-grid{display:grid; grid-template-columns:1.15fr .85fr; gap:18px; align-items:start}
+.arch-flow{display:flex; flex-direction:column; gap:0; padding:6px 0}
+.arch-node{display:flex; gap:14px; padding:12px 16px; border-left:2px solid var(--line2); margin-left:12px; position:relative}
+.arch-node .tag{flex:none; width:120px; font-family:var(--font-mono); font-size:10px; letter-spacing:.6px; color:var(--text3); text-transform:uppercase; padding-top:2px}
+.arch-node .bd h4{margin:0 0 4px; font-size:14px}
+.arch-node .bd p{margin:0; color:var(--text2); font-size:12.5px}
+.arch-node .bd p code{font-family:var(--font-mono); font-size:11px; background:var(--bg); border:1px solid var(--line); padding:1px 5px; border-radius:4px; color:var(--cyan)}
+.arch-node .bd ul{margin:6px 0 0; padding-left:18px; color:var(--text2); font-size:12px}
+.arch-node .bd ul li{margin:2px 0}
+.tag-sys{color:var(--blue)} .tag-xdp{color:var(--cyan)} .tag-bpf{color:var(--green)} .tag-usr{color:var(--amber)}
+.stack-list{display:flex; flex-direction:column; gap:0}
+.stack-row{display:flex; justify-content:space-between; align-items:center; padding:9px 0; border-bottom:1px solid var(--line); font-family:var(--font-mono); font-size:12px}
+.stack-row:last-child{border-bottom:none}
+.stack-row .l{color:var(--text2)} .stack-row .r{color:var(--text)}
+code.blk{display:block; background:#070b10; border:1px solid var(--line); border-radius:6px; padding:12px 14px; font-family:var(--font-mono); font-size:11.5px; color:var(--text2); line-height:1.8; overflow-x:auto; white-space:pre}
+code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{color:var(--amber)}
+
+/* ===================== 响应式 ===================== */
+@media (max-width:1280px){
+  .kpi-grid{grid-template-columns:repeat(3,1fr)}
+  .q-grid,.arch-grid{grid-template-columns:1fr}
+}
+
+.btn.danger{background:rgba(255,107,94,0.12); border-color:var(--red); color:var(--red)}
+.btn.danger:hover{background:rgba(255,107,94,0.20)}
+
+</style>
+<style>
+/* ===== v1.9.4 覆盖：显示框自适应屏幕 ===== */
+.chart-grid{grid-template-columns:repeat(auto-fit,minmax(300px,1fr));align-items:stretch}
+.chart{min-height:160px;height:auto;}
+#ch-up{min-height:320px;height:320px}
+/* 图表卡片宽高比 1:0.7 */
+.chart-grid .card{aspect-ratio:1/0.7;display:flex;flex-direction:column;overflow:hidden}
+.chart-grid .card-bd{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:center}
+.chart-grid .chart{flex:1;width:100%;min-height:0}
+/* KPI 指标条字体放大 */
+.kpi .k{font-size:12px}
+.kpi .v{font-size:28px}
+/* 顶栏(每个界面顶部)字体放大: 标题/副标题/右侧指标 */
+.tb-title{font-size:20px}
+.tb-title small{font-size:14px}
+.mchip .k{font-size:13px}
+.mchip .v{font-size:18px}
+.tb-metrics{gap:14px}
+/* 上游行 9 列: 开关|名称|协议|完整地址|端口|分组|基础延迟|连接健康度|删除
+   首尾列固定宽度(auto 会因表头空span与行控件宽度不同导致表头整体错位) */
+.up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px}
+/* 上游卡片跨满整行; 分流卡片从第 3 列(测速后)延伸到行尾, 宽屏 4 列下占满第 3、4 列 */
+.cfg-grid .card.up-card{grid-column:1/-1}
+.cfg-grid .card.rule-card{grid-column:3/-1}
+.cfg-grid .up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px !important}
+.cfg-grid .up-row input.text{width:100%; min-width:0}
+.cfg-grid .up-row select.q-sel{width:100%; min-width:0}
+.cfg-grid .up-row input.num{width:100%; min-width:0}
+.cfg-grid .up-row input.text[data-f="fulladdr"]{font-family:var(--font-mono); font-size:13.5px}
+/* 上游单行添加栏 */
+.up-add-row{display:flex;gap:10px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)}
+.up-add-row .text{flex:1;min-width:0}
+.up-add-row .btn{flex-shrink:0}
+/* 数据面流水线页字体放大 */
+.pl-hd .t{font-size:18px}
+.pl-hd .s{font-size:13px}
+.stn .nm{font-size:15px}
+.stn.small .nm{font-size:14px}
+.stn .sub{font-size:11.5px}
+.stn .ic{width:26px;height:26px}
+.stn .rec{font-size:11px}
+.pl-legend{font-size:13px}
+/* 实时日志框加高（自适应视口, 利用下方空白） */
+#console-body{height:min(60vh,560px)}
+/* 分流规则单行添加栏 */
+.rule-add-row{display:flex;gap:10px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)}
+.import-row{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;padding:8px 16px;border-bottom:1px solid var(--line);flex:1;min-width:0}
+.import-row .text{flex:1;min-width:0}
+.import-row .q-sel{flex:0 0 auto}
+.rule-add-row .text{flex:1;min-width:0}
+.rule-add-row .btn{flex-shrink:0}
+.sub-sec{border-bottom:1px solid var(--line);padding:10px 16px}
+.sub-hd{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--text1);margin-bottom:8px}
+.sub-hd small{font-weight:400;color:var(--text2);font-size:14px;letter-spacing:.2px}
+.sub-list{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.sub-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.02)}
+.sub-item .su{flex:1;min-width:0;font-family:var(--font-mono, monospace);font-size:12px;color:var(--cyan);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub-item .sm{flex:none;font-size:11px;color:var(--text3);white-space:nowrap}
+.sub-item .sm b{color:var(--text2)}
+.sub-item .btn{flex-shrink:0;padding:3px 10px;font-size:12px}
+.sub-item .del{margin-left:0}
+/* 配置页字体放大 */
+.cfg-grid .card-hd .t{font-size:20px}
+.cfg-grid .card-hd .s{font-size:15px}
+.cfg-grid .up-row{font-size:14.5px}
+.cfg-grid .up-row .text{font-size:14.5px;padding:6px 8px}
+.cfg-grid .up-row .q-sel{font-size:14.5px;padding:5px 8px}
+.cfg-grid .up-row .num{font-size:14.5px;padding:5px 8px}
+.cfg-grid .up-row .conn-badge{flex:none;font-family:var(--font-mono);font-size:11px;color:var(--text3);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;white-space:nowrap}
+.conn-badge.ok{color:var(--green);border-color:rgba(82,196,26,.4)}
+.conn-badge.slow{color:var(--amber);border-color:rgba(250,173,20,.4)}
+.conn-badge.bad{color:var(--red);border-color:rgba(234,102,104,.5)}
+.lat-pending{display:inline-flex;align-items:center;height:32px;padding:0 8px;color:var(--amber);font-size:13px;font-weight:600;white-space:nowrap}
+.cfg-grid .up-row .del, .cfg-grid .cfg-row .del{font-size:17px;width:30px;height:30px;line-height:1}
+.cfg-grid .cfg-row .lab{font-size:16px}
+.cfg-grid .cfg-row .lab small{font-size:13.5px;line-height:1.5}
+.cfg-grid .cfg-row .q-sel{font-size:14px}
+.cfg-grid .cfg-row .num{font-size:14px}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ===================== 侧栏 ===================== -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2.2">
+        <path d="M8 6h24v28H8z"/>
+        <path d="M14 14h12M14 20h12M14 26h8"/>
+        <circle cx="30" cy="30" r="6" fill="var(--bg)" stroke="currentColor"/>
+      </svg>
+      <div class="brand-name">ebpdns<small>eBPF DNS RESOLVER</small></div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" data-route="pipeline">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h6l2 5h8l2-3h0"/><circle cx="3" cy="7" r="1"/><circle cx="21" cy="9" r="1.4"/><path d="M3 17h10l1-3h7"/><circle cx="3" cy="17" r="1"/><circle cx="21" cy="14" r="1.4"/></svg>
+        数据面流水线
+      </div>
+      <div class="nav-item" data-route="query">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>
+        查询控制台
+      </div>
+      <div class="nav-item" data-route="config">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h10M18 8h2M4 16h2M10 16h10"/><circle cx="16" cy="8" r="2.2"/><circle cx="8" cy="16" r="2.2"/></svg>
+        配置
+      </div>
+      <div class="nav-item" data-route="telemetry">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-7 4 14 2.5-7H21"/></svg>
+        遥测
+      </div>
+      <div class="nav-item" data-route="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11.6.02 8v.5"/></svg>
+        架构说明
+      </div>
+    </nav>
+    <div class="side-foot">
+      <span class="dot"></span><span id="foot-mode">daemon 运行中</span>
+      <span class="uptime" id="foot-uptime">up 0m · v1.9.41</span>
+    </div>
+  </aside>
+  <!-- ===================== 主区 ===================== -->
+  <main class="main">
+    <header class="topbar">
+      <div class="tb-title" id="tb-title"><span id="tb-title-main">数据面流水线</span><small id="tb-sub">XDP Hook · BPF LRU 缓存 · 用户态解析引擎</small></div>
+      <div class="tb-metrics">
+        <div class="mchip"><span class="k">QPS</span><span class="v" id="m-qps">0</span></div>
+        <div class="mchip"><span class="k">命中率</span><span class="v ok" id="m-hit">0%</span></div>
+        <div class="mchip"><span class="k">平均延迟</span><span class="v" id="m-lat">–</span></div>
+        <div class="mchip"><span class="k">BPF Map</span><span class="v" id="m-map">0/1024</span></div>
+        <button class="tb-btn" id="btn-run" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5v14l12-7z"/></svg>
+          <span id="btn-run-txt">暂停</span>
+        </button>
+        <button class="tb-btn" id="btn-clear">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
+          清空
+        </button>
+      </div>
+    </header>
+    <div class="routes">
+      <!-- ============ 路由：数据面流水线 ============ -->
+      <section class="route active" data-route="pipeline">
+        <div class="card pl-card">
+          <div class="pl-hd">
+            <div>
+              <div class="t">数据面流水线</div>
+              <div class="s">packet-path 实时推演 · 用户态 LRU 缓存命中快路径直答</div>
+            </div>
+            <div class="right">
+              <div class="status-pill run" id="pill-run"><span class="dot"></span><span id="pill-txt">RUNNING</span></div>
+              <div class="seg" id="load-seg" style="display:none">
+                <button data-load="4">低</button>
+                <button data-load="10" class="on">中</button>
+                <button data-load="22">高</button>
+              </div>
+            </div>
+          </div>
+          <div id="pipeline"><div id="rail"></div></div>
+          <div class="pl-legend">
+            <span><i style="background:var(--cyan)"></i>缓存命中 · 内核直答</span>
+            <span><i style="background:var(--amber)"></i>缓存未命中 · 用户态多上游解析</span>
+            <span><i style="background:var(--red)"></i>上游失败 · SERVFAIL</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="console-hd">
+            <span class="c-dot r"></span><span class="c-dot y"></span><span class="c-dot g"></span>
+            <span style="margin-left:8px">ebpdns · 实时查询日志</span>
+            <span class="right log-tools">
+              <input class="log-search" id="log-search" type="text" placeholder="全局搜索: 域名 / IP / 上游 / 规则…" spellcheck="false" autocomplete="off">
+              <button class="btn mini" id="log-filter-clear" title="清空全部筛选">清空筛选</button>
+              <span id="log-count">0 events</span>
+            </span>
+          </div>
+          <div class="log-head">
+            <div class="lc-col"><span class="lc ts">查询时间</span><input class="lc-filter" data-f="ts" placeholder="筛选时间…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc ip">客户端IP</span><input class="lc-filter" data-f="ip" placeholder="筛选IP…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc dm">域名</span><input class="lc-filter" data-f="dm" placeholder="筛选域名…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc qt">类型</span><input class="lc-filter" data-f="qt" placeholder="A/AAAA…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc up">上游解析</span><input class="lc-filter" data-f="up" placeholder="筛选上游…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc an">解析值IP</span><input class="lc-filter" data-f="an" placeholder="筛选IP…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc la">响应时间</span><input class="lc-filter" data-f="la" placeholder=">=毫秒…" spellcheck="false"></div>
+            <div class="lc-col"><span class="lc rl">规则匹配</span><input class="lc-filter" data-f="rl" placeholder="筛选规则…" spellcheck="false"></div>
+          </div>
+          <div id="console-body"></div>
+        </div>
+      </section>
+      <!-- ============ 路由：查询控制台 ============ -->
+      <section class="route" data-route="query">
+        <div class="card">
+          <div class="card-bd">
+            <div class="q-row">
+              <input class="q-input" id="q-domain" type="text" placeholder="输入域名, 例如 www.baidu.com" spellcheck="false" autocomplete="off">
+              <select class="q-sel" id="q-type">
+                <option value="A">A (IPv4)</option>
+                <option value="AAAA">AAAA (IPv6)</option>
+                <option value="MX">MX</option>
+                <option value="TXT">TXT</option>
+                <option value="NS">NS</option>
+                <option value="CNAME">CNAME</option>
+                <option value="SOA">SOA</option>
+              </select>
+              <button class="btn primary" id="btn-query">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M14 6l6 6-6 6"/></svg>
+                发起解析
+              </button>
+              <button class="btn" id="btn-qclear">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
+                清空
+              </button>
+            </div>
+            <div class="hint" id="query-hint">手动解析会真实经过 BPF 缓存 / 多上游 / 测速择优 / 缓存回填全链路, 并计入遥测统计。</div>
+          </div>
+        </div>
+        <div class="q-grid">
+          <div class="card">
+            <div class="card-hd"><span class="t">处理链路</span><span class="s">query trace</span></div>
+            <div class="q-steps" id="q-steps"><div class="empty">输入域名并点击「发起解析」, 查看每一步处理过程。</div></div>
+          </div>
+          <div class="card">
+            <div class="card-hd"><span class="t">解析结果</span><span class="s">answer</span></div>
+            <div class="card-bd">
+              <div class="q-result" id="q-result"></div>
+              <div class="empty" id="q-result-empty">尚无结果。</div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="t">会话记录</span><span class="s">recent queries</span></div>
+          <div class="q-history" id="q-history">
+            <div class="empty">暂无手动查询记录。</div>
+          </div>
+        </div>
+      </section>
+      <!-- ============ 路由：配置 ============ -->
+      <section class="route" data-route="config">
+        <div class="cfg-grid">
+          <div class="card">
+            <div class="card-hd"><span class="t">缓存与 BPF Map</span><span class="s">kernel cache</span></div>
+            <div class="card-bd">
+              <div class="cfg-row"><div class="lab">LRU Map 容量<small>entries · 超出后按最近最少使用淘汰</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-size" min="16" max="131072" step="16"><input type="range" id="cfg-size-r" min="16" max="131072" step="16" value="1024"></div></div>
+              <div class="cfg-row"><div class="lab">默认 TTL<small>seconds · 缓存条目存活时间</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-ttl" min="5" max="3600" step="5"><input type="range" id="cfg-ttl-r" min="5" max="3600" step="5" value="300"></div></div>
+              <div class="cfg-row"><div class="lab">域名预取<small>TTL 到期前自动重新解析, 保持热点域名热缓存</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-prefetch"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">内核直答<small>用户态缓存命中即计为内核直答(XDP 内核旁路为预留接口)</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-kdirect"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">缓存持久化<small>落盘 cache.json · 每 60s 自动保存 + 退出保存, 重启后自动恢复</small></div>
+                <div class="val mono" id="cfg-cache-file" style="font-size:11px;color:var(--text3);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="">—</div></div>
+              <div class="cfg-row"><div class="lab">下发 TTL 下限<small>seconds · 0=不限制; 内网客户端收到的应答 TTL 不低于此值</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-ttlmin" min="0" max="86400" step="5" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">下发 TTL 上限<small>seconds · 0=不限制; 内网客户端收到的应答 TTL 不高于此值</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-ttlmax" min="0" max="86400" step="5" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">过期缓存兜底<small>serve-stale · 缓存过期后窗口内仍返回旧数据并后台刷新, 避免上游抖动时 SERVFAIL</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-stale"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">兜底窗口<small>seconds · 过期后最多可返回旧数据的时间(超过则正常 miss)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-stalettl" min="10" max="86400" step="10"></div></div>
+              <div class="cfg-row"><div class="lab">持久化 TTL<small>seconds · 0=按保存时剩余 TTL 原样恢复; >0 时重启恢复的缓存统一用此 TTL, 配合预取长期保持</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-persistttl" min="0" max="86400" step="60" placeholder="0"></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-hd"><span class="t">测速与优选</span><span class="s">speed test · smart features</span></div>
+            <div class="card-bd">
+              <div class="cfg-row"><div class="lab">启用测速择优<small>对候选 IP 排序, 返回最快地址 (SmartDNS 风格)</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-speed"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">测速间隔<small>ms · 两次主动探测之间的最小间隔</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-spint" min="500" max="30000" step="500"></div></div>
+              <div class="cfg-row"><div class="lab">解析失败降级<small>首选上游超时后自动尝试其余上游</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-fallback"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">超时阈值<small>ms · 单次上游查询超时上限</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-timeout" min="200" max="5000" step="100"></div></div>
+              <div class="cfg-row"><div class="lab">IPv4 优先<small>同时存在 A / AAAA 记录时优先返回 A 记录</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-v4first"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">启用 IPv6<small>关闭后 AAAA 查询直接判未命中并返回空应答 (全局一刀切)</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-v6"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">双栈智能 IPv4 优先<small>prefer_ipv4 · 仅当域名存在 A 记录(双栈)才屏蔽 AAAA, 纯 IPv6 域名正常解析 — 替代全局 IPv6 开关的精细化方案</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-v4smart"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">EDNS UDP size<small>出站查询 EDNS0 payload(字节) · 1232=IPv6 MTU 防分片安全值, 减少大应答 UDP 分片被 NAT/防火墙丢弃导致的解析超时</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-ednssize" min="512" max="4096" step="8" placeholder="1232"></div></div>
+              <div class="cfg-row"><div class="lab">加密查询填充<small>padding · DoT/DoH/DoH3/DoQ 出站报文填充到 128B 块(RFC 8467), 抹平长度指纹防流量分析 — 明文 UDP/TCP 不填充</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-padding"><span class="sl"></span></label></div></div>
+            </div>
+          </div>
+          <div class="card rule-card">
+            <div class="card-hd"><span class="t">分流规则</span><span class="s">domain rules</span></div>
+            <div class="card-bd flush">
+              <div class="sub-sec">
+                <div class="sub-hd">规则订阅 <small>链接订阅 · 明细存独立文件 rules_sub.json · 不写入 config.json</small></div>
+                <div id="rule-sub-list" class="sub-list"></div>
+                <div class="cfg-row import-row">
+                  <input class="text" id="sub-url-input" placeholder="订阅链接 https://.../list.txt (域名/Adblock/hosts 列表均可)" spellcheck="false" autocomplete="off" style="flex:2;min-width:0">
+                  <select class="q-sel" id="sub-action">
+                    <option value="block">屏蔽</option>
+                    <option value="group">使用分组</option>
+                    <option value="forceIp">强制 IP</option>
+                  </select>
+                  <select class="q-sel" id="sub-group" style="display:none">
+                    <option value="domestic">国内</option>
+                    <option value="global">海外</option>
+                  </select>
+                  <input class="text" id="sub-ip" placeholder="强制IP" style="display:none;width:90px;flex:0 0 90px" spellcheck="false" autocomplete="off">
+                  <button class="btn primary" id="btn-sub-rule">订阅</button>
+                </div>
+              </div>
+              <div class="sub-sec">
+                <div class="sub-hd">逐条规则 <small>独立文件 rules_local.json · 不写入 config.json</small></div>
+                <div id="rule-list"></div>
+                <div class="cfg-row import-row">
+                  <input class="text" id="import-input" placeholder="输入域名直接添加或批量导入, 如 baidu.com / *.taobao.com (逗号/换行分隔可批量)" spellcheck="false" autocomplete="off">
+                  <select class="q-sel" id="import-action">
+                    <option value="group">使用分组</option>
+                    <option value="block">屏蔽</option>
+                    <option value="forceIp">强制 IP</option>
+                    <option value="allow">放行(白名单)</option>
+                  </select>
+                  <select class="q-sel" id="import-group">
+                    <option value="domestic">国内</option>
+                    <option value="global">海外</option>
+                  </select>
+                  <input class="text" id="import-ip" placeholder="强制IP" style="display:none;width:90px;flex:0 0 90px" spellcheck="false" autocomplete="off">
+                  <button class="btn primary" id="btn-import-rule">导入</button>
+                </div>
+              </div>
+              <div class="cfg-actions">
+                <span class="note" style="padding:8px 16px;font-size:13.5px;line-height:2">
+                  <b>规则匹配类型</b>（在左侧"逐条规则"输入框填写，回车即添加；动作可选"屏蔽 / 使用分组"）<br>
+                  ① <b>*.example.com</b> 通配 —— 匹配 example.com 及其全部子域名<br>
+                  ② <b>re:正则</b> 正则匹配 —— 如 re:.*\.ads\.com$（匹配以 ads.com 结尾的域名）<br>
+                  <b>匹配优先级：精确 &gt; 通配 &gt; 正则</b>；URL 订阅请使用上方订阅栏
+                </span>
+              </div>
+            </div>
+          </div><div class="card up-card">
+            <div class="card-hd"><span class="t">上游服务器</span><span class="s">upstreams</span></div>
+            <div class="card-bd flush">
+              <div style="padding:4px 16px 0">
+                <div class="up-row" style="border-bottom:1px solid var(--line); padding-bottom:6px; font-family:var(--font-mono); font-size:13px; color:var(--text3); letter-spacing:.6px">
+                  <span></span><span>名称</span><span>协议</span><span>完整地址</span><span>端口</span><span>分组</span><span>基础延迟</span><span>连接健康度</span><span></span>
+                </div>
+                <div id="up-list"></div>
+              </div>
+              <div class="cfg-row up-add-row">
+                <input class="text" id="up-add-addr" placeholder="输入完整地址直接添加, 如 https://doh.opendns.com/dns-query / quic://dns.nextns.io / 223.5.5.5（自动识别协议端口）" spellcheck="false" autocomplete="off" style="flex:3;min-width:0">
+                <select class="q-sel" id="up-add-proto">
+                  <option value="auto" selected>自动</option><option value="udp">UDP</option><option value="tcp">TCP</option><option value="doh">DoH</option><option value="dot">DoT</option><option value="doq">DoQ</option><option value="doh3">DoH3</option>
+                </select>
+                <select class="q-sel" id="up-add-group">
+                  <option value="domestic">国内</option><option value="global">海外</option>
+                </select>
+                <button class="btn primary" id="btn-add-up">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  添加
+                </button>
+              </div>
+              <div class="cfg-actions">
+                <button class="btn" id="btn-reprobe">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 12.5H11L9.5 22 19 10.5h-6.5z"/></svg>
+                  一键重新测速
+                </button>
+                <span class="note">解析时并发全部可用上游做测速择优 · 回车直接添加</span>
+              </div>
+            </div>
+          </div>
+          
+        </div>
+        <div class="card">
+          <div class="cfg-actions">
+            <span style="font-size:12px;color:var(--text3);align-self:center" id="cache-policy-label">缓存策略: –</span>
+            <button class="btn primary" id="btn-save-cfg">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11.6.0v14H5z"/><path d="M8 3v5h7V3M8 21v-7h8v7"/></svg>
+              应用配置
+            </button>
+            <button class="btn" id="btn-reset-cfg">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+              恢复默认
+            </button>
+            <button class="btn" id="btn-reload-cfg">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+              热重载
+            </button>
+            <button class="btn danger" id="btn-restart-svc">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+              重启服务
+            </button>
+            <span class="note" id="cfg-saved-note">配置修改即时生效, 点击「应用配置」持久化到后端</span>
+          </div>
+        </div>
+      </section>
+      <!-- ============ 路由：遥测 ============ -->
+      <section class="route" data-route="telemetry">
+        <div class="kpi-grid">
+          <div class="kpi"><div class="k">总查询</div><div class="v" id="kpi-total">0</div></div>
+          <div class="kpi"><div class="k">缓存命中</div><div class="v cy" id="kpi-hit">0</div></div>
+          <div class="kpi"><div class="k">内核直答</div><div class="v gn" id="kpi-kd">0</div></div>
+          <div class="kpi"><div class="k">平均延迟</div><div class="v am" id="kpi-lat">–<span class="u">ms</span></div></div>
+          <div class="kpi"><div class="k">上游请求</div><div class="v" id="kpi-up">0</div></div>
+          <div class="kpi"><div class="k">解析失败</div><div class="v rd" id="kpi-err">0</div></div>
+          <div class="kpi kpi-rule"><div class="k">规则命中</div><div class="v bl" id="kpi-rule">0</div><div class="rs" id="kpi-rule-sub"><span class="rd">屏蔽 0</span><span class="cy">国内 0</span><span class="am">国外 0</span></div></div>
+        </div>
+        <div class="chart-grid">
+          <div class="card"><div class="card-hd"><span class="t">缓存命中率</span><span class="s">cache hit rate</span></div><div class="card-bd"><div class="chart" id="ch-hit"></div></div></div>
+          <div class="card"><div class="card-hd"><span class="t">吞吐</span><span class="s">QPS</span></div><div class="card-bd"><div class="chart" id="ch-qps"></div></div></div>
+          <div class="card"><div class="card-hd"><span class="t">平均响应延迟</span><span class="s">ms</span></div><div class="card-bd"><div class="chart" id="ch-lat"></div></div></div>
+          <div class="card"><div class="card-hd"><span class="t">查询类型分布</span><span class="s">qtype</span></div><div class="card-bd"><div class="chart" id="ch-qtypes"></div></div></div>
+          <div class="card">
+            <div class="card-hd"><span class="t">BPF LRU Map 占用</span><span class="s">entries</span></div>
+            <div class="card-bd">
+              <div class="mapbar"><span id="map-fill"></span></div>
+              <div class="map-info"><span id="map-used">0 / 1024</span><span id="map-pct">0%</span></div>
+              <div class="hint">Map 容量即内核态缓存条目上限, 满时按 LRU 淘汰旧条目; 命中率与 Map 容量、TTL 直接相关。</div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="t">上游平均延迟</span><span class="s">per upstream</span></div>
+          <div class="card-bd"><div class="chart" id="ch-up"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="t">上游健康度</span><span class="s">upstream health</span></div>
+          <div class="card-bd flush"><div style="overflow-x:auto"><table class="tbl" id="up-health"><thead><tr><th>上游</th><th>协议</th><th>查询数</th><th>成功率</th><th>平均延迟</th><th>状态</th></tr></thead><tbody></tbody></table></div></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="t">Top N 统计</span><span class="s">域名 / 客户端 / 上游</span></div>
+          <div class="card-bd">
+            <div style="display:flex;gap:24px;flex-wrap:wrap">
+              <div style="flex:1 1 260px;min-width:0">
+                <div style="font-weight:600;margin-bottom:6px;color:var(--text2)">查询最多的域名</div>
+                <div id="top-domains" style="font-size:12px;color:var(--text2)">–</div>
+              </div>
+              <div style="flex:1 1 260px;min-width:0">
+                <div style="font-weight:600;margin-bottom:6px;color:var(--text2)">查询最多的客户端</div>
+                <div id="top-clients" style="font-size:12px;color:var(--text2)">–</div>
+              </div>
+              <div style="flex:1 1 260px;min-width:0">
+                <div style="font-weight:600;margin-bottom:6px;color:var(--text2)">请求最多的上游</div>
+                <div id="top-ups" style="font-size:12px;color:var(--text2)">–</div>
+              </div>
+            </div>
+            <div class="hint" style="margin-top:8px">Top N 为进程内累计统计(域名/客户端超 2048 项自动裁剪低频一半), 上游按查询数排序。</div>
+          </div>
+        </div>
+      </section>
+      <!-- ============ 路由：架构说明 ============ -->
+      <section class="route" data-route="about">
+        <div class="card">
+          <div class="card-bd">
+            <div class="kicker">SmartDNS 式智能解析</div>
+            <div style="font-size:22px;font-weight:700;margin:6px 0 10px">用户态数据面 + 可选 eBPF XDP 内核旁路</div>
+            <p style="color:var(--text2);max-width:900px;margin:0" id="about-intro">本应用是仿照 <b>SmartDNS</b> 构建的智能 DNS 解析软件。默认数据面运行在<b>用户态</b>: daemon 监听 <code>UDP/TCP :53</code> + IPv6 <code>UDP6/TCP6 [::]:53</code>（无 IPv6 栈环境自动跳过）, 以<b>用户态 LRU 缓存模拟 BPF LRU_HASH Map</b>——查询命中时由 daemon 主线程直接回包(快路径, 响应体预编码), 未命中时进入 SmartDNS 式解析引擎: <b>六协议上游</b>(UDP/TCP/DoH/DoT/DoH3/DoQ) 多路并发、<b>测速择优、域名分流、CNAME 链展开、TTL 预取</b>, 结果回填 LRU 并落盘持久化。内置 <b>缓存投毒防护</b>(0x20 查询名随机化)、<b>EDNS0 防分片</b>(UDP size 1232)、<b>加密查询填充</b>(RFC8467)、<b>双栈智能</b>(有 A 记录才屏蔽 AAAA, 纯 v6 不误伤)。整套运行<b>无需内核权限</b>。同时保留 <b>eBPF XDP 内核旁路</b>预留接口(<code>bpf/</code> 目录参考实现), 可在支持原生 XDP 的网卡上把缓存命中下沉到内核直答, 作为进阶加速选项。</p>
+          </div>
+        </div>
+        <div class="arch-grid">
+          <div class="card">
+            <div class="card-hd"><span class="t">实际数据面路径</span><span class="s">data path</span></div>
+            <div class="arch-flow">
+              <div class="arch-node"><div class="tag tag-usr">DNS LISTEN</div><div class="bd"><h4>报文入口 (IPv4 + IPv6 双栈)</h4><p><code>server.py</code> 监听 UDP4/TCP4 :53 + IPv6 UDP6/TCP6 <code>[::]:53</code>（V6ONLY 独立监听, 无 IPv6 栈自动跳过仅告警）, 解析 (qname, qtype) 后主线程查缓存; 命中走<b>快路径</b>直接回包(响应体预编码, 仅重拼 qid), miss 交解析引擎。</p></div></div>
+              <div class="arch-node"><div class="tag tag-bpf">LRU MAP</div><div class="bd"><h4>用户态缓存 (模拟 BPF Map)</h4><p><code>cache.py</code> 以用户态 LRU 模拟 <code>BPF_MAP_TYPE_LRU_HASH</code>: 存 (qname, qtype) → 答案 + TTL; 支持<b>按分流 group 分区</b>淘汰、TTL 钳制(ttl_min/max + 规则级覆盖)、负缓存(NXDOMAIN)、serve-stale 过期兜底、剩余 TTL 落盘持久化, 重启自动恢复。</p></div></div>
+              <div class="arch-node"><div class="tag tag-usr">RESOLVER</div><div class="bd"><h4>SmartDNS 式解析引擎</h4><ul><li>域名分流: 精确 / *.通配 / 中缀通配 / re:正则 / forceIp / block (三层哈希索引, 10 万条级 &lt;1ms) + URL 订阅自动更新 + 独立文件存储</li><li>多上游并发: UDP / TCP / DoH / DoT / DoH3 / DoQ 六协议, 首答即返, 连接池复用</li><li>测速择优(EWMA) + 连接级健康度 + 慢速降级 + 熔断 + 失败降级(fallback) + IPv4 优先(双栈智能)</li><li>CNAME 链跟踪展开 + 负缓存 + TTL 到期前预取 + 规则级 TTL 覆盖</li><li>安全: 0x20 投毒防护 / EDNS0 1232 防分片 / RFC8467 加密查询填充</li></ul></div></div>
+              <div class="arch-node"><div class="tag tag-sys">UPSTREAM + API</div><div class="bd"><h4>上游与观测</h4><p><code>upstream.py</code> 六协议连接复用(DoH/DoT/DoQ 连接池) + 熔断; <code>quic_upstream.py</code> 提供 DoH3/DoQ (aioquic 可选, 缺失自动降级); <code>telemetry.py</code> 计数 / 历史 / Top N / 规则命中统计; <code>api.py</code> HTTP JSON API: 查询 / 配置热重载 / 重启 / 规则 CRUD / 一键重测速 / 性能剖析 / metrics, Web 控制台实时展示遥测 / 健康度 / 实时日志筛选 / Map 占用。</p></div></div>
+              <div class="arch-node"><div class="tag tag-xdp">XDP HOOK (预留)</div><div class="bd"><h4>可选内核数据面</h4><p><code>bpf/</code> 目录提供 C + libbpf 参考实现: 在原生 XDP 网卡上由内核旁路直接回包。当前<b>未集成</b>到 daemon 运行路径, 默认部署即为上方用户态路径。</p></div></div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:18px">
+            <div class="card">
+              <div class="card-hd"><span class="t">技术栈参考</span><span class="s">reference stack</span></div>
+              <div class="card-bd"><div class="stack-list">
+                <div class="stack-row"><span class="l">用户态数据面</span><span class="r">Python 3 (核心零依赖)</span></div>
+                <div class="stack-row"><span class="l">DoH3 / DoQ</span><span class="r">aioquic (可选, install.sh 自动安装)</span></div>
+                <div class="stack-row"><span class="l">可选内核数据面</span><span class="r">C + libbpf (XDP, 预留)</span></div>
+                <div class="stack-row"><span class="l">缓存 Map</span><span class="r">用户态 LRU (分区 + 负缓存 + serve-stale)</span></div>
+                <div class="stack-row"><span class="l">安全防护</span><span class="r">0x20 随机化 / EDNS 1232 / RFC8467 填充 / 双栈智能</span></div>
+                <div class="stack-row"><span class="l">计数 / 统计</span><span class="r">遥测采样 + Top N + 实时日志筛选</span></div>
+                <div class="stack-row"><span class="l">管理接口</span><span class="r">HTTP JSON API + Web 控制台 + 热重载 / 重启</span></div>
+              </div></div>
+            </div>
+            <div class="card">
+              <div class="card-hd"><span class="t">部署方式</span><span class="s">Debian 13</span></div>
+              <div class="card-bd">
+<code class="blk"><span class="c"># 安装 (见 README.md)</span>
+sudo ./install.sh
+<span class="c"># 或手动:</span>
+sudo cp -r ebpdns /opt/ebpdns
+sudo cp systemd/ebpdns.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ebpdns
+<span class="c"># 控制台</span>
+浏览器打开 http://&lt;服务器IP&gt;:8080</code>
+                <div class="hint">本软件默认以「用户态 LRU 模拟 eBPF Map」运行, 无需内核权限即可部署; 若需真实 XDP 数据面加速, 请参考 bpf/ 目录下的 C 源码与加载脚本。DoH3/DoQ 上游依赖 aioquic, 未安装时自动降级到 DoH/UDP, 不影响其他协议解析。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+<script>
+"use strict";
+/* ================================================================
+ * ebpdns —— eBPF 版 SmartDNS 解析器控制台 (Debian 部署版)
+ * 双模式:
+ *   REAL  后端 daemon 在线 → 数据来自 HTTP JSON API (真实解析)
+ *   SIM   后端不可达      → 浏览器内仿真兜底 (演示)
+ * ================================================================ */
+/* ---------------- 基础工具 ---------------- */
+const $ = (s, p) => (p || document).querySelector(s);
+const $$ = (s, p) => Array.from((p || document).querySelectorAll(s));
+const rnd = (a, b) => a + Math.random() * (b - a);
+const ri = (a, b) => Math.floor(rnd(a, b + 1));
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function randIp4(){
+  const a = [ri(1,223), ri(0,255), ri(0,255), ri(1,254)];
+  if (a[0] === 10 || a[0] === 127 || a[0] === 172 && a[1] === 16) a[0] = 104;
+  return a.join('.');
+}
+function randIp6(){
+  const he = () => ri(0,65535).toString(16);
+  return '2' + he() + ':' + he() + ':' + he() + '::' + he();
+}
+function pad(n, l){ n = String(n); while (n.length < l) n = '0' + n; return n; }
+function nowTs(){
+  const d = new Date();
+  return d.toTimeString().slice(0,8) + '.' + pad(d.getMilliseconds(),3);
+}
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+/* 运行时错误报告（调试用，正常部署可保留） */
+window.addEventListener('error', function(e){
+  try {
+    const el = document.getElementById('foot-uptime');
+    if (el) el.textContent = 'JS ERR: ' + (e.message || e.type || 'unknown');
+    const el2 = document.getElementById('log-count');
+    if (el2) el2.textContent = 'ERR';
+  } catch(_){}
+});
+window.addEventListener('unhandledrejection', function(e){
+  try {
+    const el = document.getElementById('foot-uptime');
+    if (el) el.textContent = 'JS REJ: ' + (e.reason && (e.reason.message || e.reason) || 'unknown');
+  } catch(_){}
+});
+
+/* ---------------- 模式与 API ---------------- */
+let MODE = 'sim';                 // 'real' | 'sim'
+const APP_VERSION = "v1.9.41";    // 前端兜底版本(后端 /api/status.version 优先)
+let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
+const API = {
+  async req(method, path, body){
+    const opt = { method, headers:{} };
+    if (body !== undefined){ opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    const r = await fetch(path, opt);
+    if (!r.ok) throw new Error(path + ' -> ' + r.status);
+    return r.json();
+  },
+  get(p){ return API.req('GET', p); },
+  post(p, b){ return API.req('POST', p, b); },
+  put(p, b){ return API.req('PUT', p, b); },
+  del(p){ return API.req('DELETE', p); }
+};
+
+/* ---------------- 运行状态 (仿真) ---------------- */
+const DEFAULTS = {
+  cacheSize: 1024, ttl: 300, prefetch: true, kernelDirect: true, speedTest: true,
+  ttlMin: 0, ttlMax: 0, serveStale: false, staleTtl: 3600, persistTtl: 0,
+  speedInterval: 2000, fallback: true, ipv4First: true, ipv6: true, edns: true,
+  ednsUdpSize: 1232, padding: false, preferIpv4: false,
+  hook: 'XDP 原生', mapType: 'LRU_HASH', percpu: true, liveRate: 10, timeout: 1500,
+  upstreams: [
+    { id:'ali-udp', name:'AliDNS UDP', proto:'udp', addr:'223.5.5.5', port:53, url:'', group:'domestic', latency:8, enabled:true },
+    { id:'dnspod-udp', name:'DNSPod UDP', proto:'udp', addr:'119.29.29.29', port:53, url:'', group:'domestic', latency:10, enabled:true },
+    { id:'ali-doh', name:'AliDNS DoH/DoH3', proto:'doh', addr:'dns.alidns.com', port:443, url:'/dns-query', group:'domestic', latency:30, enabled:true },
+    { id:'dnspod-doh', name:'DNSPod DoH/DoH3', proto:'doh', addr:'doh.pub', port:443, url:'/dns-query', group:'domestic', latency:40, enabled:true },
+    { id:'ali-ip-doh', name:'AliDNS IP DoH', proto:'doh', addr:'223.5.5.5', port:443, url:'/dns-query', group:'domestic', latency:30, enabled:true },
+    { id:'ali-ip2-doh', name:'AliDNS2 IP DoH', proto:'doh', addr:'223.6.6.6', port:443, url:'/dns-query', group:'domestic', latency:30, enabled:true },
+    { id:'dnspod-ip-doh', name:'DNSPod IP DoH', proto:'doh', addr:'120.53.53.53', port:443, url:'/dns-query', group:'domestic', latency:40, enabled:true },
+    { id:'cf-doh', name:'Cloudflare DoH/DoH3', proto:'doh', addr:'cloudflare-dns.com', port:443, url:'/dns-query', group:'global', latency:150, enabled:false },
+    { id:'cf-ip-doh', name:'Cloudflare IP DoH', proto:'doh', addr:'1.1.1.1', port:443, url:'/dns-query', group:'global', latency:150, enabled:false },
+    { id:'google-doh', name:'Google DoH/DoH3', proto:'doh', addr:'dns.google', port:443, url:'/dns-query', group:'global', latency:160, enabled:false },
+    { id:'google-ip-doh', name:'Google IP DoH', proto:'doh', addr:'8.8.8.8', port:443, url:'/dns-query', group:'global', latency:160, enabled:false },
+    { id:'quad9-doh', name:'Quad9 DoH/DoH3', proto:'doh', addr:'dns.quad9.net', port:443, url:'/dns-query', group:'global', latency:180, enabled:false },
+    { id:'nextdns-doh', name:'NextDNS DoH', proto:'doh', addr:'dns.nextdns.io', port:443, url:'/4d5525', group:'global', latency:200, enabled:false },
+    { id:'opendns-doh', name:'OpenDNS DoH', proto:'doh', addr:'doh.opendns.com', port:443, url:'/dns-query', group:'global', latency:200, enabled:false },
+    { id:'dnssb-doh', name:'DNS.SB DoH', proto:'doh', addr:'doh.dns.sb', port:443, url:'/dns-query', group:'global', latency:220, enabled:false },
+    { id:'adguard-doh', name:'AdGuard DoH', proto:'doh', addr:'dns.adguard.com', port:443, url:'/dns-query', group:'global', latency:220, enabled:false },
+    { id:'hinet-doh', name:'HiNet DoH', proto:'doh', addr:'dns.hinet.net', port:443, url:'/dns-query', group:'global', latency:200, enabled:false },
+    { id:'ali-doh3', name:'AliDNS DoH3', proto:'doh3', addr:'dns.alidns.com', port:443, url:'/dns-query', group:'domestic', latency:30, enabled:false },
+    { id:'nextdns-doq', name:'NextDNS DoQ', proto:'doq', addr:'dns.nextdns.io', port:853, url:'', group:'global', latency:200, enabled:false },
+    { id:'ali-doq', name:'AliDNS DoQ', proto:'doq', addr:'223.5.5.5', port:853, url:'', group:'domestic', latency:40, enabled:false }
+  ],
+  rules: [
+    { id:'r1', match:'*.baidu.com', action:'group', group:'domestic' },
+    { id:'r2', match:'*.google.com', action:'group', group:'global' },
+    { id:'r3', match:'update.microsoft.com', action:'group', group:'global' }
+  ]
+};
+let config = loadConfig();
+function loadConfig(){
+  try { const raw = localStorage.getItem('ebpdns-config'); if (raw) return Object.assign({}, DEFAULTS, JSON.parse(raw)); } catch(e){}
+  return JSON.parse(JSON.stringify(DEFAULTS));
+}
+function persistConfig(){ try { localStorage.setItem('ebpdns-config', JSON.stringify(config)); } catch(e){} }
+
+/* ---------------- 仿真世界: 域名表 ---------------- */
+const DOMAINS = [
+  {name:'www.baidu.com', group:'domestic', v4:['39.156.66.10','110.242.68.66'], v6:['240e:97f:2:0:3::3f'], w:26, ttl:300},
+  {name:'www.bilibili.com', group:'domestic', v4:['120.92.152.123','116.6.16.123'], v6:['240e:940:0:2::3f'], w:20, ttl:300},
+  {name:'www.taobao.com', group:'domestic', v4:['111.6.106.80','111.6.44.14'], v6:['240e:95b:0:1::3f'], w:18, ttl:300},
+  {name:'www.qq.com', group:'domestic', v4:['101.91.25.35','203.107.6.142'], v6:[], w:16, ttl:300},
+  {name:'www.douyin.com', group:'domestic', v4:['221.179.1.6','180.163.49.85'], v6:[], w:16, ttl:300},
+  {name:'music.163.com', group:'domestic', v4:['101.71.24.150','140.143.63.22'], v6:[], w:15, ttl:300},
+  {name:'www.zhihu.com', group:'domestic', v4:['118.89.204.198','101.89.2.212'], v6:['240e:940:0:3::3f'], w:14, ttl:300},
+  {name:'www.google.com', group:'global', v4:['142.250.72.4','172.217.26.4'], v6:['2607:f8b0:400e:c06::64'], w:12, ttl:180},
+  {name:'api.github.com', group:'global', v4:['140.82.112.6','20.205.243.166'], v6:[], w:12, ttl:180},
+  {name:'www.youtube.com', group:'global', v4:['142.250.72.14','172.217.26.14'], v6:['2607:f8b0:400e:c08::71'], w:10, ttl:180},
+  {name:'www.cloudflare.com', group:'global', v4:['1.6.6.1','1.6.6.123'], v6:[], w:10, ttl:180},
+  {name:'openai.com', group:'global', v4:['1.6.8.5','1.6.8.4'], v6:['2606:4700::6812:425'], w:8, ttl:180},
+  {name:'registry-1.docker.io', group:'global', v4:['54.1.6.3','52.4.1.6'], v6:[], w:8, ttl:180},
+  {name:'www.microsoft.com', group:'global', v4:['23.216.81.152','20.42.65.100'], v6:[], w:8, ttl:180},
+  {name:'mtalk.google.com', group:'global', v4:['142.250.72.14','172.217.26.14'], v6:[], w:6, ttl:180}
+];
+const unknownCache = {};
+function getDomainObj(name){
+  const n = name.toLowerCase().trim();
+  let d = DOMAINS.find(x => x.name.toLowerCase() === n);
+  if (d) return d;
+  if (unknownCache[n]) return unknownCache[n];
+  const domestic = /\.(cn|com\.cn|net\.cn)$/.test(n) || Math.random() < 0.5;
+  const nd = { name: n, group: domestic ? 'domestic' : 'global', v4: [randIp4(), randIp4()], v6: Math.random() < 0.7 ? [randIp6()] : [], w: 1, ttl: 300 };
+  // 限长: 仿真模式随机域名表防无限增长(超 500 删最旧)
+  const keys = Object.keys(unknownCache);
+  if (keys.length >= 500) delete unknownCache[keys[0]];
+  unknownCache[n] = nd; return nd;
+}
+function pickDomain(){
+  const total = DOMAINS.reduce((s, d) => s + d.w, 0);
+  let r = Math.random() * total;
+  for (const d of DOMAINS){ if ((r -= d.w) <= 0) return d; }
+  return DOMAINS[0];
+}
+function pickQtype(){ const r = Math.random(); if (r < 0.68) return 'A'; if (r < 0.94) return 'AAAA'; return Math.random() < 0.5 ? 'MX' : 'TXT'; }
+function qtypeCat(t){ return (t === 'A' || t === 'AAAA') ? t : '其他'; }
+
+/* ---------------- 仿真状态 ---------------- */
+const sim = {
+  running: true, cache: new Map(),
+  counters: { total:0, hit:0, miss:0, kernelDirect:0, upstreamQueries:0, errors:0 },
+  qtypeDist: { A:0, AAAA:0, 其他:0 }, qpsWindow: [], latencies: [],
+  history: [], events: [], manualHistory: [], packets: [], prefetchTimers: new Set()
+};
+function simAddQps(){ const t = Date.now(); sim.qpsWindow.push(t); if (sim.qpsWindow.length > 300) sim.qpsWindow.shift(); }
+function simQps(){ const t = Date.now(); while (sim.qpsWindow.length && t - sim.qpsWindow[0] > 1000) sim.qpsWindow.shift(); return sim.qpsWindow.length; }
+function simPushLat(ms){ sim.latencies.push(ms); if (sim.latencies.length > 400) sim.latencies.shift(); }
+function simAvgLat(){ if (!sim.latencies.length) return null; return sim.latencies.reduce((s, v) => s + v, 0) / sim.latencies.length; }
+function simHitRate(){ return sim.counters.total ? sim.counters.hit / sim.counters.total * 100 : 0; }
+function matchRule(domain){
+  const n = domain.toLowerCase();
+  for (const r of config.rules){
+    let m = r.match.trim().toLowerCase(); if (!m) continue;
+    if (m.startsWith('*.')){ const core = m.slice(2); if (n === core || n.endsWith('.' + core)) return r; }
+    else if (n === m) return r;
+  }
+  return null;
+}
+function simFill(key, d, qtype, answers){
+  const now = Date.now(), ttl = config.ttl;
+  sim.cache.set(key, { domain:d, qtype, answers, chosen: answers[0] ? answers[0].value : '', ttl, expiresAt: now + ttl * 1000, accessAt: now });
+  while (sim.cache.size > config.cacheSize){ const k = sim.cache.keys().next().value; sim.cache.delete(k); }
+}
+function simQueryUp(u, d, qtype){
+  const lat = u.latency * (0.8 + Math.random() * 0.5);
+  const fail = Math.random() < 0.05;
+  if (fail) return { u, ok:false, latency:lat };
+  let values = [];
+  if (qtype === 'A') values = d.v4.length ? d.v4.slice() : [randIp4()];
+  else if (qtype === 'AAAA') values = d.v6.length ? d.v6.slice() : (Math.random() < 0.5 ? [randIp6()] : []);
+  else if (qtype === 'MX') values = ['10 mx.' + d.name.replace(/^www\./, '') + '.'];
+  else values = ['"v=spf1 ip4:' + randIp4() + ' -all"'];
+  if (!values.length) return { u, ok:false, latency:lat, empty:true };
+  return { u, ok:true, latency:lat, values };
+}
+function simResolve(domain, qtype, opts = {}){
+  const d = getDomainObj(domain), key = domain.toLowerCase() + '|' + qtype;
+  const trace = [], now = Date.now();
+  sim.counters.total++; simAddQps(); sim.qtypeDist[qtypeCat(qtype)]++;
+  trace.push({ tag:'xdp', text:'XDP Hook 捕获 ' + domain + ' ' + qtype + ' 查询 (UDP/53), 提取 (qname, qtype)' });
+  const c = sim.cache.get(key);
+  let hit = c && c.expiresAt > now && !(qtype === 'AAAA' && !config.ipv6);
+  if (hit){
+    sim.counters.hit++; if (config.kernelDirect) sim.counters.kernelDirect++;
+    c.accessAt = now; sim.cache.delete(key); sim.cache.set(key, c);
+    const lat = 0.2 + Math.random() * 0.4, ttlLeft = Math.max(0, Math.round((c.expiresAt - now) / 1000));
+    trace.push({ tag:'bpf', text:'BPF LRU map 命中 (TTL 剩余 ' + ttlLeft + 's), ' + (config.kernelDirect ? '由用户态直答' : '经用户态直答') });
+    trace.push({ tag:'ok', text:'应答 ' + c.chosen + '  耗时 ' + lat.toFixed(2) + 'ms (缓存直答)' });
+    simPushLat(lat);
+    if (!opts.silent) simLog(domain, qtype, 'hit', c.chosen, lat);
+    return { hit:true, domain, qtype, answers:c.answers, chosen:c.chosen, latency:lat, ttl:ttlLeft, trace, error:false };
+  }
+  sim.counters.miss++;
+  trace.push({ tag:'bpf', text:'BPF LRU map 未命中 → 转交用户态解析引擎' });
+  const rule = matchRule(domain);
+  if (rule && rule.action === 'block'){
+    sim.counters.errors++;
+    trace.push({ tag:'rule', text:'分流规则 [' + rule.match + '] 命中: 屏蔽该域名 → 返回 SERVFAIL' });
+    if (!opts.silent) simLog(domain, qtype, 'err', 'SERVFAIL (规则屏蔽)', 1);
+    return { error:true, reason:'blocked', domain, qtype, answers:[], chosen:'SERVFAIL', latency:1, trace, hit:false };
+  }
+  let ups = config.upstreams.filter(u => u.enabled);
+  if (rule && rule.action === 'group'){
+    const g = ups.filter(u => u.group === rule.group); if (g.length) ups = g;
+    trace.push({ tag:'rule', text:'分流规则 [' + rule.match + '] 命中: 仅使用「' + rule.group + '」组上游' });
+  }
+  if (rule && rule.action === 'forceIp'){
+    const lat = 0.5 + Math.random() * 0.6, ans = [{ value: rule.ip, from: '分流规则', latency: lat }];
+    simFill(key, domain, qtype, ans);
+    trace.push({ tag:'rule', text:'分流规则 [' + rule.match + '] 强制 IP: ' + rule.ip });
+    trace.push({ tag:'ok', text:'应答 ' + rule.ip + '  耗时 ' + lat.toFixed(2) + 'ms' });
+    if (!opts.silent) simLog(domain, qtype, 'rule', rule.ip, lat);
+    return { hit:false, domain, qtype, answers:ans, chosen:rule.ip, latency:lat, trace, error:false };
+  }
+  if (!ups.length){
+    sim.counters.errors++;
+    trace.push({ tag:'warn', text:'无可用上游 (全部被禁用) → SERVFAIL' });
+    if (!opts.silent) simLog(domain, qtype, 'err', 'SERVFAIL (无上游)', 1);
+    return { error:true, reason:'no-upstream', domain, qtype, answers:[], chosen:'SERVFAIL', latency:1, trace, hit:false };
+  }
+  if (ups.length > 3) ups = ups.slice(0, 3);
+  const results = ups.map(u => simQueryUp(u, d, qtype));
+  sim.counters.upstreamQueries += results.length;
+  trace.push({ tag:'eng', text:'并发查询上游: ' + results.map(r => r.u.name).join(' / ') });
+  results.forEach(r => {
+    if (r.ok) r.values.forEach(v => trace.push({ tag:'ans', text:padName(r.u.name) + ' ' + v + '  ' + r.latency.toFixed(1) + 'ms' }));
+    else trace.push({ tag:'ans-fail', text:padName(r.u.name) + ' 查询失败 / 超时' });
+  });
+  const okResults = results.filter(r => r.ok && r.values.length);
+  if (!okResults.length){
+    sim.counters.errors++;
+    const lat = 120 + Math.random() * 60;
+    trace.push({ tag:'warn', text:'全部上游失败 → 返回 SERVFAIL' }); simPushLat(lat);
+    if (!opts.silent) simLog(domain, qtype, 'err', 'SERVFAIL (上游全部失败)', lat);
+    return { error:true, reason:'no-answer', domain, qtype, answers:[], chosen:'SERVFAIL', latency:lat, trace, hit:false };
+  }
+  const maxLat = Math.max(...okResults.map(r => r.latency));
+  const engineMs = maxLat + 0.4 + Math.random() * 0.3;
+  const cand = {};
+  okResults.forEach(r => r.values.forEach(v => {
+    if (!cand[v]) cand[v] = { value:v, from:[], latency:Infinity };
+    cand[v].latency = Math.min(cand[v].latency, r.latency);
+    if (!cand[v].from.includes(r.u.name)) cand[v].from.push(r.u.name);
+  }));
+  let list = Object.values(cand).map(a => ({ value:a.value, from:a.from, latency:a.latency, measured:a.latency }));
+  if (config.speedTest && list.length > 1){
+    list.forEach(a => a.measured = a.latency + Math.random() * 12);
+    list.sort((a, b) => a.measured - b.measured);
+    trace.push({ tag:'eng', text:'测速择优: ' + list[0].value + ' 最快 (' + list[0].measured.toFixed(1) + 'ms), 已按速度排序' });
+  } else trace.push({ tag:'eng', text:'按序应答, 首选 ' + list[0].value });
+  const answers = list.map(a => ({ value:a.value, from:a.from.join('+'), latency:a.latency }));
+  const chosen = list[0].value;
+  simFill(key, domain, qtype, answers);
+  trace.push({ tag:'bpf', text:'回填 BPF LRU map (TTL ' + config.ttl + 's, 当前占用 ' + sim.cache.size + '/' + config.cacheSize + ')' });
+  trace.push({ tag:'ok', text:'应答 ' + chosen + '  总耗时 ' + engineMs.toFixed(1) + 'ms' });
+  simPushLat(engineMs);
+  if (!opts.silent) simLog(domain, qtype, 'miss', chosen, engineMs);
+  return { hit:false, domain, qtype, answers, chosen, latency:engineMs, ttl:config.ttl, trace, error:false };
+}
+function padName(name){ while (name.length < 12) name += ' '; return name; }
+
+/* ---------------- 实时日志 ---------------- */
+const consoleBody = $('#console-body');
+function simLog(domain, qtype, level, answer, lat){
+  const short = domain.replace(/^www\./, '');
+  let msg;
+  if (level === 'hit') msg = short + ' ' + qtype + '  缓存直答 → ' + answer + '  (' + lat.toFixed(2) + 'ms)';
+  else if (level === 'miss') msg = short + ' ' + qtype + '  多上游解析 → ' + answer + '  (' + lat.toFixed(1) + 'ms) 回填LRU';
+  else if (level === 'rule') msg = short + ' ' + qtype + '  分流规则 → ' + answer + '  (' + lat.toFixed(2) + 'ms)';
+  else if (level === 'err') msg = short + ' ' + qtype + '  ' + answer;
+  else msg = short + ' ' + qtype + '  ' + answer + '  (' + (lat?lat.toFixed(1):'') + 'ms)';
+  const line = { ts: nowTs(), level, msg };
+  sim.events.push(line);
+  if (sim.events.length > 300) sim.events.shift();
+  appendLogLine(line);
+}
+let logFilters = {};    // {栏: 筛选值}  ts/ip/dm/qt/up/an/la/rl
+let logGlobalQ = '';    // 全局搜索关键字(小写)
+function lineMatchesFilters(line){
+  const cols = {
+    ts: String(line.ts || ''),
+    ip: String(line.client_ip || '-'),
+    dm: String(line.domain || ''),
+    qt: String(line.qtype || ''),
+    up: String(line.upstream || '-'),
+    an: String(line.answer || '-'),
+    rl: String(line.rule || '')
+  };
+  for (const f in logFilters){
+    const v = (logFilters[f] || '').trim();
+    if (!v) continue;
+    if (f === 'la'){  // 响应时间: 纯数字=最小值(>=), 否则文本包含
+      const n = parseFloat(v);
+      if (!isNaN(n)){ if (line.lat == null || line.lat < n) return false; }
+      else if (!cols.la.toLowerCase().includes(v.toLowerCase())) return false;
+      continue;
+    }
+    if (!cols[f].toLowerCase().includes(v.toLowerCase())) return false;
+  }
+  if (logGlobalQ){
+    const hay = (cols.ts + ' ' + cols.ip + ' ' + cols.dm + ' ' + cols.qt + ' ' + cols.up + ' ' +
+                 cols.an + ' ' + String(line.lat == null ? '' : line.lat) + ' ' + cols.rl + ' ' +
+                 String(line.msg || '')).toLowerCase();
+    if (!hay.includes(logGlobalQ)) return false;
+  }
+  return true;
+}
+function renderFilteredLogs(){
+  const all = (MODE === 'real') ? real.logs : sim.events;
+  consoleBody.innerHTML = '';
+  let shown = 0;
+  all.forEach(line => { if (lineMatchesFilters(line)){ appendLogLine(line, true); shown++; } });
+  $('#log-count').textContent = all.length + ' events · 显示 ' + shown;
+  consoleBody.scrollTop = consoleBody.scrollHeight;
+}
+function appendLogLine(line, skipFilter){
+  if (!skipFilter && !lineMatchesFilters(line)) return;
+  const div = document.createElement('div');
+  div.className = 'logline ' + (line.level || '');
+  // 八列: 查询时间 | 客户端IP | 域名 | 类型 | 上游解析 | 解析值IP | 响应时间 | 规则匹配
+  const ts = esc(line.ts || '');
+  const ip = esc(line.client_ip || '-');
+  const dm = esc(line.domain || '');
+  const qt = esc(line.qtype || '');
+  const up = esc(line.upstream || '-');
+  // 负缓存命中无解析值: 显示 NXDOMAIN 语义标记(橙色), 避免"-"被误读为数据缺失
+  const an = line.answer === 'NXDOMAIN' ? '<span class="nx">NXDOMAIN</span>' : esc(line.answer || '-');
+  const la = line.lat != null ? '<span class="latv ' + (line.lat > 500 ? 'hi' : '') + '">' + (Math.round(line.lat * 10) / 10) + ' ms</span>' : '-';
+  const rl = line.rule ? '<span class="rlb">' + esc(line.rule) + '</span>' : '-';
+  div.innerHTML =
+    '<span class="lc ts">' + ts + '</span>' +
+    '<span class="lc ip">' + ip + '</span>' +
+    '<span class="lc dm">' + dm + '</span>' +
+    '<span class="lc qt">' + qt + '</span>' +
+    '<span class="lc up">' + up + '</span>' +
+    '<span class="lc an">' + an + '</span>' +
+    '<span class="lc la">' + la + '</span>' +
+    '<span class="lc rl">' + rl + '</span>';
+  const nearBottom = consoleBody.scrollHeight - consoleBody.scrollTop - consoleBody.clientHeight < 40;
+  consoleBody.appendChild(div);
+  while (consoleBody.children.length > 300) consoleBody.removeChild(consoleBody.firstChild);
+  if (nearBottom) consoleBody.scrollTop = consoleBody.scrollHeight;
+  const all = (MODE === 'real') ? real.logs : sim.events;
+  $('#log-count').textContent = all.length + ' events · 显示 ' + consoleBody.children.length;
+}
+function renderLogBatch(events, triggerPacket){
+  events.forEach(line => {
+    appendLogLine(line);
+    if (triggerPacket) spawnPacket(line.domain || line.msg.split(' ')[0], line.level === 'hit', line.level === 'err', 0);
+  });
+}
+function clearLogUI(){ consoleBody.innerHTML = ''; $('#log-count').textContent = '0 events · 显示 0'; }
+function clearLogFilters(){
+  logFilters = {}; logGlobalQ = '';
+  $$('.lc-filter').forEach(inp => { inp.value = ''; });
+  $('#log-search').value = '';
+  renderFilteredLogs();
+}
+
+/* ---------------- 流水线: 站点 / 连线 / 数据包动画 ---------------- */
+const ST = { client:{x:9,y:28}, xdp:{x:26,y:28}, cache:{x:44,y:28}, reply:{x:87,y:28}, engine:{x:44,y:75}, up:[{x:64,y:75},{x:77,y:75},{x:90,y:75}] };
+const HIT_WP = [ST.client, ST.xdp, ST.cache, ST.reply];
+const ERR_WP = [ST.client, ST.xdp, ST.cache, ST.engine];
+const HIT_SEGS = [70, 70, 130]; const ERR_SEGS = [60, 60, 85, 300];
+const MISS_SEGS = [60, 60, 85, 240, 340, 210, 150];
+function missWp(upIdx){ return [ST.client, ST.xdp, ST.cache, ST.engine, ST.up[upIdx], ST.engine, ST.cache, ST.reply]; }
+const STN_ICONS = {
+  client:'<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M9 21h6M12 17v4"/>',
+  xdp:'<path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/>',
+  cache:'<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+  reply:'<path d="M20 9H9l4-4-4-4"/><path d="M4 21v-8a4 4 0 0 1.6.0h12"/>',
+  engine:'<rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/>',
+  globe:'<circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c3 2.5 3 13.5 0 16M12 4c-3 2.5-3 13.5 0 16"/>',
+  server:'<rect x="4" y="4" width="16" height="6" rx="1.5"/><rect x="4" y="14" width="16" height="6" rx="1.5"/><path d="M7.5 7h.01M7.5 17h.01"/>'
+};
+function stnHTML(x, y, w, icon, nm, sub, cls){
+  return '<div class="stn ' + cls + '" style="left:' + x + '%;top:' + y + '%;width:' + w + '%;transform:translate(-50%,-50%)">' +
+    '<div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + icon + '</svg></div>' +
+    '<div class="nm">' + nm + '</div><div class="sub">' + sub + '</div></div>';
+}
+function addFlow(parent, x1, y1, x2, y2, cls, dir){
+  const f = document.createElement('div'); f.className = 'flow ' + cls;
+  const ln = document.createElement('div'); ln.className = 'ln';
+  if (dir === 'h'){ ln.style.left = x1 + '%'; ln.style.top = (y1 - 0.8) + '%'; ln.style.width = (x2 - x1) + '%'; ln.style.height = '1.6px'; }
+  else { ln.style.left = (x1 - 0.8) + '%'; ln.style.top = y1 + '%'; ln.style.width = '1.6px'; ln.style.height = (y2 - y1) + '%'; }
+  const hd = document.createElement('div'); hd.className = 'hd';
+  if (dir === 'h'){ hd.style.left = (x2 - 0.25) + '%'; hd.style.top = (y2 - 0.32) + '%'; }
+  else { hd.style.left = (x2 - 0.32) + '%'; hd.style.top = (y2 - 0.25) + '%'; }
+  f.appendChild(ln); f.appendChild(hd); parent.appendChild(f);
+}
+function renderPipeline(){
+  const rail = $('#rail'); if (!rail) return;
+  rail.innerHTML = '';
+  sim.packets.forEach(p => p.el.remove()); sim.packets = [];
+  const c = MODE === 'real' ? (real.pipeline || {}) : {};
+  const hook = c.hook || config.hook, mapType = c.map_type || config.mapType, cacheSize = c.cache_size || config.cacheSize;
+  const kdirect = MODE === 'real' ? (c.kernel_direct !== undefined ? c.kernel_direct : config.kernelDirect) : config.kernelDirect;
+  const ups = MODE === 'real' ? (c.upstreams || []) : config.upstreams.filter(u => u.enabled).slice(0, 3);
+  rail.insertAdjacentHTML('beforeend', stnHTML(ST.client.x, ST.client.y, 13, STN_ICONS.server, '客户端', 'LAN / Pod · 发往 :53', ''));
+  rail.insertAdjacentHTML('beforeend', stnHTML(ST.xdp.x, ST.xdp.y, 13, STN_ICONS.xdp, 'XDP Hook', hook + ' · 报文旁路', 'hot'));
+  rail.insertAdjacentHTML('beforeend', stnHTML(ST.cache.x, ST.cache.y, 14, STN_ICONS.cache, 'BPF 缓存', mapType + ' · ' + cacheSize + ' 条目' + (kdirect ? ' · 缓存直答' : ''), 'hot'));
+  rail.insertAdjacentHTML('beforeend', stnHTML(ST.reply.x, ST.reply.y, 13, STN_ICONS.reply, '回包', '应答返回客户端', ''));
+  rail.insertAdjacentHTML('beforeend', stnHTML(ST.engine.x, ST.engine.y, 15, STN_ICONS.engine, '用户态引擎', 'ebpdns daemon · SmartDNS 逻辑', 'warm'));
+  for (let i = 0; i < 3; i++){
+    const s = ST.up[i], u = ups[i];
+    if (u) rail.insertAdjacentHTML('beforeend', stnHTML(s.x, s.y, 13, STN_ICONS.globe, u.name, (u.proto||'UDP') + ' ' + (u.addr||''), 'warm'));
+    else rail.insertAdjacentHTML('beforeend', stnHTML(s.x, s.y, 13, STN_ICONS.globe, '上游 ' + (i+1), '未启用', 'dim'));
+  }
+  addFlow(rail, 14.5, 28, 20.5, 28, 'miss', 'h');
+  addFlow(rail, 31.5, 28, 38.5, 28, 'cyan', 'h');
+  addFlow(rail, 50, 28, 81, 28, 'cyan', 'h');
+  addFlow(rail, 43, 41, 43, 64, 'amber', 'v');
+  for (let i = 0; i < 3; i++){
+    const s = ST.up[i];
+    addFlow(rail, 50.5, 74, s.x - 5.5, 74, 'amber', 'h');
+    addFlow(rail, s.x - 5.5, 78, 50.5, 78, 'back', 'h');
+  }
+  addFlow(rail, 45.2, 64, 45.2, 41, 'amber', 'v');
+}
+function spawnPacket(domain, hit, error, upIdx){
+  const rail = $('#rail'); if (!rail) return;
+  const el = document.createElement('div'); el.className = 'pkt';
+  const color = hit ? 'var(--cyan)' : (error ? 'var(--red)' : 'var(--amber)');
+  el.innerHTML = '<span class="pkt-dot" style="background:' + color + ';border-color:' + color + '"></span><span class="pkt-label">' + esc(String(domain).replace(/^www\./, '')) + '</span>';
+  rail.appendChild(el);
+  const waypoints = hit ? HIT_WP : (error ? ERR_WP : missWp(Math.min(upIdx, 2)));
+  const segs = hit ? HIT_SEGS : (error ? ERR_SEGS : MISS_SEGS);
+  sim.packets.push({ el, waypoints, segs, start: performance.now(), dur: segs.reduce((a, b) => a + b, 0) });
+  if (sim.packets.length > 16){ const old = sim.packets.shift(); if (old.el.parentNode) old.el.parentNode.removeChild(old.el); }
+}
+function posAt(p, elp){
+  let acc = 0;
+  for (let i = 0; i < p.segs.length; i++){
+    const d = p.segs[i];
+    if (elp < acc + d){ const t = (elp - acc) / d, a = p.waypoints[i], b = p.waypoints[i + 1]; return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
+    acc += d;
+  }
+  const b = p.waypoints[p.waypoints.length - 1]; return { x: b.x, y: b.y };
+}
+function frame(now){
+  for (let i = sim.packets.length - 1; i >= 0; i--){
+    const p = sim.packets[i], elp = now - p.start;
+    if (elp >= p.dur){ if (p.el.parentNode) p.el.parentNode.removeChild(p.el); sim.packets.splice(i, 1); continue; }
+    if (route === 'pipeline'){ const pos = posAt(p, elp); p.el.style.left = pos.x + '%'; p.el.style.top = pos.y + '%'; }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 页内路由 ---------------- */
+let route = 'pipeline';
+const ROUTE_META = {
+  pipeline: ['数据面流水线', 'XDP Hook · BPF LRU 缓存 · 用户态解析引擎'],
+  query:    ['查询控制台', '手动发起 DNS 解析, 查看完整处理链路'],
+  config:   ['配置', '上游服务器 · 缓存 · 测速 · 分流 · eBPF 数据面'],
+  telemetry:['遥测', '命中率 · 吞吐 · 延迟 · 上游健康度 · Map 用量'],
+  about:    ['架构说明', 'eBPF 数据面 + SmartDNS 式用户态引擎的设计拆解']
+};
+function setRoute(r){
+  route = r;
+  $$('.route').forEach(s => s.classList.toggle('active', s.dataset.route === r));
+  $$('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.route === r));
+  const m = ROUTE_META[r];
+  $('#tb-title-main').textContent = m[0]; $('#tb-sub').textContent = m[1];
+  if (r === 'telemetry') refreshCharts();
+  if (r === 'config'){
+    // 配置未就绪(首次进入早于后端 config 拉取完成)先拉取再渲染, 否则渲染空表
+    if (MODE === 'real' && !real.config){
+      API.get('/api/config').then(c => { real.config = c; renderConfig(); }).catch(() => {});
+    } else renderConfig();
+  }
+  if (r === 'pipeline') renderPipeline();
+}
+
+/* ---------------- 顶栏 / 状态 ---------------- */
+function updateTopbar(data){
+  $('#m-qps').textContent = (data.qps || 0).toFixed(0);
+  $('#m-hit').textContent = (data.hit_rate || 0).toFixed(1) + '%';
+  const al = data.avg_latency_ms;
+  $('#m-lat').textContent = al != null ? al.toFixed(1) + 'ms' : '–';
+  const m = data.map || { used:0, capacity:1024 };
+  $('#m-map').textContent = m.used + '/' + m.capacity;
+  const pill = $('#pill-run'), txt = $('#pill-txt');
+  pill.className = 'status-pill run'; txt.textContent = 'RUNNING';
+}
+function refreshMapUI(m){
+  const pct = m && m.capacity ? Math.min(100, m.used / m.capacity * 100) : 0;
+  $('#map-fill').style.width = pct + '%';
+  $('#map-used').textContent = (m ? m.used : 0) + ' / ' + (m ? m.capacity : 1024);
+  $('#map-pct').textContent = pct.toFixed(1) + '%';
+}
+
+/* ---------------- 遥测: ECharts ---------------- */
+let charts = {};
+function baseTooltip(trigger){ return { trigger, confine:true, backgroundColor:'#0d141e', borderColor:'#2a3b4f', textStyle:{ color:'#e6eef6', fontSize:11 }, padding:[8,10] }; }
+function baseAxis(){ return { axisLine:{ lineStyle:{ color:'#2a3b4f' } }, axisTick:{ show:false }, axisLabel:{ color:'#5e6f82', fontSize:10 }, splitLine:{ lineStyle:{ color:'#141e2c' } } }; }
+function initCharts(){
+  if (typeof echarts === 'undefined'){ setTimeout(initCharts, 300); return; }
+  charts.hit = echarts.init($('#ch-hit'));
+  charts.qps = echarts.init($('#ch-qps'));
+  charts.lat = echarts.init($('#ch-lat'));
+  charts.qtypes = echarts.init($('#ch-qtypes'));
+  charts.up = echarts.init($('#ch-up'));
+  [charts.hit, charts.qps, charts.lat, charts.qtypes, charts.up].forEach(c => { new ResizeObserver(() => c.resize()).observe(c.getDom()); });
+  refreshCharts();
+}
+function chartHitOpt(labels, data){
+  return { grid:{ left:38, right:14, top:18, bottom:22 }, xAxis:{ type:'category', data:labels, boundaryGap:false, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, fontSize:9 } }, yAxis:{ type:'value', min:0, max:100, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, formatter:'{value}%' } }, series:[{ type:'line', data, smooth:true, symbol:'none', lineStyle:{ color:'#2ee6c8', width:2 }, areaStyle:{ color:'#2ee6c8', opacity:0.08 } }], tooltip:baseTooltip('axis') };
+}
+function chartQpsOpt(labels, data){
+  return { grid:{ left:38, right:14, top:18, bottom:22 }, xAxis:{ type:'category', data:labels, boundaryGap:false, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, fontSize:9 } }, yAxis:{ type:'value', ...baseAxis() }, series:[{ type:'line', data, smooth:true, symbol:'none', lineStyle:{ color:'#5b8def', width:2 }, areaStyle:{ color:'#5b8def', opacity:0.08 } }], tooltip:baseTooltip('axis') };
+}
+function chartLatOpt(labels, data){
+  return { grid:{ left:38, right:14, top:18, bottom:22 }, xAxis:{ type:'category', data:labels, boundaryGap:false, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, fontSize:9 } }, yAxis:{ type:'value', ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, formatter:'{value}ms' } }, series:[{ type:'line', data, smooth:true, symbol:'none', lineStyle:{ color:'#ffb454', width:2 }, areaStyle:{ color:'#ffb454', opacity:0.08 } }], tooltip:baseTooltip('axis') };
+}
+function chartQtypesOpt(qd, total){
+  return { tooltip: baseTooltip('item'), legend:{ orient:'vertical', right:4, top:'middle', textStyle:{ color:'#b8c6d6', fontSize:12 }, itemWidth:14, itemHeight:10, itemGap:16 }, series:[{ type:'pie', radius:['42%','72%'], center:['37%','48%'], color:['#2ee6c8','#5b8def','#ffb454'], label:{ show:true, formatter:(p) => p.name + '\n' + p.value + ' (' + p.percent + '%)', color:'#e6eef6', fontSize:11, lineHeight:17 }, labelLine:{ length:16, length2:12, lineStyle:{ color:'#2a3b4f' } }, data:[{ name:'A', value:qd.A || 0 },{ name:'AAAA', value:qd.AAAA || 0 },{ name:'其他', value:qd['其他'] || 0 }] }] };
+}
+function refreshCharts(){
+  if (!charts.hit) return;
+  let history, qd, total, ups;
+  if (MODE === 'real' && real.snapshot){
+    history = real.snapshot.history || [];
+    qd = real.snapshot.qtype_dist || { A:0, AAAA:0, 其他:0 };
+    total = (real.snapshot.counters && real.snapshot.counters.total) || 0;
+    ups = real.snapshot.upstreams || [];
+  } else {
+    history = sim.history;
+    qd = sim.qtypeDist;
+    total = sim.counters.total;
+    ups = config.upstreams.filter(u => u.enabled).map(u => { const lat = u.latency; return { name:u.name, latency:lat, success_rate:100 }; });
+  }
+  const labels = history.map(s => s.label);
+  charts.hit.setOption(chartHitOpt(labels, history.map(s => s.hit_rate)), true);
+  charts.qps.setOption(chartQpsOpt(labels, history.map(s => s.qps)), true);
+  charts.lat.setOption(chartLatOpt(labels, history.map(s => s.lat)), true);
+  charts.qtypes.setOption(chartQtypesOpt(qd, total), true);
+  charts.up.setOption(chartUpOpt(ups), true);
+}
+function chartUpOpt(ups){
+  const names=[], data=[];
+  (ups||[]).forEach(u => {
+    // 只显示"有真实查询且实测延迟>0"的上游: 禁用/无流量上游的 0ms 静态值
+    // 对用户是误导("0ms 异常"), 过滤后图表与健康表口径一致。
+    if (!(u.queries > 0) || !(u.avg_latency > 0)) return;
+    const avg = u.avg_latency != null ? u.avg_latency : (u.latency != null ? u.latency : 0);
+    const sr = u.success_rate != null ? u.success_rate : 100;
+    const color = sr < 60 ? '#ff6b5e' : (sr < 85 ? '#ffb454' : '#2ee6c8');
+    const label = (u.addr || u.name || '–') + (u.port ? ':' + u.port : '');
+    names.push(label); data.push({ value:+avg.toFixed(1), itemStyle:{ color } });
+  });
+  return { grid:{ left:116, right:52, top:18, bottom:26 }, xAxis:{ type:'value', ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, formatter:'{value}ms', fontSize:11 } }, yAxis:{ type:'category', data:names, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, color:'#b8c6d6', fontSize:12, width:110, overflow:'truncate' } }, series:[{ type:'bar', data, barWidth:10, barCategoryGap:'82%', label:{ show:true, position:'right', color:'#93a2b3', fontSize:11, formatter:(p) => p.value + 'ms' } }], tooltip: baseTooltip('item') };
+}
+function refreshTelemetryUI(){
+  let c, al, m, ups;
+  if (MODE === 'real' && real.status){
+    c = real.status.counters; al = real.status.avg_latency_ms; m = real.status.map; ups = real.snapshot ? real.snapshot.upstreams : [];
+  } else {
+    c = sim.counters; al = simAvgLat(); m = { used: sim.cache.size, capacity: config.cacheSize };
+    ups = config.upstreams.filter(u => u.enabled).map(u => { const st = { ok:0, fail:0, latSum:0 }; return { name:u.name, proto:u.proto, addr:u.addr, port:u.port, queries:0, success_rate:100, avg_latency:u.latency, status:'待命' }; });
+  }
+  $('#kpi-total').textContent = c.total; $('#kpi-hit').textContent = c.hit; $('#kpi-kd').textContent = (c.kernelDirect !== undefined ? c.kernelDirect : c.kernel_direct) || 0;
+  $('#kpi-lat').innerHTML = al != null ? al.toFixed(1) + '<span class="u">ms</span>' : '–';
+  $('#kpi-up').textContent = (c.upstreamQueries !== undefined ? c.upstreamQueries : c.upstream_queries) || 0; $('#kpi-err').textContent = c.errors || 0;
+  const rh = (MODE === 'real' && real.status && real.status.rule_hits) ? real.status.rule_hits : {};
+  const rhSum = (rh.block||0) + (rh.domestic||0) + (rh.global||0) + (rh.forceIp||0);
+  const rhEl = $('#kpi-rule');
+  if (rhEl) rhEl.textContent = rhSum;
+  const rhSub = $('#kpi-rule-sub');
+  if (rhSub) rhSub.innerHTML = '<span class="rd">屏蔽 ' + (rh.block||0) + '</span><span class="cy">国内 ' + (rh.domestic||0) + '</span><span class="am">国外 ' + (rh.global||0) + '</span><span class="gy">强制IP ' + (rh.forceIp||0) + '</span>';
+  const cpl = $('#cache-policy-label');
+  if (cpl){
+    const cp = (MODE === 'real' && real.status && real.status.cache_policy) ? real.status.cache_policy
+             : (MODE === 'sim' ? 'lru' : '');
+    if (cp) cpl.textContent = '缓存策略: ' + (cp === 'tinylfu' ? 'W-TinyLFU' : 'LRU 分区') + ' · 容量 ' + (m ? m.capacity : config.cacheSize);
+  }
+  const cfEl = $('#cfg-cache-file');
+  if (cfEl && MODE === 'real' && real.status && real.status.cache_file){
+    cfEl.textContent = real.status.cache_file; cfEl.title = real.status.cache_file;
+  } else if (cfEl && MODE === 'sim'){ cfEl.textContent = '（仿真模式不落盘）'; cfEl.title = ''; }
+  refreshMapUI(m);
+  const tb = $('#up-health tbody');
+  let h = '';
+  // 过滤: 只显示"启用"或"有真实查询数据且成功率>0"的上游——禁用/纯兜底候选
+  // 上游不展示 0ms/"异常" 误导。查询数为 0 的已禁用上游会被过滤掉。
+  (ups || []).forEach(u => {
+    const isEnabled = u.enabled === true;
+    const hasRealData = (u.queries || 0) > 0 && (u.success_rate || 0) > 0;
+    if (!isEnabled && !hasRealData) return;
+    const sr = u.success_rate != null ? u.success_rate : (isEnabled ? 100 : 0);
+    const status = u.status || (sr >= 85 ? '健康' : (sr >= 60 ? '抖动' : '异常'));
+    const dotColor = sr >= 85 ? 'var(--green)' : (sr >= 60 ? 'var(--amber)' : 'var(--red)');
+    h += '<tr><td class="ip">' + esc(u.name) + '</td><td>' + (u.proto||'') + '</td><td>' + (u.queries||0) + '</td><td>' + sr.toFixed(1) + '%</td><td>' + (u.avg_latency!=null?u.avg_latency.toFixed(1):'–') + 'ms</td><td><span class="mono" style="color:' + dotColor + '">● ' + esc(status) + '</span></td></tr>';
+  });
+  tb.innerHTML = h || '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:12px">暂无已启用且产生查询的上游</td></tr>';
+  // Top N 统计(域名/客户端/上游)
+  const stTop = (MODE === 'real' && real.status) ? real.status : null;
+  if (stTop){
+    const fmtTop = (arr, unit) => (arr && arr.length ? arr.slice(0,8).map(x => x[0] + ' <span style="color:var(--text3)">' + x[1] + unit + '</span>').join('<br>') : '暂无数据');
+    const td = $('#top-domains'); if (td) td.innerHTML = fmtTop(stTop.top_domains, '');
+    const tc = $('#top-clients'); if (tc) tc.innerHTML = fmtTop(stTop.top_clients, '');
+    const tu = $('#top-ups'); if (tu) tu.innerHTML = fmtTop(stTop.top_upstreams, ' 次');
+  } else {
+    ['top-domains','top-clients','top-ups'].forEach(id => { const el = $(id); if (el) el.textContent = '–'; });
+  }
+}
+
+/* ---------------- 查询控制台 ---------------- */
+const qSteps = $('#q-steps'), qResult = $('#q-result'), qResultEmpty = $('#q-result-empty');
+async function runManualQuery(){
+  const domain = $('#q-domain').value.trim();
+  if (!domain) return;
+  const qtype = $('#q-type').value;
+  $('#q-steps').innerHTML = ''; $('#q-result').classList.remove('show'); qResultEmpty.style.display = 'block';
+  const t0 = performance.now();
+  let result;
+  if (MODE === 'real'){
+    try { result = await API.post('/api/query', { domain, qtype }); }
+    catch(e){ qSteps.innerHTML = '<div class="q-step warn"><span class="st-time">+0ms</span><span class="st-tag">ERR</span><span class="st-txt">后端 API 调用失败: ' + esc(e.message) + '</span></div>'; return; }
+  } else {
+    result = simResolve(domain, qtype, { silent:true });
+  }
+  const steps = result.trace || [];
+  for (let i = 0; i < steps.length; i++){
+    const s = steps[i];
+    const div = document.createElement('div');
+    div.className = 'q-step ' + s.tag;
+    div.innerHTML = '<span class="st-time">+' + (performance.now() - t0).toFixed(1) + 'ms</span><span class="st-tag">' + esc(s.tag).toUpperCase() + '</span><span class="st-txt">' + esc(s.text) + '</span>';
+    qSteps.appendChild(div);
+    await new Promise(r => setTimeout(r, 120));
+    qSteps.scrollTop = qSteps.scrollHeight;
+  }
+  renderManualResult(result);
+  spawnPacket(result.domain, result.hit === true, result.error === true, 0);
+  if (MODE === 'sim'){
+    sim.manualHistory.push({ ts: nowTs(), domain, qtype, answer: result.chosen, lat: result.latency });
+    renderHistory(sim.manualHistory);
+  } else {
+    const snap = await API.get('/api/snapshot');
+    renderHistory(snap.manual_history || []);
+  }
+}
+function renderManualResult(result){
+  qResultEmpty.style.display = 'none'; qResult.classList.add('show');
+  const tag = result.error ? 'err' : (result.hit ? 'hit' : 'miss');
+  const tagTxt = result.error ? 'SERVFAIL' : (result.hit ? '缓存命中 · 缓存直答' : '未命中 · 用户态解析');
+  let h = '<div class="res-head"><span class="domain">' + esc(result.domain) + '</span><span class="rtype">' + esc(result.qtype) + '</span>' +
+    '<span class="res-tag ' + tag + '">' + tagTxt + '</span><span class="lat">' + (result.latency||0).toFixed(2) + 'ms · TTL ' + (result.ttl_left||result.ttl||0) + 's</span></div>';
+  if (result.error){
+    h += '<div class="hint">解析失败: ' + esc(result.reason) + '。可检查上游服务器是否启用、分流规则是否屏蔽、或网络是否可达。</div>';
+  } else {
+    h += '<table class="tbl"><thead><tr><th>地址</th><th>来源上游</th><th>TTL</th></tr></thead><tbody>';
+    (result.answers || []).forEach((a, i) => {
+      h += '<tr' + (i === 0 ? ' class="choosed"' : '') + '><td class="ip">' + esc(a.value) + '</td><td>' + esc(a.from) + '</td><td>' + (a.ttl != null ? a.ttl + 's' : '–') + '</td></tr>';
+    });
+    h += '</tbody></table>';
+  }
+  qResult.innerHTML = h;
+}
+function renderHistory(list){
+  const box = $('#q-history');
+  if (!list || !list.length){ box.innerHTML = '<div class="empty">暂无手动查询记录。</div>'; return; }
+  let h = '<table class="tbl"><thead><tr><th>时间</th><th>域名</th><th>类型</th><th>结果</th><th>耗时</th></tr></thead><tbody>';
+  list.slice().reverse().slice(0, 20).forEach(e => {
+    h += '<tr><td>' + esc(e.ts || '').slice(0,8) + '</td><td class="ip">' + esc(e.domain) + '</td><td>' + esc(e.qtype) + '</td><td>' + esc(e.answer) + '</td><td>' + (e.lat||0).toFixed(1) + 'ms</td></tr>';
+  });
+  h += '</tbody></table>';
+  box.innerHTML = h;
+}
+
+/* ---------------- 配置中心 ---------------- */
+const GROUP_LABEL = { domestic:'国内', global:'海外' };
+const PROTO_LABEL = { udp:'UDP', tcp:'TCP', doh:'DoH', dot:'DoT', doq:'DoQ', doh3:'DoH3' };
+const ACTION_LABEL = { group:'使用分组', forceIp:'强制 IP', block:'屏蔽', allow:'放行(白名单)' };
+function renderConfig(){
+  if (MODE === 'real' && real.config){
+    const c = real.config;
+    $('#cfg-size').value = c.cache_size; $('#cfg-size-r').value = c.cache_size;
+    $('#cfg-ttl').value = c.ttl; $('#cfg-ttl-r').value = c.ttl;
+    $('#cfg-prefetch').checked = !!c.prefetch; $('#cfg-kdirect').checked = !!c.kernel_direct;
+    $('#cfg-ttlmin').value = c.ttl_min || 0; $('#cfg-ttlmax').value = c.ttl_max || 0;
+    $('#cfg-stale').checked = !!c.serve_stale; $('#cfg-stalettl').value = c.stale_ttl || 3600;
+    $('#cfg-persistttl').value = c.persist_ttl || 0;
+    $('#cfg-speed').checked = !!c.speed_test; $('#cfg-spint').value = c.speed_interval_ms;
+    $('#cfg-fallback').checked = !!c.fallback; $('#cfg-v4first').checked = !!c.ipv4_first;
+    $('#cfg-v6').checked = !!c.ipv6; $('#cfg-v4smart').checked = !!c.prefer_ipv4;
+    $('#cfg-ednssize').value = c.edns_udp_size || 1232; $('#cfg-padding').checked = !!c.padding;
+    $('#cfg-timeout').value = c.timeout_ms || 1500;
+    renderUpstreams(c.upstreams || []); renderRules(c.rules || []); renderRuleSubs(c.rule_subscriptions || []);
+    // 合并连接级健康度(来自 /api/upstreams): 配置页上游表格显示真实连接延迟
+    API.get('/api/upstreams').then(r => {
+      if (r && r.upstreams){
+        const m = {};
+        (r.upstreams).forEach(x => { m[x.id] = x; });
+        (c.upstreams || []).forEach(u => { const h = m[u.id]; if (h){ u.conn_avg_lat = h.conn_avg_lat; u.conn_ok = h.conn_ok; u.conn_fail = h.conn_fail; u.conn_key = h.conn_key; } });
+        renderUpstreams(c.upstreams || []);
+      }
+    }).catch(() => {});
+  } else {
+    $('#cfg-size').value = config.cacheSize; $('#cfg-size-r').value = config.cacheSize;
+    $('#cfg-ttl').value = config.ttl; $('#cfg-ttl-r').value = config.ttl;
+    $('#cfg-prefetch').checked = config.prefetch; $('#cfg-kdirect').checked = config.kernelDirect;
+    $('#cfg-ttlmin').value = config.ttlMin || 0; $('#cfg-ttlmax').value = config.ttlMax || 0;
+    $('#cfg-stale').checked = config.serveStale; $('#cfg-stalettl').value = config.staleTtl;
+    $('#cfg-persistttl').value = config.persistTtl || 0;
+    $('#cfg-speed').checked = config.speedTest; $('#cfg-spint').value = config.speedInterval;
+    $('#cfg-fallback').checked = config.fallback; $('#cfg-v4first').checked = config.ipv4First;
+    $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.preferIpv4;
+    $('#cfg-ednssize').value = config.ednsUdpSize || 1232; $('#cfg-padding').checked = config.padding;
+    $('#cfg-timeout').value = config.timeout;
+    renderUpstreams(config.upstreams); renderRules(config.rules); renderRuleSubs(config.ruleSubscriptions || []);
+  }
+  bindConfigEvents();
+}
+function fullAddr(u){
+  // 上游完整地址(地址+URL路径合并, 端口独立列): https://dns.alidns.com/dns-query
+  if (!u) return '';
+  const proto = String(u.proto || 'udp').toLowerCase();
+  const scheme = { udp:'udp', tcp:'tcp', doh:'https', doh3:'https', dot:'tls', doq:'quic' }[proto] || proto;
+  let s = scheme + '://' + (u.addr || '');
+  let url = u.url || '';
+  if (/^(doh|doh3|doq)$/.test(proto)){
+    if (url && url.charAt(0) !== '/') url = '/' + url;
+    if (!url) url = '/dns-query';
+  }
+  return s + url;
+}
+function connBadge(u){
+  // 连接维度健康度徽标(来自 /api/upstreams 合并): 成功/失败/平均延迟
+  if (u.conn_avg_lat == null) return '<span class="conn-badge" title="连接级健康度待统计">-</span>';
+  const cls = (u.conn_fail || 0) > (u.conn_ok || 0) ? 'bad' : ((u.conn_avg_lat || 0) > 500 ? 'slow' : 'ok');
+  return '<span class="conn-badge ' + cls + '" title="连接级健康度: 成功 ' + (u.conn_ok||0) + ' / 失败 ' + (u.conn_fail||0) + ' · ' + esc(u.conn_key||'') + '">' +
+    (u.conn_avg_lat != null ? (Math.round(u.conn_avg_lat*10)/10) + 'ms' : '-') + ' · ' + (u.conn_ok||0) + '/' + (u.conn_fail||0) + '</span>';
+}
+function renderUpstreams(ups){
+  const box = $('#up-list');
+  box.innerHTML = ups.map(u => {
+    const full = fullAddr(u);
+    const portOpts = [53, 443, 853, 1053, 5353];
+    const portHtml = portOpts.map(p => '<option value="' + p + '"' + (Number(u.port) === p ? ' selected' : '') + '>' + p + '</option>').join('') +
+      (portOpts.indexOf(Number(u.port)) < 0 && u.port != null ? '<option value="' + u.port + '" selected>' + u.port + '</option>' : '');
+    return '<div class="up-row">' +
+    '<label class="switch"><input type="checkbox" data-f="enabled" data-id="' + u.id + '"' + (u.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
+    '<input class="text" data-f="name" data-id="' + u.id + '" value="' + esc(u.name) + '" title="上游名称">' +
+    '<select class="q-sel" data-f="proto" data-id="' + u.id + '">' + ['udp','tcp','doh','dot','doq','doh3'].map(p => '<option value="' + p + '"' + (String(u.proto||'udp').toLowerCase() === p ? ' selected' : '') + '>' + PROTO_LABEL[p] + '</option>').join('') + '</select>' +
+    '<input class="text" data-f="fulladdr" data-id="' + u.id + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29)">' +
+    '<select class="q-sel" data-f="port" data-id="' + u.id + '">' + portHtml + '</select>' +
+    '<select class="q-sel" data-f="group" data-id="' + u.id + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
+    (u.latency != null
+      ? '<input class="num" type="number" data-f="latency" data-id="' + u.id + '" min="1" max="500" value="' + u.latency + '" title="基础延迟(ms), 实时查询延迟以遥测为准">'
+      : '<span class="lat-pending" title="应用配置后自动实测延迟">待测</span>') +
+    connBadge(u) +
+    '<button class="del" data-del="' + u.id + '">×</button></div>';
+  }).join('');
+}
+function renderRules(rules){
+  const box = $('#rule-list');
+  box.innerHTML = rules.map(r =>
+    '<div class="cfg-row">' +
+    '<input class="text" data-r="match" data-id="' + r.id + '" value="' + esc(r.match) + '" placeholder="*.example.com" style="width:190px">' +
+    '<select class="q-sel" data-r="action" data-id="' + r.id + '">' + ['group','forceIp','block','allow'].map(a => '<option value="' + a + '"' + (r.action === a ? ' selected' : '') + '>' + ACTION_LABEL[a] + '</option>').join('') + '</select>' +
+    (r.action === 'group' ? '<select class="q-sel" data-r="group" data-id="' + r.id + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (r.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' : '') +
+    (r.action === 'forceIp' ? '<input class="text" data-r="ip" data-id="' + r.id + '" value="' + esc(r.ip || '') + '" placeholder="1.2.3.4">' : '') +
+    '<input class="num" data-r="ttl_min" data-id="' + r.id + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_min != null && r.ttl_min !== '' ? r.ttl_min : '') + '" placeholder="TTL↓" title="规则级 TTL 下限(秒), 覆盖全局下发 TTL 下限; 留空继承全局" style="width:62px">' +
+    '<input class="num" data-r="ttl_max" data-id="' + r.id + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_max != null && r.ttl_max !== '' ? r.ttl_max : '') + '" placeholder="TTL↑" title="规则级 TTL 上限(秒), 覆盖全局下发 TTL 上限; 留空继承全局" style="width:62px">' +
+    '<button class="del" data-delrule="' + r.id + '" style="margin-left:auto">×</button></div>'
+  ).join('');
+  bindRuleEvents();
+}
+function renderRuleSubs(subs){
+  const box = $('#rule-sub-list');
+  if (!box) return;
+  if (!subs || !subs.length){
+    box.innerHTML = '<div class="note" style="padding:4px 2px">暂无订阅, 在下方输入订阅链接添加</div>';
+    return;
+  }
+  box.innerHTML = subs.map(s =>
+    '<div class="sub-item">' +
+    '<span class="su" title="' + esc(s.url) + '">' + esc(s.url) + '</span>' +
+    '<span class="sm"><b>' + (s.count != null ? s.count : 0) + '</b> 条</span>' +
+    '<span class="sm">' + esc(s.updated_at || '-') + '</span>' +
+    '<span class="sm">' + (ACTION_LABEL[s.action] || s.action) + '</span>' +
+    '<button class="btn" data-subupdate="' + esc(s.url) + '">更新</button>' +
+    '<button class="del" data-subdel="' + esc(s.url) + '">×</button></div>'
+  ).join('');
+  $$('#rule-sub-list [data-subupdate]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const url = el.dataset.subupdate;
+      el.disabled = true; el.textContent = '更新中…';
+      try {
+        const res = await API.post('/api/rules/subscribe/update', { url });
+        note('订阅更新完成: ' + res.count + ' 条', 'var(--green)');
+        await refreshConfigAfterChange();
+      } catch(e){ note('订阅更新失败: ' + e.message, 'var(--red)'); }
+      finally { el.disabled = false; el.textContent = '更新'; }
+    });
+  });
+  $$('#rule-sub-list [data-subdel]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const url = el.dataset.subdel;
+      if (!confirm('删除订阅 ' + url + ' ?\n(仅移除订阅, 不影响逐条规则)')) return;
+      try {
+        await API.del('/api/rules/subscribe?url=' + encodeURIComponent(url));
+        note('订阅已删除', 'var(--green)');
+        await refreshConfigAfterChange();
+      } catch(e){ note('删除失败: ' + e.message, 'var(--red)'); }
+    });
+  });
+}
+async function refreshConfigAfterChange(){
+  const c = await API.get('/api/config');
+  if (MODE === 'real' && c){ real.config = c; renderConfig(); }
+}
+function currentUpstreams(){ return MODE === 'real' && real.config ? real.config.upstreams : config.upstreams; }
+function currentRules(){ return MODE === 'real' && real.config ? real.config.rules : config.rules; }
+function bindRuleEvents(){
+  const rules = currentRules();
+  $$('#rule-list [data-r]').forEach(el => {
+    el.addEventListener('change', () => {
+      const r = rules.find(x => x.id === el.dataset.id); if (!r) return;
+      if (el.dataset.r === 'ttl_min' || el.dataset.r === 'ttl_max'){
+        const v = el.value.trim();
+        if (v === '') delete r[el.dataset.r];           // 留空 = 删除字段 = 继承全局
+        else r[el.dataset.r] = clamp(+v, 0, 86400);    // 规则级 TTL 覆盖全局
+        return;
+      }
+      r[el.dataset.r] = el.value;
+      if (el.dataset.r === 'action') renderRules(rules);
+    });
+  });
+  $$('#rule-list [data-delrule]').forEach(el => {
+    el.addEventListener('click', () => {
+      const list = rules.filter(x => x.id !== el.dataset.delrule);
+      if (MODE === 'real') real.config.rules = list; else config.rules = list;
+      renderRules(currentRules());
+    });
+  });
+}
+function bindConfigEvents(){
+  const ups = currentUpstreams();
+  $('#cfg-size').addEventListener('change', e => { if (MODE==='real') real.config.cache_size = clamp(+e.target.value,16,1048576); else config.cacheSize = clamp(+e.target.value,16,1048576); $('#cfg-size-r').value = e.target.value; });
+  $('#cfg-size-r').addEventListener('input', e => { if (MODE==='real') real.config.cache_size = +e.target.value; else config.cacheSize = +e.target.value; $('#cfg-size').value = e.target.value; });
+  $('#cfg-ttl').addEventListener('change', e => { if (MODE==='real') real.config.ttl = clamp(+e.target.value,5,3600); else config.ttl = clamp(+e.target.value,5,3600); $('#cfg-ttl-r').value = e.target.value; });
+  $('#cfg-ttl-r').addEventListener('input', e => { if (MODE==='real') real.config.ttl = +e.target.value; else config.ttl = +e.target.value; $('#cfg-ttl').value = e.target.value; });
+  const bindCfg = (id, key, conv) => { $(id).addEventListener('change', e => { if (MODE==='real') real.config[key] = conv(e); else config[key] = conv(e); }); };
+  bindCfg('#cfg-prefetch','prefetch', e => e.target.checked);
+  bindCfg('#cfg-kdirect','kernel_direct', e => e.target.checked);
+  bindCfg('#cfg-ttlmin','ttl_min', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-ttlmax','ttl_max', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-stale','serve_stale', e => e.target.checked);
+  bindCfg('#cfg-stalettl','stale_ttl', e => clamp(+e.target.value,10,86400));
+  bindCfg('#cfg-persistttl','persist_ttl', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-speed','speed_test', e => e.target.checked);
+  bindCfg('#cfg-spint','speed_interval_ms', e => clamp(+e.target.value,500,30000));
+  bindCfg('#cfg-fallback','fallback', e => e.target.checked);
+  bindCfg('#cfg-v4first','ipv4_first', e => e.target.checked);
+  bindCfg('#cfg-v6','ipv6', e => e.target.checked);
+  bindCfg('#cfg-v4smart','prefer_ipv4', e => e.target.checked);
+  bindCfg('#cfg-ednssize','edns_udp_size', e => clamp(+e.target.value,512,4096));
+  bindCfg('#cfg-padding','padding', e => e.target.checked);
+  bindCfg('#cfg-timeout','timeout_ms', e => clamp(+e.target.value,200,5000));
+  $('#up-list').addEventListener('change', e => {
+    const el = e.target, f = el.dataset.f, id = el.dataset.id; if (!f || !id) return;
+    const u = ups.find(x => x.id === id); if (!u) return;
+    if (f === 'enabled') u.enabled = el.checked;
+    else if (f === 'fulladdr') {
+      // 完整地址(地址+URL路径合并, 端口独立列)编辑: 自动解析拆回分字段
+      const parsed = parseUpstreamAddr(el.value, u.proto);
+      if (!parsed){ note('地址格式无法识别: ' + el.value, 'var(--red)'); el.value = fullAddr(u); return; }
+      const hadExplicitPort = /:\d+(\/|$)/.test(el.value.trim());  // 地址里显式写了端口
+      const oldPort = u.port;
+      u.proto = parsed.proto; u.addr = parsed.addr; u.url = parsed.url;
+      if (hadExplicitPort) u.port = parsed.port;   // 显式端口才覆盖(端口独立列编辑)
+      else u.port = oldPort || parsed.port;        // 否则保留原端口, 避免 8443→443 类丢失
+      // 同步协议下拉选中值与端口下拉
+      const row = el.closest('.up-row');
+      if (row){
+        const ps = row.querySelector('[data-f="proto"]'); if (ps) ps.value = u.proto;
+        const psel = row.querySelector('[data-f="port"]');
+        if (psel){
+          if ([53,443,853,1053,5353].indexOf(Number(u.port)) >= 0) psel.value = String(u.port);
+          else { const o = document.createElement('option'); o.value = String(u.port); o.textContent = String(u.port); o.selected = true; psel.appendChild(o); }
+        }
+      }
+      el.value = fullAddr(u);
+    }
+    else if (f === 'port') u.port = +el.value;
+    else if (f === 'proto') {
+      u.proto = el.value;
+      u.port = ({ udp:53, tcp:53, doh:443, dot:853, doq:853, doh3:443 }[el.value] || 53);  // 协议联动默认端口
+      const row = el.closest('.up-row');
+      if (row){ const fa = row.querySelector('[data-f="fulladdr"]'); if (fa) fa.value = fullAddr(u); }
+      if (MODE === 'sim') renderPipeline();
+    }
+    else if (f === 'latency') u.latency = clamp(+el.value, 1, 500);
+    else u[f] = el.value;
+    if (f === 'enabled' && MODE === 'sim') renderPipeline();
+  });
+  $('#up-list').addEventListener('click', e => {
+    const b = e.target.closest('[data-del]'); if (!b) return;
+    const list = ups.filter(x => x.id !== b.dataset.del);
+    if (MODE === 'real') real.config.upstreams = list; else config.upstreams = list;
+    renderConfig();
+  });
+  // 上游: 卡片内单行直接添加——输入完整地址自动识别协议/端口/路径
+  // 支持: https://host/path  quic://host  tls://host  udp://host  tcp://host
+  //       host:port  host  ip  ip:port；协议下拉选「自动」时按地址推断, 否则强制所选协议
+  const UP_PORT_DEFAULT = { udp:53, tcp:53, doh:443, dot:853, doq:853, doh3:443 };
+  function parseUpstreamAddr(raw, protoSel){
+    const s = (raw || '').trim();
+    if (!s) return null;
+    let proto = null, rest = s, url = '';
+    const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/);
+    if (m){
+      const scheme = m[1].toLowerCase();
+      rest = m[2];
+      if (scheme === 'https'){ proto = 'doh'; url = '/dns-query'; }
+      else if (scheme === 'http'){ proto = 'doh'; url = '/dns-query'; }   // 明文 DoH(端口 80)
+      else if (scheme === 'quic'){ proto = 'doq'; url = '/dns-query'; }
+      else if (scheme === 'tls' || scheme === 'dot'){ proto = 'dot'; url = ''; }
+      else if (scheme === 'udp'){ proto = 'udp'; url = ''; }
+      else if (scheme === 'tcp'){ proto = 'tcp'; url = ''; }
+      else if (scheme === 'doh'){ proto = 'doh'; url = '/dns-query'; }
+      else if (scheme === 'doh3'){ proto = 'doh3'; url = '/dns-query'; }
+      else return { error: '无法识别的协议前缀 ' + scheme + '://（支持 https/http/quic/tls/udp/tcp）' };
+    } else if (protoSel && protoSel !== 'auto'){
+      proto = protoSel;   // 用户显式指定协议
+      if (proto === 'doh' || proto === 'doh3' || proto === 'doq') url = '/dns-query';
+    } else {
+      proto = 'udp';      // 无前缀 + 自动 → 默认 UDP
+    }
+    // 拆分 host:port 与路径
+    let host = rest, port = UP_PORT_DEFAULT[proto];
+    const slash = host.indexOf('/');
+    if (slash >= 0){
+      const p = host.slice(slash);
+      if (proto === 'doh' || proto === 'doh3' || proto === 'doq'){
+        url = p.startsWith('/') ? p : '/' + p;
+      }
+      host = host.slice(0, slash);
+    }
+    const colon = host.lastIndexOf(':');
+    if (colon > 0 && /^\d+$/.test(host.slice(colon + 1))){
+      port = parseInt(host.slice(colon + 1), 10);
+      host = host.slice(0, colon);
+    }
+    if (!host || !/^[a-zA-Z0-9.\-_:\[\]]+$/.test(host)){
+      return { error: '地址格式无法识别: ' + s };
+    }
+    if (proto === 'doh' || proto === 'doh3' || proto === 'doq'){
+      if (!url) url = '/dns-query';
+      if (url.charAt(0) !== '/') url = '/' + url;
+    } else {
+      url = '';
+    }
+    return { proto: proto, addr: host, port: port, url: url };
+  }
+  function addUpstreamFromInput(){
+    const raw = ($('#up-add-addr').value || '').trim();
+    if (!raw){ note('请输入上游完整地址后再添加', 'var(--red)'); $('#up-add-addr').focus(); return; }
+    const protoSel = $('#up-add-proto').value;
+    const group = $('#up-add-group').value;
+    const parsed = parseUpstreamAddr(raw, protoSel);
+    if (!parsed || parsed.error){ note(parsed ? parsed.error : '地址为空', 'var(--red)'); $('#up-add-addr').focus(); return; }
+    const list = currentUpstreams();
+    const n = list.length + 1;
+    list.push({ id:'u' + Date.now(), name:'上游 ' + n, proto: parsed.proto, addr: parsed.addr,
+                port: parsed.port, url: parsed.url, group: group, latency: null, enabled: true });
+    renderConfig();
+    $('#up-add-addr').value = '';
+    $('#up-add-addr').focus();
+    const disp = parsed.proto === 'doh' || parsed.proto === 'doh3' || parsed.proto === 'doq'
+      ? parsed.proto + '://' + parsed.addr + ':' + parsed.port + parsed.url
+      : parsed.proto + '://' + parsed.addr + ':' + parsed.port;
+    note('已添加上游 ' + disp + ' (' + (PROTO_LABEL[parsed.proto] || parsed.proto.toUpperCase()) + ':' + parsed.port + ')', 'var(--green)');
+  }
+  $('#btn-add-up').addEventListener('click', addUpstreamFromInput);
+  $('#up-add-addr').addEventListener('keydown', e => { if (e.key === 'Enter') addUpstreamFromInput(); });
+  $('#btn-reprobe').addEventListener('click', async () => {
+    if (MODE !== 'real'){ note('仿真模式使用内置估算延迟, 无需测速', 'var(--text3)'); return; }
+    note('正在实测全部上游延迟…', 'var(--amber)');
+    try {
+      note('正在实测上游延迟…', 'var(--amber)');
+      const res = await API.post('/api/reprobe');
+      const rs = res.results || [];
+      const okN = rs.filter(r => r.ok).length;
+      const parts = rs.map(r => r.name + ' ' + r.old + '→' + (r.ok ? r.new : r.new + '(保留)') + 'ms');
+      note('重新测速完成 ' + okN + '/' + rs.length + ' 个: ' + parts.join('  ·  '), okN ? 'var(--green)' : 'var(--red)');
+      const c = await API.get('/api/config');
+      real.config = c; renderConfig();
+    } catch(e){ note('测速失败: ' + e.message, 'var(--red)'); }
+  });
+  // 导入域名列表: 取消 prompt 弹窗, 卡片内内联导入行直接执行
+  $('#import-action').addEventListener('change', () => {
+    const ip = $('#import-ip');
+    if (ip) ip.style.display = ($('#import-action').value === 'forceIp') ? '' : 'none';
+  });
+  async function runImport(){
+    if (MODE !== 'real'){ note('仿真模式无法导入, 请连接后端', 'var(--text3)'); return; }
+    const input = ($('#import-input').value || '').trim();
+    if (!input){ note('请输入域名列表后再导入', 'var(--red)'); $('#import-input').focus(); return; }
+    const action = $('#import-action').value;
+    const payload = { action };
+    if (action === 'group') payload.group = $('#import-group').value;
+    if (action === 'forceIp') payload.ip = ($('#import-ip').value || '').trim() || '1.2.3.4';
+    payload.content = input;
+    try {
+      const res = await API.post('/api/rules/import', payload);
+      note('逐条导入完成: 新增 ' + res.added + ' 条规则', 'var(--green)');
+      $('#import-input').value = '';
+      $('#import-input').focus();
+      const c = await API.get('/api/config');
+      real.config = c; renderConfig();
+    } catch(e){ note('导入失败: ' + e.message, 'var(--red)'); }
+  }
+  $('#btn-import-rule').addEventListener('click', runImport);
+  $('#import-input').addEventListener('keydown', e => { if (e.key === 'Enter') runImport(); });
+  // 规则订阅: 链接订阅(明细存独立文件, 卡片只显示链接)
+  $('#sub-action').addEventListener('change', () => {
+    const v = $('#sub-action').value;
+    $('#sub-group').style.display = (v === 'group') ? '' : 'none';
+    $('#sub-ip').style.display = (v === 'forceIp') ? '' : 'none';
+  });
+  async function addSubRule(){
+    if (MODE !== 'real'){ note('仿真模式无法订阅, 请连接后端', 'var(--text3)'); return; }
+    const url = ($('#sub-url-input').value || '').trim();
+    if (!url){ note('请输入订阅链接', 'var(--red)'); $('#sub-url-input').focus(); return; }
+    if (!/^https?:\/\//i.test(url)){ note('仅支持 http/https 订阅链接', 'var(--red)'); return; }
+    const action = $('#sub-action').value;
+    const payload = { url, action };
+    if (action === 'group') payload.group = $('#sub-group').value;
+    if (action === 'forceIp') payload.ip = ($('#sub-ip').value || '').trim() || '1.2.3.4';
+    const btn = $('#btn-sub-rule');
+    btn.disabled = true; btn.textContent = '订阅中…';
+    try {
+      const res = await API.post('/api/rules/subscribe', payload);
+      note('订阅成功: ' + res.count + ' 条规则 (明细存 rules_sub.json)', 'var(--green)');
+      $('#sub-url-input').value = '';
+      const c = await API.get('/api/config');
+      real.config = c; renderConfig();
+    } catch(e){ note('订阅失败: ' + e.message, 'var(--red)'); }
+    finally { btn.disabled = false; btn.textContent = '订阅'; }
+  }
+  $('#btn-sub-rule').addEventListener('click', addSubRule);
+  $('#sub-url-input').addEventListener('keydown', e => { if (e.key === 'Enter') addSubRule(); });
+  // 分流规则: 单一输入框统一添加/批量导入(已与上方导入行合并)
+  $('#btn-import-rule').addEventListener('click', runImport);
+  $('#import-input').addEventListener('keydown', e => { if (e.key === 'Enter') runImport(); });
+  $('#btn-save-cfg').addEventListener('click', async () => {
+    if (MODE === 'real'){
+      try {
+        await API.put('/api/config', real.config);
+        note('配置已保存到后端 ' + real.configPath + ', 新增上游自动测速中…', 'var(--green)');
+        // 后端对新增上游异步实测延迟, 稍后拉取配置刷新显示真实延迟
+        setTimeout(async () => {
+          try {
+            const c = await API.get('/api/config');
+            real.config = c; renderConfig();
+          } catch(e){ /* 拉取失败保留当前视图 */ }
+        }, 1600);
+      } catch(e){ note('保存失败: ' + e.message, 'var(--red)'); }
+    } else {
+      persistConfig(); note('配置已保存到本地 (仿真模式)', 'var(--green)');
+    }
+  });
+  $('#btn-reset-cfg').addEventListener('click', () => {
+    if (MODE === 'real'){ API.get('/api/config').then(c => { real.config = c; renderConfig(); note('已重新加载后端配置', 'var(--text3)'); }); }
+    else { config = JSON.parse(JSON.stringify(DEFAULTS)); renderConfig(); note('已恢复默认 (仿真模式)', 'var(--text3)'); }
+  });
+  // 热重载: 不重启进程, 重新读取 config.json 并增量应用(容量/规则/geo/策略)
+  $('#btn-reload-cfg').addEventListener('click', async () => {
+    if (MODE !== 'real'){ note('仿真模式无需热重载', 'var(--text3)'); return; }
+    note('正在热重载配置…', 'var(--amber)');
+    try {
+      const r = await API.post('/api/reload', {});
+      if (r && r.ok === false){ note('热重载失败: ' + (r.error || '未知错误'), 'var(--red)'); return; }
+      const ch = (r && r.changed && r.changed.length) ? r.changed.join('; ') : '无实质变更';
+      note('热重载完成: ' + ch, 'var(--green)');
+      API.get('/api/config').then(c => { if (c){ real.config = c; renderConfig(); } });
+      if (typeof refreshTelemetryUI === 'function') refreshTelemetryUI();
+    } catch(e){ note('热重载失败: ' + e.message, 'var(--red)'); }
+  });
+  // 重启服务: 取消 confirm 确认框, 点击直接执行(后端异步重启, 立即返回)
+  $('#btn-restart-svc').addEventListener('click', async () => {
+    if (MODE !== 'real'){ note('仿真模式无需重启服务', 'var(--text3)'); return; }
+    note('正在重启 ebpdns 服务… 控制台将自动重连', 'var(--amber)');
+    try {
+      await API.post('/api/restart');
+      note('重启指令已下发, 服务重启中…', 'var(--amber)');
+      setTimeout(() => { if (typeof pollStatus === 'function') pollStatus(); }, 3500);
+    } catch(e){ note('重启失败: ' + e.message, 'var(--red)'); }
+  });
+}
+function note(txt, color){ const el = $('#cfg-saved-note'); el.textContent = txt; el.style.color = color; setTimeout(() => { el.textContent = '配置修改即时生效, 点击「应用配置」持久化到后端'; el.style.color = ''; }, 2600); }
+
+/* ---------------- 实时查询流 (仿真) ---------------- */
+let streamTimer = null, streamAcc = 0;
+function startSimStream(){
+  if (streamTimer) clearInterval(streamTimer);
+  streamAcc = 0;
+  streamTimer = setInterval(() => {
+    if (!sim.running) return;
+    streamAcc += config.liveRate * 0.05;
+    let n = Math.floor(streamAcc); streamAcc -= n;
+    while (n-- > 0 && sim.packets.length < 40){
+      const d = pickDomain(), qt = pickQtype();
+      const r = simResolve(d.name, qt);
+      if (r.error) spawnPacket(d.name, false, true, 0);
+      else spawnPacket(d.name, r.hit, false, 0);
+    }
+  }, 50);
+  setInterval(() => {
+    sim.history.push({ label: pad(new Date().getHours(),2) + ':' + pad(new Date().getMinutes(),2) + ':' + pad(new Date().getSeconds(),2), hit_rate: +simHitRate().toFixed(1), qps: simQps(), lat: simAvgLat() ? +simAvgLat().toFixed(1) : 0 });
+    if (sim.history.length > 120) sim.history.shift();
+    updateTopbar({ qps: simQps(), hit_rate: simHitRate(), avg_latency_ms: simAvgLat(), map: { used: sim.cache.size, capacity: config.cacheSize } });
+    refreshTelemetryUI();
+    if (route === 'telemetry') refreshCharts();
+  }, 1000);
+}
+function simReset(){
+  sim.cache.clear(); sim.counters = { total:0, hit:0, miss:0, kernelDirect:0, upstreamQueries:0, errors:0 };
+  sim.qtypeDist = { A:0, AAAA:0, 其他:0 }; sim.qpsWindow = []; sim.latencies = []; sim.history = []; sim.events = [];
+  sim.manualHistory = []; clearLogUI(); renderHistory([]);
+  refreshTelemetryUI();
+}
+
+/* ---------------- 轮询 (真实模式) ---------------- */
+let statusFail = 0;   // 后端连续不可达计数: 恢复后自动刷新配置区(重启后界面不刷新问题)
+async function pollStatus(){
+  try {
+    real.status = await API.get('/api/status');
+    if (statusFail > 0){
+      // 后端曾不可达(重启/崩溃恢复): 刷新配置与遥测数据, 避免界面停留在旧值
+      if (route === 'config') API.get('/api/config').then(c => { real.config = c; renderConfig(); }).catch(() => {});
+      if (route === 'telemetry') refreshTelemetryUI();
+      statusFail = 0;
+    }
+    updateTopbar({ qps: real.status.qps, hit_rate: real.status.hit_rate, avg_latency_ms: real.status.avg_latency_ms, map: real.status.map });
+    $('#foot-uptime').textContent = 'up ' + Math.floor(real.status.uptime_s/60) + 'm ' + (real.status.uptime_s%60) + 's · v' + (real.status.version || APP_VERSION);
+    // 顶栏与 KPI 卡同一数据源同一轮刷新: 避免"顶部延时与下面延时不同步"
+    if (route === 'telemetry') refreshTelemetryUI();
+  } catch(e){
+    statusFail++;
+  }
+}
+async function pollSnapshot(){
+  try {
+    real.snapshot = await API.get('/api/snapshot');
+    refreshTelemetryUI();
+    if (route === 'telemetry') refreshCharts();
+    renderHistory(real.snapshot.manual_history || []);
+  } catch(e){}
+}
+async function pollLogs(){
+  try {
+    const r = await API.get('/api/logs?since=' + real.logSeq);
+    if (r.events && r.events.length){
+      real.logs = real.logs.concat(r.events);
+      if (real.logs.length > 400) real.logs = real.logs.slice(-400);
+      renderLogBatch(r.events, true);
+    }
+    // 用后端返回的 next_seq 推进游标: events 是定长 deque, 满 500 会弹出
+    // 最旧条目, 若用 += events.length 累计位置索引, 弹出后新事件永远拉
+    // 不到(日志静默停更)。seq 游标彻底消除该错位。
+    if (r.next_seq != null) real.logSeq = r.next_seq;
+  } catch(e){}
+}
+async function pollPipeline(){
+  try {
+    real.pipeline = await API.get('/api/pipeline');
+    if (route === 'pipeline') renderPipeline();
+  } catch(e){}
+}
+function startRealPolls(){
+  pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
+  setInterval(pollStatus, 1000);
+  setInterval(pollSnapshot, 2500);
+  setInterval(pollLogs, 1500);
+  setInterval(pollPipeline, 5000);
+  $('#btn-run').style.display = 'none';
+  $('#load-seg').style.display = 'none';
+  $('#foot-mode').textContent = 'daemon 运行中 · REAL';
+  $('#foot-mode').style.color = 'var(--green)';
+  $('#query-hint').textContent = '手动解析会真实经过 BPF 缓存 / 多上游 / 测速择优 / 缓存回填全链路, 并计入遥测统计。';
+}
+
+/* ---------------- 绑定事件 ---------------- */
+function bindEvents(){
+  $$('.nav-item').forEach(n => n.addEventListener('click', () => setRoute(n.dataset.route)));
+  $('#btn-run').addEventListener('click', () => { sim.running = !sim.running; updateTopbar({ qps:simQps(), hit_rate:simHitRate(), avg_latency_ms:simAvgLat(), map:{used:sim.cache.size, capacity:config.cacheSize} }); $('#btn-run-txt').textContent = sim.running ? '暂停' : '运行'; });
+  $('#btn-clear').addEventListener('click', () => { if (MODE === 'real'){ API.post('/api/reset'); real.logs = []; real.logSeq = 0; clearLogUI(); } else simReset(); });
+  $$('#load-seg button').forEach(b => b.addEventListener('click', () => {
+    $$('#load-seg button').forEach(x => x.classList.remove('on')); b.classList.add('on'); config.liveRate = +b.dataset.load;
+  }));
+  $('#btn-query').addEventListener('click', runManualQuery);
+  $('#q-domain').addEventListener('keydown', e => { if (e.key === 'Enter') runManualQuery(); });
+  $('#btn-qclear').addEventListener('click', () => { if (MODE === 'sim'){ sim.manualHistory = []; renderHistory([]); } else { renderHistory([]); } });
+  // 实时日志: 每栏筛选框 + 全局搜索(输入即过滤, 实时生效)
+  $$('.lc-filter').forEach(inp => inp.addEventListener('input', () => {
+    logFilters[inp.dataset.f] = inp.value;
+    renderFilteredLogs();
+  }));
+  $('#log-search').addEventListener('input', e => {
+    logGlobalQ = e.target.value.trim().toLowerCase();
+    renderFilteredLogs();
+  });
+  $('#log-filter-clear').addEventListener('click', clearLogFilters);
+}
+
+/* ---------------- 启动 ---------------- */
+async function boot(){
+  const qp = new URLSearchParams(location.search);
+  // 路由优先级: ?route= 参数 > #hash 锚点 > 默认 pipeline
+  // (支持 http://host/#telemetry 等 hash 直达, 修复"刷新/重启后界面不刷新"问题)
+  const h = (location.hash || '').replace(/^#\/?/, '').trim();
+  const initialRoute = ROUTE_META[qp.get('route')] ? qp.get('route')
+    : (ROUTE_META[h] ? h : 'pipeline');
+  try {
+    let s = null;
+    try { s = await API.get('/api/status'); } catch(e){}
+    if (s && s.app === 'ebpdns') MODE = 'real';
+    if (MODE === 'real'){
+      try { real.config = await API.get('/api/config'); real.configPath = (s && s.config_path) || '/etc/ebpdns/config.json'; } catch(e){}
+      appendLogLine({ ts: nowTs(), level: 'sys', msg: 'ebpdns ' + APP_VERSION + ' 已连接后端 daemon · REAL 模式' });
+      renderPipeline(); bindEvents(); setRoute(initialRoute); initCharts();
+      startRealPolls();
+      requestAnimationFrame(frame);
+    } else {
+      appendLogLine({ ts: nowTs(), level: 'sys', msg: '未检测到后端 daemon, 进入浏览器仿真模式 (SIM)' });
+      $('#foot-mode').textContent = '演示仿真 · SIM';
+      $('#foot-mode').style.color = 'var(--amber)';
+      renderPipeline(); bindEvents(); setRoute(initialRoute); initCharts();
+      startSimStream();
+      requestAnimationFrame(frame);
+      const bt = Date.now();
+      setInterval(() => { const s2 = Math.floor((Date.now() - bt) / 1000); $('.side-foot .uptime').textContent = 'up ' + Math.floor(s2/60) + 'm ' + (s2%60) + 's · ' + APP_VERSION + '-sim'; }, 1000);
+    }
+  } catch(e){
+    try { console.error('ebpdns boot error:', e); } catch(_){}
+  }
+}
+boot();
+
+</script>
+</body>
+</html>

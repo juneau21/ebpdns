@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 juneau21
+Copyright (c) 2026 ebpdns contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,5 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+注: bpf/ 目录下的 eBPF 程序遵循 GPL-2.0 (见 ebpdns_xdp.bpf.c 顶部 SPDX 声明)。

@@ -1,0 +1,467 @@
+"""上游客户端：UDP / TCP / DoH / DoT。
+query_upstream() 返回 (ok, response_bytes, latency_ms, err_str)。
+
+2026-09-01 优化:
+  - UDP: 校验响应源地址与 qid (防 DNS 投毒/乱序)
+  - DoH / DoT: 连接复用 (keep-alive), 避免高频查询下每次 TLS 握手
+"""
+import collections
+import http.client
+import socket
+import ssl
+import struct
+import threading
+import time
+from . import dnsmsg
+from .dnsmsg import parse_tcp_frame, tcp_frame
+
+# DoH 默认路径（若配置未给 url）
+DOH_DEFAULT_PATH = "/dns-query"
+UA = "ebpdns/1.0 (Debian; SmartDNS-style resolver)"
+
+
+def _host_port(up):
+    addr = up.get("addr", "")
+    port = int(up.get("port", 53))
+    if addr.startswith("["):
+        # [v6]:port
+        idx = addr.find("]")
+        return addr[1:idx], port
+    return addr, port
+
+
+def _resolve_host(host, timeout=3):
+    """解析上游 hostname，优先 IPv4。返回 sockaddr 元组或 None。"""
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_UDP)
+    except OSError:
+        return None
+    for fam, _, _, _, sockaddr in infos:
+        if fam == socket.AF_INET:
+            return (sockaddr[0], 0)
+    if infos:
+        return infos[0][4]
+    return None
+
+
+# ---------------- 连接复用池（DoH / DoT） ----------------
+class _ConnPool:
+    """按 (proto, host, port, path) 维护可复用连接组。
+
+    每 key 最多 _MAX_CONN 个并发连接（BoundedSemaphore 控制), 并发查询可
+    并行使用不同连接——旧版单连接单锁会把同上游 DoH/DoT 查询完全串行化
+    (每次查询独占连接一个完整 HTTPS/TLS 往返, 高并发 miss 时全部排队)。
+    """
+
+    _MAX_CONN = 4
+    _MAX_IDLE = 30.0   # 连接空闲超时(秒): 超龄空闲连接惰性回收, 防长期运行连接泄漏
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}  # key -> {"conns": deque, "sem": BoundedSemaphore}
+
+    def entry(self, key):
+        with self._lock:
+            e = self._entries.get(key)
+            if e is None:
+                e = {"conns": collections.deque(), "sem": threading.BoundedSemaphore(self._MAX_CONN)}
+                self._entries[key] = e
+            return e
+
+    @staticmethod
+    def _idle_ok(conn, now):
+        """连接是否在空闲窗口内(未超龄)。连接对象打 _ebpdns_last_use 时间戳。"""
+        try:
+            last = getattr(conn, "_ebpdns_last_use", 0) or 0
+            return (now - last) < _ConnPool._MAX_IDLE
+        except Exception:
+            return True
+
+    def acquire(self, key, timeout):
+        """拿一个连接槽。返回 "NEW" 表示可新建连接; None 表示超时(池满)。
+        惰性回收: 空闲超龄连接在取出时关闭丢弃(不归还池), 防连接泄漏。"""
+        e = self.entry(key)
+        if not e["sem"].acquire(timeout=timeout):
+            return None
+        try:
+            with self._lock:
+                now = time.monotonic()
+                while e["conns"]:
+                    c = e["conns"].popleft()
+                    if self._idle_ok(c, now):
+                        return c
+                    # 超龄: 关闭并继续取下一个
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                return "NEW"
+        except Exception:
+            e["sem"].release()
+            return None
+
+    def release(self, key, conn):
+        e = self._entries.get(key)
+        if e is None:
+            return
+        if conn is not None:
+            with self._lock:
+                try:
+                    conn._ebpdns_last_use = time.monotonic()
+                except Exception:
+                    pass
+                e["conns"].append(conn)
+        e["sem"].release()
+
+    def discard(self, key):
+        """删除上游时回收该 key 的连接组(释放连接对象与信号量)。
+        连接对象由 GC 回收(TCP/TLS 连接无显式 close 时由 socket 析构关闭)。"""
+        with self._lock:
+            e = self._entries.pop(key, None)
+        if e is not None:
+            try:
+                for c in list(e.get("conns") or []):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+_pool = _ConnPool()
+
+
+def discard_upstream_conns(up):
+    """删除上游时回收 DoH/DoT 连接池条目(按 proto/host/port/path key),
+    防止 _pool 残留已删除上游的连接对象造成内存泄漏。"""
+    proto = str(up.get("proto", "")).lower()
+    if proto not in ("doh", "dot"):
+        return
+    host, port = _host_port(up)
+    path = str(up.get("url") or DOH_DEFAULT_PATH)
+    if not path.startswith("/"):
+        path = "/" + path
+    _pool.discard((proto, host, port, path))
+
+
+def _doh_conn(host, port, timeout):
+    return http.client.HTTPSConnection(host, port, timeout=timeout)
+
+
+def _doh_query(up, query_bytes, timeout_ms):
+    host, port = _host_port(up)
+    path = up.get("url") or DOH_DEFAULT_PATH
+    if not path.startswith("/"):
+        path = "/" + path
+    # key 含 path: 同一 host:port 不同 DoH 路径(如 NextDNS /4d5525 vs /dns-query)
+    # 必须独立连接池, 否则复用连接会把请求发到错误路径
+    key = ("doh", host, port, path)
+    timeout = timeout_ms / 1000.0
+    headers = {
+        "Content-Type": "application/dns-message",
+        "Accept": "application/dns-message",
+        "User-Agent": UA,
+    }
+    # 连接槽获取带超时: 池满(4 连接都在忙)时等待, 不无限阻塞
+    got = _pool.acquire(key, timeout)
+    if got is None:
+        return False, None
+    try:
+        conn = None if got == "NEW" else got
+        # 连接有效判据：HTTPConnection.sock 非 None（Python 3.10 无 is_connected()）
+        if conn is None or getattr(conn, "sock", None) is None:
+            try:
+                conn = _doh_conn(host, port, timeout)
+            except OSError:
+                _pool.release(key, None)
+                return False, None
+        try:
+            conn.request("POST", path, body=query_bytes, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status != 200 or not body:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _pool.release(key, None)
+                return False, None
+            _pool.release(key, conn)  # 复用成功，写回池
+            return True, body
+        except (OSError, http.client.HTTPException):
+            # 连接失效 → 关闭并一次性重试（新建连接）
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                conn = _doh_conn(host, port, timeout)
+                conn.request("POST", path, body=query_bytes, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status != 200 or not body:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _pool.release(key, None)
+                    return False, None
+                _pool.release(key, conn)
+                return True, body
+            except (OSError, http.client.HTTPException):
+                _pool.release(key, None)
+                return False, None
+    except Exception:
+        # 兜底: 任何异常路径都不泄漏连接槽
+        try:
+            _pool.release(key, None)
+        except Exception:
+            pass
+        return False, None
+
+
+def _dot_conn(host, port, timeout):
+    sock = socket.create_connection((host, port), timeout=timeout)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+    return sock
+
+
+def _dot_query(up, query_bytes, timeout_ms):
+    """DoT (DNS over TLS)：复用 TLS 连接组（多连接并发）。"""
+    host, port = _host_port(up)
+    key = ("dot", host, port, "")
+    timeout = timeout_ms / 1000.0
+    frame = tcp_frame(query_bytes)
+
+    def _exchange(sock):
+        sock.settimeout(timeout)
+        sock.sendall(frame)
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+            try:
+                msg, _ = parse_tcp_frame(buf)
+                return msg
+            except Exception:
+                continue
+
+    got = _pool.acquire(key, timeout)
+    if got is None:
+        return False, None
+    try:
+        sock = None if got == "NEW" else got
+        if sock is None:
+            try:
+                sock = _dot_conn(host, port, timeout)
+            except OSError:
+                _pool.release(key, None)
+                return False, None
+        try:
+            msg = _exchange(sock)
+            if msg is not None:
+                _pool.release(key, sock)  # 复用成功，写回池
+                return True, msg
+            _pool.release(key, None)
+            return False, None
+        except OSError:
+            # 连接失效 → 关闭重试一次
+            try:
+                sock.close()
+            except Exception:
+                pass
+            try:
+                sock = _dot_conn(host, port, timeout)
+                msg = _exchange(sock)
+                if msg is not None:
+                    _pool.release(key, sock)
+                    return True, msg
+                _pool.release(key, None)
+                return False, None
+            except (OSError, Exception):
+                _pool.release(key, None)
+                return False, None
+    except Exception:
+        try:
+            _pool.release(key, None)
+        except Exception:
+            pass
+        return False, None
+
+
+def _is_hostname(host):
+    return not host.replace(".", "").isdigit()
+
+
+# ---------------- UDP / TCP ---------------- #
+def _udp_query(up, query_bytes, timeout_ms):
+    host, port = _host_port(up)
+    addr = (host, port)
+    try:
+        qid = struct.unpack(">H", query_bytes[:2])[0]
+    except Exception:
+        qid = None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # 期望响应源 IP 集合: host 为域名时解析出全部 IP(A 记录可能多个,
+    # 单值校验会误丢来自其他 IP 的响应); 解析失败则集合为空 → 不校验源,
+    # 靠 qid(16bit 随机)兜底防投毒。
+    expect_ips = set()
+    if not _is_hostname(host):
+        expect_ips.add(host)
+    else:
+        try:
+            for i in socket.getaddrinfo(host, None, socket.AF_INET):
+                expect_ips.add(i[4][0])
+        except OSError:
+            pass
+    try:
+        sock.settimeout(timeout_ms / 1000.0)
+        sock.sendto(query_bytes, addr)
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            try:
+                data, src = sock.recvfrom(4096)
+            except socket.timeout:
+                return False, None
+            # 校验源地址（域名 host 用解析 IP 集合; 解析失败则不校验源, 靠 qid 兜底）
+            if expect_ips and src[0] not in expect_ips:
+                continue
+            if port and src[1] != port:
+                continue
+            if qid is not None and len(data) >= 2:
+                rid = struct.unpack(">H", data[:2])[0]
+                if rid != qid:
+                    continue  # 响应 ID 不匹配，继续等待（防乱序/投毒）
+            # DNS 0x20 投毒防护: 响应 question qname 大小写必须与查询一致
+            # (仅对明文 UDP 生效; 查询未做 0x20 时全小写 qname 也通过)
+            if not dnsmsg.check_0x20(query_bytes, data):
+                continue  # 大小写失配 = 伪造应答嫌疑, 丢弃继续等
+            return True, data
+        return False, None
+    except OSError:
+        return False, None
+    finally:
+        sock.close()
+
+
+def _tcp_query(up, query_bytes, timeout_ms, use_tls=False):
+    host, port = _host_port(up)
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout_ms / 1000.0)
+    except OSError:
+        return False, None
+    try:
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+        sock.settimeout(timeout_ms / 1000.0)
+        sock.sendall(tcp_frame(query_bytes))
+        buf = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return False, None
+            buf += chunk
+            try:
+                msg, _ = parse_tcp_frame(buf)
+            except Exception:
+                continue
+            # 明文 TCP 同样做 0x20 校验(加密 DoT 无投毒面, 跳过)
+            if not use_tls and not dnsmsg.check_0x20(query_bytes, msg):
+                continue
+            return True, msg
+    except OSError:
+        return False, None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _quic_available():
+    try:
+        from . import quic_upstream
+        return quic_upstream.available()
+    except Exception:
+        return False
+
+
+def _quic_query_doq(up, query_bytes, timeout_ms):
+    from . import quic_upstream
+    return quic_upstream.query_doq(up, query_bytes, timeout_ms)
+
+
+def _quic_query_doh3(up, query_bytes, timeout_ms):
+    from . import quic_upstream
+    return quic_upstream.query_doh3(up, query_bytes, timeout_ms)
+
+
+def query_upstream(up, query_bytes, timeout_ms=1500):
+    """按上游协议发起一次查询。返回 (ok, response_bytes, latency_ms, err_str)。"""
+    proto = str(up.get("proto", "udp")).lower()
+    t0 = time.monotonic()
+    try:
+        if proto == "udp":
+            ok, data = _udp_query(up, query_bytes, timeout_ms)
+        elif proto == "tcp":
+            ok, data = _tcp_query(up, query_bytes, timeout_ms, use_tls=False)
+        elif proto == "dot":
+            ok, data = _dot_query(up, query_bytes, timeout_ms)
+        elif proto == "doh":
+            ok, data = _doh_query(up, query_bytes, timeout_ms)
+        elif proto in ("doq", "doh3"):
+            if not _quic_available():
+                return False, None, timeout_ms, "aioquic 未安装 (pip install aioquic)"
+            if proto == "doq":
+                ok, data, _lat, _e = _quic_query_doq(up, query_bytes, timeout_ms)
+            else:
+                ok, data, _lat, _e = _quic_query_doh3(up, query_bytes, timeout_ms)
+        else:
+            return False, None, timeout_ms, "unknown proto %s" % proto
+    except Exception as e:
+        return False, None, int((time.monotonic() - t0) * 1000), str(e)
+    lat = int((time.monotonic() - t0) * 1000)
+    if not ok:
+        return False, None, lat, "query failed"
+    return True, data, lat, None
+
+
+def probe_ip(ip, query_bytes, timeout_ms=800):
+    """对候选 IP 发起一次快速 UDP DNS 探测（用于测速择优）。返回 RTT ms 或 None。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_ms / 1000.0)
+        t0 = time.monotonic()
+        sock.sendto(query_bytes, (ip, 53))
+        sock.recvfrom(2048)
+        return int((time.monotonic() - t0) * 1000)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def probe_tcp(ip, port=443, timeout_ms=800):
+    """对候选 IP 发起 TCP connect 探测（SmartDNS speed-check 风格, tcp:443）。
+
+    更贴近真实访问路径；非特权即可（ICMP 才需 root）。返回 RTT ms 或 None。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout_ms / 1000.0)
+        t0 = time.monotonic()
+        sock.connect((ip, port))
+        return int((time.monotonic() - t0) * 1000)
+    except OSError:
+        return None
+    finally:
+        sock.close()

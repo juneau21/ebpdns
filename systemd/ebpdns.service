@@ -1,0 +1,24 @@
+[Unit]
+Description=ebpdns - eBPF SmartDNS-style DNS resolver
+Documentation=file:///opt/ebpdns/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 默认以 root 运行以监听 53 端口并读写 /etc/ebpdns。
+# 若改用专用用户(如 ebpdns), 可去掉 User=root 并保留 AmbientCapabilities。
+User=root
+ExecStart=/opt/ebpdns/bin/ebpdns run --config /etc/ebpdns/config.json
+Restart=on-failure
+RestartSec=3
+# 优雅退出约 3s(SIGTERM 停止预取/线程池后快速退出); 15s 内未退出则 systemd 强杀
+TimeoutStopSec=15
+# 允许非特权绑定低端口(53) 与原始套接字(可选的 XDP 加载)
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=no
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
