@@ -1,5 +1,7 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
+请注意！！！所有代码来源豆包模型，软件已稳定运行，后续几乎不会更新
+
 把「ebpdns · eBPF 版 SmartDNS 解析器控制台」从浏览器内仿真升级为**真实可部署的 DNS 解析软件**。
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT）
