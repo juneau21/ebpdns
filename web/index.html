@@ -607,6 +607,8 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><input class="num" type="number" id="cfg-spint" min="500" max="30000" step="500"></div></div>
               <div class="cfg-row"><div class="lab">解析失败降级<small>首选上游超时后自动尝试其余上游</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-fallback"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">并发上游数<small>每次查询并发的上游数量(按延迟取最快N个, 全部失败自动回退剩余) · 预取固定用1个</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-maxup" min="1" max="16" step="1"></div></div>
               <div class="cfg-row"><div class="lab">超时阈值<small>ms · 单次上游查询超时上限</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-timeout" min="200" max="5000" step="100"></div></div>
               <div class="cfg-row"><div class="lab">IPv4 优先<small>同时存在 A / AAAA 记录时优先返回 A 记录</small></div>
@@ -882,7 +884,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.44";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.46";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
 const API = {
   async req(method, path, body){
@@ -902,7 +904,7 @@ const API = {
 const DEFAULTS = {
   cacheSize: 1024, ttl: 300, prefetch: true, kernelDirect: true, speedTest: true,
   ttlMin: 0, ttlMax: 0, serveStale: false, staleTtl: 3600, persistTtl: 0,
-  speedInterval: 2000, fallback: true, ipv4First: true, ipv6: true, edns: true,
+  speedInterval: 2000, fallback: true, maxParallelUpstreams: 3, ipv4First: true, ipv6: true, edns: true,
   ednsUdpSize: 1232, padding: false, preferIpv4: false,
   hook: 'XDP 原生', mapType: 'LRU_HASH', percpu: true, liveRate: 10, timeout: 1500,
   upstreams: [
@@ -1526,7 +1528,7 @@ function renderConfig(){
     $('#cfg-stale').checked = !!c.serve_stale; $('#cfg-stalettl').value = c.stale_ttl || 3600;
     $('#cfg-persistttl').value = c.persist_ttl || 0;
     $('#cfg-speed').checked = !!c.speed_test; $('#cfg-spint').value = c.speed_interval_ms;
-    $('#cfg-fallback').checked = !!c.fallback; $('#cfg-v4first').checked = !!c.ipv4_first;
+    $('#cfg-fallback').checked = !!c.fallback; $('#cfg-maxup').value = c.max_parallel_upstreams || 3; $('#cfg-v4first').checked = !!c.ipv4_first;
     $('#cfg-v6').checked = !!c.ipv6; $('#cfg-v4smart').checked = !!c.prefer_ipv4;
     $('#cfg-ednssize').value = c.edns_udp_size || 1232; $('#cfg-padding').checked = !!c.padding;
     $('#cfg-timeout').value = c.timeout_ms || 1500;
@@ -1548,7 +1550,7 @@ function renderConfig(){
     $('#cfg-stale').checked = config.serveStale; $('#cfg-stalettl').value = config.staleTtl;
     $('#cfg-persistttl').value = config.persistTtl || 0;
     $('#cfg-speed').checked = config.speedTest; $('#cfg-spint').value = config.speedInterval;
-    $('#cfg-fallback').checked = config.fallback; $('#cfg-v4first').checked = config.ipv4First;
+    $('#cfg-fallback').checked = config.fallback; $('#cfg-maxup').value = config.maxParallelUpstreams || 3; $('#cfg-v4first').checked = config.ipv4First;
     $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.preferIpv4;
     $('#cfg-ednssize').value = config.ednsUdpSize || 1232; $('#cfg-padding').checked = config.padding;
     $('#cfg-timeout').value = config.timeout;
@@ -1697,6 +1699,7 @@ function bindConfigEvents(){
   bindCfg('#cfg-speed','speed_test', e => e.target.checked);
   bindCfg('#cfg-spint','speed_interval_ms', e => clamp(+e.target.value,500,30000));
   bindCfg('#cfg-fallback','fallback', e => e.target.checked);
+  bindCfg('#cfg-maxup','max_parallel_upstreams', e => clamp(+e.target.value,1,16));
   bindCfg('#cfg-v4first','ipv4_first', e => e.target.checked);
   bindCfg('#cfg-v6','ipv6', e => e.target.checked);
   bindCfg('#cfg-v4smart','prefer_ipv4', e => e.target.checked);

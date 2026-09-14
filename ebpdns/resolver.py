@@ -219,11 +219,12 @@ class Resolver:
         self._bg_thread.start()
 
     # ---------------- 公共 ---------------- #
-    def resolve(self, domain, qtype, silent=False, counted=True, force_refresh=False, client_ip=None, _depth=0):
+    def resolve(self, domain, qtype, silent=False, counted=True, force_refresh=False, client_ip=None, _depth=0, max_upstreams=None):
         """核心解析流程。返回结构化结果 dict (含 rcode)。
 
         force_refresh=True: 跳过缓存命中直接重新解析(供预取在 TTL 到期前刷新)。
         client_ip: 查询来源客户端 IP, 用于实时查询日志展示; 后台任务(预取/刷新)传 None。
+        max_upstreams: 限制并发查询的上游数量(None=用配置 max_parallel_upstreams); 预取时传 1 只用最快上游。
         """
         d = self._normalize(domain)
         qtype = str(qtype).upper()
@@ -412,10 +413,19 @@ class Resolver:
             return self._result(d, qtype, [], None, False, True, "no-upstream",
                                 latency=lat, trace=trace, ttl_left=0, rcode=2)
         if cfg.get("fallback", True):
-            # 全部可用上游并发查询, 首答即返(测速择优): 不再截断前 N 个
-            trace.append({"tag": "eng", "text": "解析失败降级开 → 并发查询全部 %d 个可用上游: %s" % (len(ups), " / ".join(u["name"] for u in ups))})
+            # 按实测延迟排序(无实测时回退配置静态延迟), 先并发最快 max_upstreams 个
+            # 全部失败时自动回退到剩余上游(保持旧版容错性, 同时减少正常场景的上游请求)
+            _n = max_upstreams if max_upstreams is not None else int(cfg.get("max_parallel_upstreams", 3))
+            _n = max(1, min(_n, len(ups)))
+            _all_ups = sorted(ups, key=lambda u: self._upstream_eff_lat(u))
+            ups = _all_ups[:_n]
+            _backup_ups = _all_ups[_n:] if _n < len(_all_ups) else []
+            trace.append({"tag": "eng", "text": "解析失败降级开 → 先并发最快 %d/%d 个上游(实测延迟排序): %s%s" % (
+                _n, len(_all_ups), " / ".join(u["name"] for u in ups),
+                (" (失败回退 %d 个)" % len(_backup_ups)) if _backup_ups else "")})
         else:
             ups = ups[:1]
+            _backup_ups = []
             trace.append({"tag": "warn", "text": "解析失败降级关 → 仅用首选上游 %s (失败即 SERVFAIL)" % ups[0]["name"]})
         # ---- 构造查询（EDNS + 防分片 + 加密填充） ----
         # 按上游协议分组构造: 明文 UDP/TCP 用不填充报文; DoT/DoH/DoH3/DoQ 等
@@ -425,8 +435,19 @@ class Resolver:
         query_bytes = qmap["default"]
         # ---- 多上游并发 ----
         results = self._query_parallel(ups, query_bytes, d, qtype, trace, qmap=qmap)
-        tel.inc("upstream_queries", len(ups))
+        if counted:
+            tel.inc("upstream_queries", len(ups))
         ok_results = [r for r in results if r.get("answers")]
+        # ---- 最快N个全部失败 → 回退剩余上游(仅真失败, NXDOMAIN/NODATA不回退) ----
+        if not ok_results and _backup_ups:
+            _all_fail = all(not r.get("answers") and r.get("rcode") not in (0, 3) for r in results)
+            if _all_fail:
+                trace.append({"tag": "warn", "text": "最快 %d 个上游全部失败 → 回退剩余 %d 个上游" % (len(ups), len(_backup_ups))})
+                _bk = self._query_parallel(_backup_ups, query_bytes, d, qtype, trace, qmap=qmap)
+                if counted:
+                    tel.inc("upstream_queries", len(_backup_ups))
+                results.extend(_bk)
+                ok_results = [r for r in results if r.get("answers")]
         if not ok_results:
             # 全部无答案 → 区分 NXDOMAIN / NODATA / 真失败
             nx = [r for r in results if r.get("rcode") == 3]
@@ -827,6 +848,21 @@ class Resolver:
         self._fill_cache(self._ckey(d, "A"), d, "A", ans)
         trace.append({"tag": "eng", "text": "IPv4 优先回退: AAAA NODATA, 上游查得 A → %s" % ans[0]["value"]})
         return ans
+
+    def _upstream_eff_lat(self, u):
+        """上游有效延迟: 优先实测平均延迟, 无实测时回退配置静态延迟。
+        失败率>50%的上游惩罚性排后(加 500ms), 避免频繁选到故障上游。"""
+        try:
+            st = self.tel.per_upstream.get(u.get("id", ""))
+            if st and st.get("ok", 0) > 0:
+                avg = st["lat_sum"] / st["ok"]
+                total = st["ok"] + st.get("fail", 0)
+                if total > 10 and st.get("fail", 0) / total > 0.5:
+                    return avg + 500.0  # 高失败率惩罚
+                return avg
+        except Exception:
+            pass
+        return float(u.get("latency", 9999))
 
     def _query_parallel(self, ups, query_bytes, d, qtype, trace, qmap=None):
         """并发查询多个上游，首个有效应答（NOERROR 且有答案）即返回。
@@ -1234,7 +1270,7 @@ class Resolver:
 
     def _do_stale_refresh(self, key, d, qtype):
         try:
-            r = self.resolve(d, qtype, silent=True, counted=False, force_refresh=True)
+            r = self.resolve(d, qtype, silent=True, counted=False, force_refresh=True, max_upstreams=1)
             if r and not r.get("error"):
                 chosen = str(r.get("chosen") or "")
                 desc = chosen if _looks_like_ip(chosen) else "记录 %d 条" % len(r.get("answers") or [])
@@ -1337,8 +1373,8 @@ class Resolver:
 
     def _do_prefetch(self, d, qtype):
         try:
-            log.debug("预取触发 %s %s (强制刷新)", d, qtype)
-            r = self.resolve(d, qtype, silent=True, counted=False, force_refresh=True)
+            log.debug("预取触发 %s %s (强制刷新, 单上游)", d, qtype)
+            r = self.resolve(d, qtype, silent=True, counted=False, force_refresh=True, max_upstreams=1)
             if r and not r.get("error"):
                 chosen = str(r.get("chosen") or "")
                 # 只展示可读结果: 合法 IP 直接显示; rdata 无法解析(hex 乱码/未知类型)时

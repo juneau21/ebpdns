@@ -1,6 +1,6 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
-请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新
+把「ebpdns · eBPF 版 SmartDNS 解析器控制台」从浏览器内仿真升级为**真实可部署的 DNS 解析软件**。
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT）
 - 复刻 SmartDNS 的**测速择优、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
@@ -8,26 +8,6 @@
 - 内置 **HTTP JSON API + Web 控制台**：控制台连上后端即为真实数据（REAL 模式），后端不可达时自动降级为浏览器内仿真（SIM 模式）
 - 可选 **eBPF XDP 内核旁路**（`bpf/`）：`bpf/` 目录为参考实现、当前**未集成**到 daemon 运行路径，默认部署即为上方用户态路径
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
-
-- **六协议上游**：UDP/TCP/DoH/DoT/DoQ/DoH3，连接复用 + 熔断
-- **智能解析**：测速择优、域名分流、TTL 管控、预取、负缓存、双栈智能
-- **零依赖**：纯 Python 标准库，systemd 一键部署
-- **Web 控制台**：实时遥测、查询控制台、配置管理、分流规则
-- **高性能**：缓存命中 p50 0.1ms，QPS 5.8 万，10 分钟 3500 万查询 0 错误
-- **稳定**：崩溃自动重启、缓存持久化跨重启恢复、上游熔断降级
-
-WEB运行截图
-<img width="2560" height="1294" alt="8b7fd55aebaabd3c6b02dbf5cebad588" src="https://github.com/user-attachments/assets/04e6dcbb-b222-491a-80c7-118b15af7561" />
-
-<img width="2560" height="1294" alt="a83d7ef15e3db57cb7e31a933e20700d" src="https://github.com/user-attachments/assets/1cb773c9-506b-420a-86f4-cc0b5c3a22e2" />
-
-<img width="2560" height="2303" alt="f30077ac6517da6edcd01c02f1c0602f" src="https://github.com/user-attachments/assets/34b6f35f-e5f5-4360-b761-395223d281b7" />
-
-<img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
-
-<img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
-
-
 
 ---
 
@@ -317,6 +297,8 @@ ebpdns/
 
 ## 13. 版本历史（要点）
 
+- **v1.9.46**：**实测延迟排序（修复 v1.9.45 延迟升高）**。上游选择从"配置静态延迟排序"改为"实测平均延迟优先"，无实测时回退静态延迟；失败率>50%的上游加 500ms 惩罚排后。解决 v1.9.45 中配置延迟不准确（如 DNSPod DoH3 配置 1232ms 但实测 40ms）导致最快上游被排到后面、平均延迟从 24ms 升至 62ms 的问题。
+- **v1.9.45**：**上游请求爆炸修复（4889万→6.7万）**。三大优化：① 尊重 `max_parallel_upstreams` 配置——fallback=True 时按延迟排序取最快 N 个并发（默认 3），替代旧版"并发全部上游"；② 预取/serve-stale 后台刷新只用最快 1 个上游（`max_upstreams=1`），不需要测速择优；③ `upstream_queries` 计数加 `counted` 判断，预取/内部调用不再污染统计。生产环境 56 小时上游请求从 4889 万降至预计 ~1000 万（减少 80%），延迟和内存同步改善。
 - **v1.9.44**：**Bootstrap 并发解析（修复启动延迟 46 秒）**。Bootstrap 预解析从串行改为线程池并发，单查询超时 2s，总上限 5s；不可达 DNS 时 15 个 hostname 从 45 秒降至 5 秒。日志始终输出 `X/Y` 解析结果（0 个也输出，方便排查）。
 - **v1.9.43**：**TCP 端口冲突自愈**。TCP 服务器新增三重机制解决重启时 `Address already in use`：① SO_REUSEPORT 允许新旧进程同时绑定（内核负载均衡，零停机切换）；② 绑定失败自动重试 3 次（间隔 200ms，覆盖 TIME_WAIT 场景）；③ 关闭时 SO_LINGER=0 避免 TIME_WAIT 占用端口。TCP6/TCP 重启不再端口冲突。
 - **v1.9.42**：**Bootstrap 解析器（解决已知限制2）**。启动时用 UDP 上游（默认 223.5.5.5:53，可配置 `bootstrap_dns`）预解析所有 DoH/DoT 的 hostname，缓存 IP；后续 DoH/DoT 连接直接用 IP + SNI，彻底摆脱系统 `/etc/resolv.conf` 依赖。解析失败的上游自动回退系统 getaddrinfo，不影响启动。修复 `_is_hostname` 对 IPv6 地址的误判。
