@@ -22,7 +22,7 @@ WEB运行截图
 
 <img width="2560" height="1294" alt="a83d7ef15e3db57cb7e31a933e20700d" src="https://github.com/user-attachments/assets/1cb773c9-506b-420a-86f4-cc0b5c3a22e2" />
 
-<img width="2560" height="2303" alt="f30077ac6517da6edcd01c02f1c0602f" src="https://github.com/user-attachments/assets/34b6f35f-e5f5-4360-b761-395223d281b7" />
+<img width="2560" height="2769" alt="c5d0918474cc61c6cdda6f962fbbd6e4" src="https://github.com/user-attachments/assets/a0075bfb-ce7b-4090-ae4a-5937c73e6efe" />
 
 <img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
 
