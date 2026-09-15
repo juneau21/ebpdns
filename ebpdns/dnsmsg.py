@@ -302,12 +302,18 @@ def parse_message(data):
     for rr_type, count in (("answer", an), ("authority", ns), ("additional", ar)):
         for _ in range(count):
             name, pos = decode_name(data, pos)
+            # RR 头固定 10 字节: 校验长度防止越界 unpack
+            if pos + 10 > len(data):
+                raise DNSError("truncated RR header")
             rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
             pos += 10
             if rtype == TYPE_OPT:
                 # OPT RR 无 rdata 解析，直接跳过
                 pos += rdlen
                 continue
+            # rdata 长度越界校验
+            if pos + rdlen > len(data):
+                raise DNSError("truncated RR rdata")
             try:
                 value = _parse_rdata(data, pos, rtype, rdlen, len(data))
             except Exception:
@@ -378,27 +384,32 @@ def encode_rdata(rtype, value):
 
 
 def _response_header_bits(query_data, rcode, truncated=False):
-    """从请求报文提取 qid 并构造响应 flags。返回 (qid, flags)。"""
-    qid, flags, qd, an, ns, ar = struct.unpack(">HHHHHH", query_data[:12])
+    """从请求报文提取 qid 并构造响应 flags。返回 (qid_bytes, new_flags)。
+    qid 直接截取原始字节(大端序), 避免 unpack+repack 的双重开销。"""
+    qid_bytes = query_data[0:2]
+    flags = struct.unpack(">H", query_data[2:4])[0]
     new_flags = (flags & 0x0110) | 0x8080 | (rcode & 0x0F)  # QR RD RA
     if truncated:
         new_flags |= 0x0200  # TC
-    return qid, new_flags
+    return qid_bytes, new_flags
+
 def build_response_header(query_data, rcode, an_count, truncated=False):
     """构造响应 12 字节头（qid 回显 + QR/RD/RA/rcode + 计数）。"""
-    qid, new_flags = _response_header_bits(query_data, rcode, truncated)
-    return struct.pack(">HHHHHH", qid, new_flags, 1, an_count, 0, 0)
+    qid_bytes, new_flags = _response_header_bits(query_data, rcode, truncated)
+    return qid_bytes + struct.pack(">HHHHH", new_flags, 1, an_count, 0, 0)
 def build_response_body(domain, qtype, answers):
     """构造 question + answer section（不含 header）。供快路径按缓存条目预编码复用。"""
     question = encode_name(domain) + struct.pack(">HH", qtype, CLASS_IN)
-    answer_section = b""
+    out = bytearray(question)
     for a in answers:
         rtype = int(a.get("type", qtype) or qtype)
         ttl = int(a.get("ttl", 300))
         rdata = encode_rdata(rtype, a["value"])
         name = a.get("name", domain)
-        answer_section += encode_name(name) + struct.pack(">HHIH", rtype, CLASS_IN, ttl, len(rdata)) + rdata
-    return question + answer_section
+        out += encode_name(name)
+        out += struct.pack(">HHIH", rtype, CLASS_IN, ttl, len(rdata))
+        out += rdata
+    return bytes(out)
 def build_response(query_data, domain, qtype, answers, rcode=0):
     """基于请求报文构造响应。answers: [{value, type, ttl, name?}]。
     限制答案数量上限（避免超大 UDP 响应），超限设置 TC 位。"""
@@ -423,14 +434,15 @@ def build_error_response(query_data, rcode=2):
     header = struct.pack(">HHHHHH", qid, flags, qd, 0, 0, 0)
     pos = 12
     try:
-        question = b""
+        question = bytearray()
         for _ in range(qd):
             name, pos = decode_name(query_data, pos)
             if pos + 4 > len(query_data):
                 return None
-            question += encode_name(name) + query_data[pos:pos + 4]
+            question += encode_name(name)
+            question += query_data[pos:pos + 4]
             pos += 4
-        return header + question
+        return header + bytes(question)
     except Exception:
         # 解析失败退化为空 question 的错误响应（客户端可识别 rcode）
         return header

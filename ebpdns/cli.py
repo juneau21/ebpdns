@@ -14,7 +14,6 @@ from . import __version__
 from . import config as config_mod
 from .api import APIServer, AppContext, _parse_domain_list
 from .probe import start_first_probe
-from .cache import LRUCache
 from .resolver import Resolver
 from .server import DNSServer
 from .telemetry import Telemetry
@@ -167,8 +166,9 @@ def _setup_logging(level="info", fmt="text"):
 def build_app(cfg, config_path=None):
     """按配置构建 resolver / telemetry / cache / dns / api。"""
     telemetry = Telemetry()
-    cache = LRUCache(int(cfg.get("cache_size", 1024)))
-    resolver = Resolver(cfg, telemetry, cache)
+    # 不传预建 cache: 让 Resolver 按 cache_policy 自行创建
+    # (PartitionedCache / TinyLFUCache), 否则 LRUCache 占位会使策略选择失效。
+    resolver = Resolver(cfg, telemetry, cache=None)
 
     dns_server = None
     endpoints = {}
@@ -209,6 +209,10 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                 if not url or url in have:
                     continue
                 try:
+                    from .api import _sub_url_blocked
+                    if _sub_url_blocked(url):
+                        log.warning("订阅冷启动补下载跳过被阻止的 URL (私有/回环地址): %s", url)
+                        continue
                     req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
                     with urllib.request.urlopen(req, timeout=20) as r:
                         text = r.read().decode("utf-8", "replace")
@@ -435,7 +439,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     config_path = getattr(args, "config", None) or args.config
     if not config_path:
-        # 未显式指定时探测实际路径（含 EBPNDS_CONFIG 环境变量指向），
+        # 未显式指定时探测实际路径（含 EBPDNS_CONFIG 环境变量指向），
         # 以便缓存文件等派生路径落在配置同目录
         for p in config_mod.default_paths():
             if os.path.isfile(p):

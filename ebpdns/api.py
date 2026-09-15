@@ -18,6 +18,41 @@ from .probe import probe_upstream_latencies
 log = logging.getLogger("ebpdns.api")
 from . import upstream, quic_upstream
 
+
+def _sub_url_blocked(url):
+    """SSRF 防护: 解析订阅 URL 的主机名, 拒绝指向私有/环回/链路本地地址。
+    解析出的任何一个 IP 命中即拒绝(防止 DNS rebinding 到内网)。
+    返回 None 表示放行, 返回错误字符串表示拒绝原因。"""
+    import ipaddress
+    import socket
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return "订阅 URL 解析失败"
+    host = parsed.hostname or ""
+    if not host:
+        return "订阅 URL 缺少主机名"
+    # 主机名本身就是 IP: 直接判定
+    try:
+        ips = [ipaddress.ip_address(host)]
+    except ValueError:
+        ips = []
+        try:
+            for fam, _t, _p, _c, sa in socket.getaddrinfo(host, parsed.port or 80):
+                try:
+                    ips.append(ipaddress.ip_address(sa[0]))
+                except ValueError:
+                    pass
+        except OSError:
+            return "订阅主机名解析失败"
+    if not ips:
+        return "订阅主机名无可用 IP"
+    for ip in ips:
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)"
+    return None
+
 class AppContext:
     """应用上下文：解析引擎 / 遥测 / 缓存 / 配置 / DNS 服务器引用。"""
 
@@ -735,6 +770,10 @@ class _Handler(BaseHTTPRequestHandler):
         return {"rules": self._local_rules(), "subscriptions": subs}
 
     def _fetch_sub_text(self, url):
+        # SSRF 防护: 拒绝指向内网/环回/链路本地的订阅地址
+        blocked = _sub_url_blocked(url)
+        if blocked:
+            raise ValueError(blocked)
         req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
         with urllib.request.urlopen(req, timeout=20) as r:
             return r.read().decode("utf-8", "replace")

@@ -52,7 +52,6 @@ class LRUCache:
                 self._maps[i].pop(key, None)
                 return None
             self._maps[i].move_to_end(key)
-            entry["access_at"] = now
             return entry
 
     def put(self, key, value, now=None):
@@ -99,10 +98,17 @@ class LRUCache:
         return total
 
     def _purge_expired_locked(self, i, now):
-        expired = [k for k, e in self._maps[i].items() if e.get("expires_at", 0) <= now]
-        for k in expired:
+        # LRU 顺序下(OrderedDict: 队首=最久未访问), 过期条目集中在队首。
+        # 只从队首向后扫描到首个未过期条目即停, 避免每 32 次 put 做全表扫描
+        # (高容量下全表扫描在锁内执行会阻塞 get/put 热路径)。
+        cnt = 0
+        while self._maps[i]:
+            k, e = next(iter(self._maps[i].items()))
+            if e.get("expires_at", 0) > now:
+                break
             self._maps[i].pop(k, None)
-        return len(expired)
+            cnt += 1
+        return cnt
 
     def clear(self):
         for i in range(self._SHARDS):
@@ -280,6 +286,10 @@ class PartitionedCache:
         return out
 
     def restore(self, entries, now=None, persist_ttl=0):
+        # 按 group 聚合条目后每组只调用一次内层 restore。
+        # 旧实现逐条调用 self._caches[g].restore([e], ...), 而 LRUCache.restore
+        # 开头会 clear() 整个 shard, 导致每个 group 只保留最后一条。
+        groups = {}
         for e in entries or []:
             k = e.get("key") or []
             if len(k) == 3:
@@ -287,13 +297,16 @@ class PartitionedCache:
                 kk = (k[1], k[2])
             elif len(k) == 2:
                 g = "default"
-                kk = (k[0], k[1])
+                kk = tuple(k)
             else:
                 continue
             try:
-                e = dict(e)
-                e["key"] = list(kk)
-                self._caches[g].restore([e], now, persist_ttl)
+                groups.setdefault(g, []).append({**e, "key": list(kk)})
+            except Exception:
+                continue
+        for g, es in groups.items():
+            try:
+                self._caches[g].restore(es, now, persist_ttl)
             except Exception:
                 continue
 

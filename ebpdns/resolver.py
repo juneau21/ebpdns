@@ -18,6 +18,7 @@ import time
 import urllib.request
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
+import ipaddress
 
 from . import dnsmsg
 
@@ -141,6 +142,7 @@ class Resolver:
         self._rule_allow_wild = {}          # 白名单通配匹配(优先于 block)
         self._rule_match_cache = {}         # domain -> rule/None(哨兵), 规则重建时清空
         self._rule_cache_max = 8192
+        self._has_group_rules = False       # 有无 group 分流规则: 无则 _ckey 跳过 match_rule
         self._rebuild_rule_index()
         # Bootstrap 预解析: 用 UDP 上游解析所有 DoH/DoT hostname, 缓存 IP,
         # 后续连接用 IP+SNI, 彻底摆脱系统 /etc/resolv.conf 依赖(限制2解决)。
@@ -531,12 +533,13 @@ class Resolver:
             if boot_warm:
                 retry = False
                 with self._boot_retry_lock:
-                    if self._boot_retries < 4:
+                    if self._boot_retries < 3:
                         self._boot_retries += 1
                         retry = True
                 if retry:
-                    trace.append({"tag": "warn", "text": "启动预热: 上游未就绪, 2s 后重试"})
-                    time.sleep(2.0)
+                    trace.append({"tag": "warn", "text": "启动预热: 上游未就绪, 1s 后重试"})
+                    # 缩短到 1s: 原 2.0s 在 worker 线程内阻塞, 占住上游查询线程池
+                    time.sleep(1.0)
                     return self.resolve(d, qtype, silent=silent, counted=False,
                                         force_refresh=force_refresh,
                                         client_ip=client_ip, _depth=_depth + 1)
@@ -564,6 +567,33 @@ class Resolver:
                     cand[v]["from"].append(r["up_name"])
                 cand[v]["ttl"] = min(cand[v]["ttl"], a.get("ttl", cand[v]["ttl"]))
         cand_list = list(cand.values())
+        # ip_speed_probe 配置控制探测协议: udp53/tcp443/both(按上游协议决定)
+        _probe_cfg = str(self.cfg.get("ip_speed_probe", "both")).lower()
+        if _probe_cfg in ("udp53", "tcp443"):
+            for _c in cand_list:
+                _c["probe"] = _probe_cfg
+        # ---- 响应 IP 合法性校验(防 DNS 劫持/rebinding): 过滤私有/保留地址 ----
+        # 上游返回的 A/AAAA 若为内网/保留地址(如 10.x/192.168.x/127.x/fc00::/7),
+        # 视为劫持响应或 DNS rebinding 攻击, 丢弃该答案。forceIp 规则豁免。
+        if cfg.get("rebind_protection", True) and qtype in ("A", "AAAA") and not (rule and rule.get("action") == "forceIp"):
+            _before = len(cand_list)
+            cand_list = [a for a in cand_list if not self._is_private_ip(a["value"])]
+            if len(cand_list) < _before:
+                _dropped = _before - len(cand_list)
+                trace.append({"tag": "warn", "text": "IP 合法性校验: 丢弃 %d 个私有/保留地址答案" % _dropped})
+                tel.inc("rebind_blocked")
+                if not cand_list:
+                    # 全部答案都是私有 IP → NODATA(不返回劫持结果)
+                    tel.inc("errors")
+                    lat = (time.monotonic() - t0) * 1000
+                    tel.push_latency(lat)
+                    trace.append({"tag": "warn", "text": "全部答案为私有/保留地址 → 返回 NODATA"})
+                    if not silent:
+                        tel.log(d, qtype, "err", "rebind_protection: 全部答案为私有IP", lat,
+                                client_ip=client_ip, upstream=" / ".join(r.get("up_name", "?") for r in ok_results[:3]),
+                                answer="")
+                    return self._result(d, qtype, [], None, False, False, None,
+                                        latency=lat, trace=trace, ttl_left=0, empty=True, rcode=0)
         # ---- 测速择优 ----
         if cfg.get("speed_test", True) and len(cand_list) > 1:
             cand_list = self._speed_sort(cand_list, query_bytes, d)
@@ -608,7 +638,8 @@ class Resolver:
         q = msg["questions"][0]
         if q["qclass"] != dnsmsg.CLASS_IN:
             return None
-        domain, qtype_name = q["name"], dnsmsg.type_name(q["qtype"])
+        domain = q["name"]
+        qtype_name = q.get("qtype_name") or dnsmsg.type_name(q["qtype"])
         key = self._ckey(domain, qtype_name)
         t0 = time.monotonic()
         now = time.time()
@@ -630,6 +661,8 @@ class Resolver:
         if stale:
             tel.inc("stale_served")
             self._trigger_stale_refresh(key, domain, qtype_name)
+        lat = (time.monotonic() - t0) * 1000
+        kd = self.cfg.get("kernel_direct", True) and not stale
         # 预编码响应体缓存: 同一缓存条目的 question+answer section 固定,
         # 只随 qid 变化的 header 每次重拼。首答时编码一次存入条目, 后续命中
         # 直接复用, 省去 encode_name/encode_rdata 热路径开销。
@@ -641,12 +674,10 @@ class Resolver:
                 if not stale:
                     c["resp_body"] = body
             resp = dnsmsg.build_response_header(raw_query, 3, 0) + body
-            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0,
-                         (time.monotonic() - t0) * 1000)
+            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0, lat)
             # 快路径命中 → 实时查询日志(带客户端IP), 与完整路径事件同构
             try:
-                tel.log(domain, qtype_name, "hit", "缓存直答 NXDOMAIN",
-                        (time.monotonic() - t0) * 1000,
+                tel.log(domain, qtype_name, "hit", "缓存直答 NXDOMAIN", lat,
                         client_ip=client_addr, upstream="缓存直答", answer="NXDOMAIN")
             except Exception:
                 pass
@@ -662,17 +693,15 @@ class Resolver:
                     body = dnsmsg.build_response_body(domain, q["qtype"], c["answers"])
                     c["resp_body"] = body
             resp = dnsmsg.build_response_header(raw_query, 0, len(c["answers"])) + body
-            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0,
-                         (time.monotonic() - t0) * 1000,
-                         kernel_direct=self.cfg.get("kernel_direct", True) and not stale)
+            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0, lat,
+                         kernel_direct=kd)
             # 快路径命中 → 实时查询日志(带客户端IP)
             try:
                 chosen = c.get("chosen", "") or (c["answers"][0]["value"] if c.get("answers") else "")
                 tel.log(domain, qtype_name, "hit",
-                        ("serve-stale → %s" if stale else "内核直答 → %s") % chosen,
-                        (time.monotonic() - t0) * 1000,
+                        ("serve-stale → %s" if stale else "内核直答 → %s") % chosen, lat,
                         client_ip=client_addr,
-                        upstream="serve-stale" if stale else ("内核直答" if self.cfg.get("kernel_direct", True) else "缓存直答"),
+                        upstream="serve-stale" if stale else ("内核直答" if kd else "缓存直答"),
                         answer=chosen)
             except Exception:
                 pass
@@ -863,6 +892,17 @@ class Resolver:
         except Exception:
             pass
         return float(u.get("latency", 9999))
+
+    @staticmethod
+    def _is_private_ip(ip_str):
+        """判断 IP 是否为私有/保留/环回/链路本地地址(防 DNS 劫持/rebinding)。
+        覆盖 RFC1918/环回/链路本地/共享地址/文档地址/组播/保留, 以及 IPv6 对应段。"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
+        except (ValueError, TypeError):
+            return False  # 非 IP(如 CNAME 目标域名) 不拦截
 
     def _query_parallel(self, ups, query_bytes, d, qtype, trace, qmap=None):
         """并发查询多个上游，首个有效应答（NOERROR 且有答案）即返回。
@@ -1130,7 +1170,7 @@ class Resolver:
                                 self._ip_speed_cache.pop(_k, None)
                 self._probe_pool.submit_drop(
                     self._probe_candidate_ip, ip, query_bytes,
-                    a.get("probe", "udp53"), 800)
+                    a.get("probe", "udp53"), int(self.cfg.get("speed_timeout_ms", 800)))
         # 加权随机选优(不放回抽样): 权重=1/(rtt+10), 快 IP 概率性优先
         out = []
         pool = list(work)
@@ -1417,7 +1457,9 @@ class Resolver:
     def _ckey(self, d, qtype):
         """构造分区缓存 key: (group, domain, qtype)。
         group 按分流规则: 命中 group 规则 → domestic/global; 其余(含 block/无规则)→ default。
-        规则匹配走 _rule_match_cache(O(1)), 热路径额外开销可忽略。"""
+        无 group 规则时直接用 default, 跳过 match_rule 查表(热路径省一次函数调用+dict查找)。"""
+        if not self._has_group_rules:
+            return ("default", d, qtype)
         g = "default"
         try:
             r = self.match_rule(d)
@@ -1528,6 +1570,9 @@ class Resolver:
 
     def _fetch_sub_text(self, url, timeout=20):
         """拉取订阅文本(与 api 实现一致, resolver 后台更新独立使用)。"""
+        from .api import _sub_url_blocked
+        if _sub_url_blocked(url):
+            raise ValueError("subscription URL blocked (private/loopback address): %s" % url)
         req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8", "replace")
@@ -1667,6 +1712,10 @@ class Resolver:
         self._rule_suffix_wild = suffix_wild
         self._rule_regex = regex
         self._rule_match_cache = {}   # 规则集变更, 全部缓存结论失效
+        # 检测是否有 group 分流规则: 无则 _ckey 直接用 default 分区, 跳过 match_rule
+        self._has_group_rules = any(
+            (r.get("action") == "group") for r in rules
+        )
 
     def _load_local_rules(self):
         """从逐条规则独立文件(rules_local.json)加载规则明细(不写入 config.json)。

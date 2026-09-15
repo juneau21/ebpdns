@@ -176,9 +176,19 @@ class _TCPRequestHandler(socketserver.BaseRequestHandler):
                         msg, buf = dnsmsg.parse_tcp_frame(buf)
                     except Exception:
                         break  # 帧不完整，等待更多数据
-                    resp = self.server.resolver.answer_raw(msg, self.client_address)
+                    # 与 UDP _handle 对齐: answer_raw 异常时回 SERVFAIL, 避免连接裸崩
+                    try:
+                        resp = self.server.resolver.answer_raw(msg, self.client_address)
+                    except Exception:
+                        try:
+                            resp = dnsmsg.build_error_response(msg, 2)
+                        except Exception:
+                            resp = None
                     if resp:
-                        sock.sendall(dnsmsg.tcp_frame(resp))
+                        try:
+                            sock.sendall(dnsmsg.tcp_frame(resp))
+                        except OSError:
+                            break
         except (socket.timeout, OSError):
             pass
 

@@ -18,11 +18,47 @@ from .dnsmsg import parse_tcp_frame, tcp_frame
 # DoH 默认路径（若配置未给 url）
 DOH_DEFAULT_PATH = "/dns-query"
 UA = "ebpdns/1.0 (Debian; SmartDNS-style resolver)"
+# DoH 请求头常量: 避免每次查询新建 dict(http.client.request 会 copy)
+_DOH_HEADERS = {
+    "Content-Type": "application/dns-message",
+    "Accept": "application/dns-message",
+    "User-Agent": UA,
+}
 
 # ---------------- Bootstrap 解析器（摆脱系统 DNS 依赖） ----------------
 # 启动时用 UDP 上游预解析 DoH/DoT hostname，缓存 IP；连接时用 IP + SNI
 _bootstrap_cache = {}
 _bootstrap_lock = threading.Lock()
+
+# UDP 热路径上游 hostname 解析缓存: host -> (ip_set, expire_monotonic)
+# miss 热路径每次 getaddrinfo 是阻塞的系统 DNS 解析, 必须带 TTL 缓存(300s)
+_addr_cache = {}
+_addr_cache_lock = threading.Lock()
+_ADDR_CACHE_TTL = 300.0
+
+
+def _cached_udp_addrs(host):
+    """返回上游 hostname 的 IPv4 地址集合, 带 300s TTL 缓存。
+    避免 UDP miss 热路径每次查询都阻塞调 getaddrinfo。
+    内部存 frozenset 直接返回(只读), 避免每次调用拷贝 set。"""
+    now = time.monotonic()
+    with _addr_cache_lock:
+        hit = _addr_cache.get(host)
+        if hit and hit[1] > now:
+            return hit[0]
+    # 缓存未命中: 释放锁后做阻塞解析
+    ips = set()
+    try:
+        for i in socket.getaddrinfo(host, None, socket.AF_INET):
+            ips.add(i[4][0])
+    except OSError:
+        pass
+    if ips:
+        fs = frozenset(ips)
+        with _addr_cache_lock:
+            _addr_cache[host] = (fs, now + _ADDR_CACHE_TTL)
+        return fs
+    return frozenset()
 
 
 def _is_hostname(s):
@@ -58,10 +94,12 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
         labels = b"".join(bytes([len(p)]) + p.encode() for p in host.split("."))
         q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(q, (bp_host, bp_port))
-        data, _ = s.recvfrom(65535)
-        s.close()
+        try:
+            s.settimeout(timeout)
+            s.sendto(q, (bp_host, bp_port))
+            data, _ = s.recvfrom(65535)
+        finally:
+            s.close()
         # 解析响应中的 A 记录
         pos = 12
         while data[pos]:
@@ -275,11 +313,7 @@ def _doh_query(up, query_bytes, timeout_ms):
     # 必须独立连接池, 否则复用连接会把请求发到错误路径
     key = ("doh", host, port, path)
     timeout = timeout_ms / 1000.0
-    headers = {
-        "Content-Type": "application/dns-message",
-        "Accept": "application/dns-message",
-        "User-Agent": UA,
-    }
+    headers = _DOH_HEADERS
     # 连接槽获取带超时: 池满(4 连接都在忙)时等待, 不无限阻塞
     got = _pool.acquire(key, timeout)
     if got is None:
@@ -347,9 +381,9 @@ def _dot_conn(host, port, timeout):
     ip = _bootstrap_ip(host)
     connect_host = ip if ip else host
     sock = socket.create_connection((connect_host, port), timeout=timeout)
+    # 使用 ssl.create_default_context() 默认校验(含 CA 校验 + 主机名校验)。
+    # IP 直连场景通过 server_hostname=host 传 SNI, 证书校验仍按主机名进行。
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
     return sock
 
@@ -370,6 +404,9 @@ def _dot_query(up, query_bytes, timeout_ms):
             if not chunk:
                 return None
             buf += chunk
+            # 接收缓冲上限: 防止畸形/恶意上游无限累积 chunk 导致内存爆炸
+            if len(buf) > 65536:
+                return None
             try:
                 msg, _ = parse_tcp_frame(buf)
                 return msg
@@ -435,11 +472,8 @@ def _udp_query(up, query_bytes, timeout_ms):
     if not _is_hostname(host):
         expect_ips.add(host)
     else:
-        try:
-            for i in socket.getaddrinfo(host, None, socket.AF_INET):
-                expect_ips.add(i[4][0])
-        except OSError:
-            pass
+        # 用带 TTL 的解析缓存, 避免 miss 热路径每次阻塞 getaddrinfo
+        expect_ips = _cached_udp_addrs(host)
     try:
         sock.settimeout(timeout_ms / 1000.0)
         sock.sendto(query_bytes, addr)
@@ -478,9 +512,8 @@ def _tcp_query(up, query_bytes, timeout_ms, use_tls=False):
         return False, None
     try:
         if use_tls:
+            # 默认证书校验: 不关闭 check_hostname/verify_mode
             ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
             sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
         sock.settimeout(timeout_ms / 1000.0)
         sock.sendall(tcp_frame(query_bytes))
@@ -490,6 +523,8 @@ def _tcp_query(up, query_bytes, timeout_ms, use_tls=False):
             if not chunk:
                 return False, None
             buf += chunk
+            if len(buf) > 65536:
+                return False, None
             try:
                 msg, _ = parse_tcp_frame(buf)
             except Exception:

@@ -577,7 +577,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
             <div class="card-hd"><span class="t">缓存与 BPF Map</span><span class="s">kernel cache</span></div>
             <div class="card-bd">
               <div class="cfg-row"><div class="lab">LRU Map 容量<small>entries · 超出后按最近最少使用淘汰</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-size" min="16" max="131072" step="16"><input type="range" id="cfg-size-r" min="16" max="131072" step="16" value="1024"></div></div>
+                <div class="val"><input class="num" type="number" id="cfg-size" min="1" max="10000000" step="16"><input type="range" id="cfg-size-r" min="1" max="10000000" step="16" value="1024"></div></div>
               <div class="cfg-row"><div class="lab">默认 TTL<small>seconds · 缓存条目存活时间</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-ttl" min="5" max="3600" step="5"><input type="range" id="cfg-ttl-r" min="5" max="3600" step="5" value="300"></div></div>
               <div class="cfg-row"><div class="lab">域名预取<small>TTL 到期前自动重新解析, 保持热点域名热缓存</small></div>
@@ -621,6 +621,8 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><input class="num" type="number" id="cfg-ednssize" min="512" max="4096" step="8" placeholder="1232"></div></div>
               <div class="cfg-row"><div class="lab">加密查询填充<small>padding · DoT/DoH/DoH3/DoQ 出站报文填充到 128B 块(RFC 8467), 抹平长度指纹防流量分析 — 明文 UDP/TCP 不填充</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-padding"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">响应 IP 合法性校验<small>防 DNS 劫持/rebinding · 丢弃上游返回的私有/保留/环回地址(10.x/192.168.x/127.x/fc00::/7 等), forceIp 规则豁免</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-rebind"><span class="sl"></span></label></div></div>
             </div>
           </div>
           <div class="card rule-card">
@@ -703,11 +705,31 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               </div>
             </div>
           </div>
-          
+          <div class="card">
+            <div class="card-hd"><span class="t">高级选项</span><span class="s">advanced</span></div>
+            <div class="card-bd">
+              <div class="cfg-row"><div class="lab">EDNS0 总开关<small>出站是否携带 EDNS0 OPT 记录(含 UDP size 扩展)</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-edns"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">DNS 0x20 投毒防护<small>大小写随机化查询名, 提高缓存投毒难度</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-dnssec0x20"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">候选 IP 测速开关<small>对 A/AAAA 候选地址做 RTT 测速并择优返回</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-ipspeedcheck"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">健康检查周期<small>seconds · 0=关闭主动健康检查</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="3600" step="10" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">规则订阅更新周期<small>seconds · 0=不自动更新订阅</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="86400" step="60" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">Bootstrap DNS<small>引导解析 DoH/DoT 主机名用的普通 DNS 地址, 多个用逗号分隔</small></div>
+                <div class="val"><input class="text" type="text" id="cfg-bootstrapdns" placeholder="如 223.5.5.5, 119.29.29.29" spellcheck="false" autocomplete="off"></div></div>
+            </div>
+          </div>
         </div>
         <div class="card">
           <div class="cfg-actions">
             <span style="font-size:12px;color:var(--text3);align-self:center" id="cache-policy-label">缓存策略: –</span>
+            <select class="q-sel" id="cfg-cache-policy" title="缓存策略热切换 · 保存后自动热重载生效">
+              <option value="lru">LRU 分区</option>
+              <option value="tinylfu">W-TinyLFU</option>
+            </select>
             <button class="btn primary" id="btn-save-cfg">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11.6.0v14H5z"/><path d="M8 3v5h7V3M8 21v-7h8v7"/></svg>
               应用配置
@@ -884,13 +906,22 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.46";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.48";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
 const API = {
   async req(method, path, body){
     const opt = { method, headers:{} };
     if (body !== undefined){ opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-    const r = await fetch(path, opt);
+    // 10s 超时: 避免后端 hang 住时前端 Promise 永远 pending
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    opt.signal = ctrl.signal;
+    let r;
+    try {
+      r = await fetch(path, opt);
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) throw new Error(path + ' -> ' + r.status);
     return r.json();
   },
@@ -905,7 +936,7 @@ const DEFAULTS = {
   cacheSize: 1024, ttl: 300, prefetch: true, kernelDirect: true, speedTest: true,
   ttlMin: 0, ttlMax: 0, serveStale: false, staleTtl: 3600, persistTtl: 0,
   speedInterval: 2000, fallback: true, maxParallelUpstreams: 3, ipv4First: true, ipv6: true, edns: true,
-  ednsUdpSize: 1232, padding: false, preferIpv4: false,
+  ednsUdpSize: 1232, padding: false, rebindProtection: true, preferIpv4: false,
   hook: 'XDP 原生', mapType: 'LRU_HASH', percpu: true, liveRate: 10, timeout: 1500,
   upstreams: [
     { id:'ali-udp', name:'AliDNS UDP', proto:'udp', addr:'223.5.5.5', port:53, url:'', group:'domestic', latency:8, enabled:true },
@@ -1442,7 +1473,7 @@ function refreshTelemetryUI(){
   // Top N 统计(域名/客户端/上游)
   const stTop = (MODE === 'real' && real.status) ? real.status : null;
   if (stTop){
-    const fmtTop = (arr, unit) => (arr && arr.length ? arr.slice(0,8).map(x => x[0] + ' <span style="color:var(--text3)">' + x[1] + unit + '</span>').join('<br>') : '暂无数据');
+    const fmtTop = (arr, unit) => (arr && arr.length ? arr.slice(0,8).map(x => esc(x[0]) + ' <span style="color:var(--text3)">' + x[1] + unit + '</span>').join('<br>') : '暂无数据');
     const td = $('#top-domains'); if (td) td.innerHTML = fmtTop(stTop.top_domains, '');
     const tc = $('#top-clients'); if (tc) tc.innerHTML = fmtTop(stTop.top_clients, '');
     const tu = $('#top-ups'); if (tu) tu.innerHTML = fmtTop(stTop.top_upstreams, ' 次');
@@ -1530,8 +1561,14 @@ function renderConfig(){
     $('#cfg-speed').checked = !!c.speed_test; $('#cfg-spint').value = c.speed_interval_ms;
     $('#cfg-fallback').checked = !!c.fallback; $('#cfg-maxup').value = c.max_parallel_upstreams || 3; $('#cfg-v4first').checked = !!c.ipv4_first;
     $('#cfg-v6').checked = !!c.ipv6; $('#cfg-v4smart').checked = !!c.prefer_ipv4;
-    $('#cfg-ednssize').value = c.edns_udp_size || 1232; $('#cfg-padding').checked = !!c.padding;
+    $('#cfg-ednssize').value = c.edns_udp_size || 1232; $('#cfg-padding').checked = !!c.padding; $('#cfg-rebind').checked = c.rebind_protection !== false;
     $('#cfg-timeout').value = c.timeout_ms || 1500;
+    $('#cfg-cache-policy').value = c.cache_policy || 'lru';
+    $('#cfg-edns').checked = c.edns !== false; $('#cfg-dnssec0x20').checked = !!c.dnssec_0x20;
+    $('#cfg-ipspeedcheck').checked = !!c.ip_speed_check;
+    $('#cfg-healthint').value = c.health_check_interval || 0;
+    $('#cfg-rulesubint').value = c.rule_sub_interval || 0;
+    $('#cfg-bootstrapdns').value = c.bootstrap_dns || '';
     renderUpstreams(c.upstreams || []); renderRules(c.rules || []); renderRuleSubs(c.rule_subscriptions || []);
     // 合并连接级健康度(来自 /api/upstreams): 配置页上游表格显示真实连接延迟
     API.get('/api/upstreams').then(r => {
@@ -1552,8 +1589,14 @@ function renderConfig(){
     $('#cfg-speed').checked = config.speedTest; $('#cfg-spint').value = config.speedInterval;
     $('#cfg-fallback').checked = config.fallback; $('#cfg-maxup').value = config.maxParallelUpstreams || 3; $('#cfg-v4first').checked = config.ipv4First;
     $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.preferIpv4;
-    $('#cfg-ednssize').value = config.ednsUdpSize || 1232; $('#cfg-padding').checked = config.padding;
+    $('#cfg-ednssize').value = config.ednsUdpSize || 1232; $('#cfg-padding').checked = config.padding; $('#cfg-rebind').checked = config.rebindProtection !== false;
     $('#cfg-timeout').value = config.timeout;
+    $('#cfg-cache-policy').value = 'lru';
+    $('#cfg-edns').checked = config.edns !== false; $('#cfg-dnssec0x20').checked = !!config.dnssec_0x20;
+    $('#cfg-ipspeedcheck').checked = !!config.ip_speed_check;
+    $('#cfg-healthint').value = config.health_check_interval || 0;
+    $('#cfg-rulesubint').value = config.rule_sub_interval || 0;
+    $('#cfg-bootstrapdns').value = config.bootstrap_dns || '';
     renderUpstreams(config.upstreams); renderRules(config.rules); renderRuleSubs(config.ruleSubscriptions || []);
   }
   bindConfigEvents();
@@ -1682,9 +1725,15 @@ function bindRuleEvents(){
     });
   });
 }
+let _configEventsBound = false;
 function bindConfigEvents(){
-  const ups = currentUpstreams();
-  $('#cfg-size').addEventListener('change', e => { if (MODE==='real') real.config.cache_size = clamp(+e.target.value,16,1048576); else config.cacheSize = clamp(+e.target.value,16,1048576); $('#cfg-size-r').value = e.target.value; });
+  // P0-1: bindConfigEvents 内所有绑定对象都是持久 DOM 元素或不被 innerHTML 重写的容器
+  // (#up-list/#rule-list 只换 innerHTML, 容器本身常驻)。逐行业务事件在 renderRules→bindRuleEvents
+  // 中按新行重绑。因此这里只在初始化时绑一次, 避免每次 renderConfig 后监听器累积导致
+  // 一次保存触发 N 次 PUT /api/config。
+  if (_configEventsBound) return;
+  _configEventsBound = true;
+  $('#cfg-size').addEventListener('change', e => { if (MODE==='real') real.config.cache_size = clamp(+e.target.value,1,10000000); else config.cacheSize = clamp(+e.target.value,1,10000000); $('#cfg-size-r').value = e.target.value; });
   $('#cfg-size-r').addEventListener('input', e => { if (MODE==='real') real.config.cache_size = +e.target.value; else config.cacheSize = +e.target.value; $('#cfg-size').value = e.target.value; });
   $('#cfg-ttl').addEventListener('change', e => { if (MODE==='real') real.config.ttl = clamp(+e.target.value,5,3600); else config.ttl = clamp(+e.target.value,5,3600); $('#cfg-ttl-r').value = e.target.value; });
   $('#cfg-ttl-r').addEventListener('input', e => { if (MODE==='real') real.config.ttl = +e.target.value; else config.ttl = +e.target.value; $('#cfg-ttl').value = e.target.value; });
@@ -1705,9 +1754,20 @@ function bindConfigEvents(){
   bindCfg('#cfg-v4smart','prefer_ipv4', e => e.target.checked);
   bindCfg('#cfg-ednssize','edns_udp_size', e => clamp(+e.target.value,512,4096));
   bindCfg('#cfg-padding','padding', e => e.target.checked);
+  bindCfg('#cfg-rebind','rebind_protection', e => e.target.checked);
   bindCfg('#cfg-timeout','timeout_ms', e => clamp(+e.target.value,200,5000));
+  // 高级选项 (P1-4)
+  bindCfg('#cfg-edns','edns', e => e.target.checked);
+  bindCfg('#cfg-dnssec0x20','dnssec_0x20', e => e.target.checked);
+  bindCfg('#cfg-ipspeedcheck','ip_speed_check', e => e.target.checked);
+  bindCfg('#cfg-healthint','health_check_interval', e => clamp(+e.target.value,0,3600));
+  bindCfg('#cfg-rulesubint','rule_sub_interval', e => clamp(+e.target.value,0,86400));
+  $('#cfg-bootstrapdns').addEventListener('change', e => { const v = (e.target.value || '').trim(); if (MODE==='real') real.config.bootstrap_dns = v; else config.bootstrapDns = v; });
+  // 缓存策略热切换 (P1-3): lru <-> tinylfu, 保存后自动热重载重建缓存容器
+  $('#cfg-cache-policy').addEventListener('change', e => { if (MODE==='real'){ real.config.cache_policy = e.target.value; _cachePolicyDirty = true; } });
   $('#up-list').addEventListener('change', e => {
     const el = e.target, f = el.dataset.f, id = el.dataset.id; if (!f || !id) return;
+    const ups = currentUpstreams();
     const u = ups.find(x => x.id === id); if (!u) return;
     if (f === 'enabled') u.enabled = el.checked;
     else if (f === 'fulladdr') {
@@ -1745,6 +1805,7 @@ function bindConfigEvents(){
   });
   $('#up-list').addEventListener('click', e => {
     const b = e.target.closest('[data-del]'); if (!b) return;
+    const ups = currentUpstreams();
     const list = ups.filter(x => x.id !== b.dataset.del);
     if (MODE === 'real') real.config.upstreams = list; else config.upstreams = list;
     renderConfig();
@@ -1890,13 +1951,14 @@ function bindConfigEvents(){
   }
   $('#btn-sub-rule').addEventListener('click', addSubRule);
   $('#sub-url-input').addEventListener('keydown', e => { if (e.key === 'Enter') addSubRule(); });
-  // 分流规则: 单一输入框统一添加/批量导入(已与上方导入行合并)
-  $('#btn-import-rule').addEventListener('click', runImport);
-  $('#import-input').addEventListener('keydown', e => { if (e.key === 'Enter') runImport(); });
+  // (P0-2: 原先此处重复绑定 #btn-import-rule / #import-input, 已删除——两者在上方各绑一次即可)
   $('#btn-save-cfg').addEventListener('click', async () => {
     if (MODE === 'real'){
       try {
         await API.put('/api/config', real.config);
+        // P1-3: 缓存策略(lru<->tinylfu)需重建缓存容器, 保存后自动热重载生效
+        const needReload = _cachePolicyDirty;
+        if (needReload) _cachePolicyDirty = false;
         note('配置已保存到后端 ' + real.configPath + ', 新增上游自动测速中…', 'var(--green)');
         // 后端对新增上游异步实测延迟, 稍后拉取配置刷新显示真实延迟
         setTimeout(async () => {
@@ -1905,6 +1967,13 @@ function bindConfigEvents(){
             real.config = c; renderConfig();
           } catch(e){ /* 拉取失败保留当前视图 */ }
         }, 1600);
+        if (needReload){
+          try {
+            const r = await API.post('/api/reload', {});
+            if (r && r.ok === false) note('缓存策略热重载失败: ' + (r.error || '未知错误'), 'var(--red)');
+            else note('缓存策略已切换为 ' + (real.config.cache_policy === 'tinylfu' ? 'W-TinyLFU' : 'LRU 分区') + ', 缓存容器已重建', 'var(--green)');
+          } catch(e){ note('缓存策略热重载失败: ' + e.message, 'var(--red)'); }
+        }
       } catch(e){ note('保存失败: ' + e.message, 'var(--red)'); }
     } else {
       persistConfig(); note('配置已保存到本地 (仿真模式)', 'var(--green)');
@@ -1938,7 +2007,9 @@ function bindConfigEvents(){
     } catch(e){ note('重启失败: ' + e.message, 'var(--red)'); }
   });
 }
-function note(txt, color){ const el = $('#cfg-saved-note'); el.textContent = txt; el.style.color = color; setTimeout(() => { el.textContent = '配置修改即时生效, 点击「应用配置」持久化到后端'; el.style.color = ''; }, 2600); }
+let _noteTimer = null;
+let _cachePolicyDirty = false;   // P1-3: 缓存策略被改动时置位, 保存后自动 /api/reload 重建缓存容器
+function note(txt, color){ const el = $('#cfg-saved-note'); el.textContent = txt; el.style.color = color; if (_noteTimer) clearTimeout(_noteTimer); _noteTimer = setTimeout(() => { el.textContent = '配置修改即时生效, 点击「应用配置」持久化到后端'; el.style.color = ''; _noteTimer = null; }, 2600); }
 
 /* ---------------- 实时查询流 (仿真) ---------------- */
 let streamTimer = null, streamAcc = 0;
@@ -2035,7 +2106,19 @@ function startRealPolls(){
 function bindEvents(){
   $$('.nav-item').forEach(n => n.addEventListener('click', () => setRoute(n.dataset.route)));
   $('#btn-run').addEventListener('click', () => { sim.running = !sim.running; updateTopbar({ qps:simQps(), hit_rate:simHitRate(), avg_latency_ms:simAvgLat(), map:{used:sim.cache.size, capacity:config.cacheSize} }); $('#btn-run-txt').textContent = sim.running ? '暂停' : '运行'; });
-  $('#btn-clear').addEventListener('click', () => { if (MODE === 'real'){ API.post('/api/reset'); real.logs = []; real.logSeq = 0; clearLogUI(); } else simReset(); });
+  $('#btn-clear').addEventListener('click', async () => {
+    if (MODE === 'real'){
+      // P2-4: 不能简单把 logSeq 置 0——后端 events deque 未被清空, 下次 pollLogs(since=0)
+      // 会把旧事件全部拉回。改为: 触发后端 reset 后立即用当前游标再请求一次, 同步成后端新的
+      // next_seq, 既清掉前端显示又让后续增量轮询从后端新游标开始。
+      try { await API.post('/api/reset'); } catch(e){}
+      real.logs = []; clearLogUI();
+      try {
+        const r = await API.get('/api/logs?since=' + real.logSeq);
+        real.logSeq = (r && r.next_seq != null) ? r.next_seq : real.logSeq;
+      } catch(e){ real.logSeq = 0; }
+    } else simReset();
+  });
   $$('#load-seg button').forEach(b => b.addEventListener('click', () => {
     $$('#load-seg button').forEach(x => x.classList.remove('on')); b.classList.add('on'); config.liveRate = +b.dataset.load;
   }));

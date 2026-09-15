@@ -25,6 +25,8 @@ DEFAULTS = {
     "health_check_interval": 30,     # 上游主动健康检查周期(秒), 0=关闭
     "health_probe_domain": "www.baidu.com",  # 健康检查探测域名(绕过分流规则直连上游)
     "health_probe_timeout_ms": 2000, # 健康检查探测超时(毫秒)
+    "circuit_fails": 3,               # 熔断器连续失败阈值(达到后打开熔断)
+    "circuit_open_s": 30,             # 熔断打开持续时间(秒), 超时后半开探测
     "bootstrap_dns": "223.5.5.5:53", # DoH/DoT hostname 预解析用的 UDP bootstrap DNS, 摆脱系统DNS依赖
     "rule_sub_interval": 3600,       # 规则订阅自动更新周期(秒), 0=关闭
     "ttl": 300,
@@ -48,6 +50,7 @@ DEFAULTS = {
     "edns": True,                   # 携带 EDNS0
     "edns_udp_size": 1232,          # 出站查询 EDNS0 UDP payload(字节): 1232=防分片安全值, 减少 UDP 分片丢失导致的超时
     "padding": False,               # 加密查询(DNS over TLS/HTTPS/QUIC)报文填充: 对齐 128B 块抹平长度指纹, 仅加密协议生效
+    "rebind_protection": True,      # 响应 IP 合法性校验: 丢弃上游返回的私有/保留/环回地址(防 DNS 劫持/DNS rebinding), forceIp 规则豁免
     "edns_client_subnet": None,     # 如 "203.0.113.0/24"
     "hook": "XDP 原生",
     "map_type": "LRU_HASH",
@@ -239,7 +242,7 @@ def default_config():
 def default_paths():
     """返回候选配置路径列表（按优先级）。"""
     cands = []
-    env = os.environ.get("EBPNDS_CONFIG")
+    env = os.environ.get("EBPDNS_CONFIG")
     if env:
         cands.append(env)
     cands.append("/etc/ebpdns/config.json")

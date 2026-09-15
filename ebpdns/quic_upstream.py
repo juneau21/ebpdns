@@ -172,7 +172,7 @@ class _QuicUpstream:
             try:
                 conf = QuicConfiguration(is_client=True, alpn_protocols=[self.alpn],
                                          idle_timeout=60)  # 60s 空闲再断开, 减少频繁重连
-                conf.verify_mode = ssl.CERT_NONE
+                # 启用默认证书校验(不覆盖 verify_mode); server_name 由下方设置
                 if self.host:
                     conf.server_name = self.host
                 async with connect(self.host, self.port, configuration=conf,

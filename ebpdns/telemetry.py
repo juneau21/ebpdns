@@ -11,7 +11,7 @@ class Telemetry:
         self.counters = {
             "total": 0, "hit": 0, "miss": 0, "kernel_direct": 0,
             "upstream_queries": 0, "errors": 0, "ipv4_fallback": 0, "stale_served": 0,
-            "bytes_in": 0, "bytes_out": 0,
+            "bytes_in": 0, "bytes_out": 0, "rebind_blocked": 0,
         }
         # 分流规则命中统计(按 action/group 归类)
         self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0}
@@ -173,20 +173,21 @@ class Telemetry:
         answer:    解析值 IP(应答的 chosen IP, 无答案如 NXDOMAIN 为 '')
         rule:      命中的分流规则 match(未命中为 None)
         """
-        self._ev_seq += 1
-        self.events.append({
-            "seq": self._ev_seq,
-            "ts": _now_ts(),
-            "domain": domain,
-            "qtype": qtype,
-            "level": level,
-            "msg": msg,
-            "lat": lat,
-            "client_ip": client_ip,
-            "upstream": upstream,
-            "answer": answer,
-            "rule": rule,
-        })
+        with self._lock:
+            self._ev_seq += 1
+            self.events.append({
+                "seq": self._ev_seq,
+                "ts": _now_ts(),
+                "domain": domain,
+                "qtype": qtype,
+                "level": level,
+                "msg": msg,
+                "lat": lat,
+                "client_ip": client_ip,
+                "upstream": upstream,
+                "answer": answer,
+                "rule": rule,
+            })
 
     # ---- 每秒采样 ----
     def sample(self):
@@ -237,6 +238,17 @@ class Telemetry:
 
 
 def _now_ts():
-    t = time.localtime()
-    ms = int(time.time() * 1000) % 1000
-    return "%02d:%02d:%02d.%03d" % (t.tm_hour, t.tm_min, t.tm_sec, ms)
+    """带 1ms 缓存的时间戳格式化: time.localtime() 是系统调用,
+    每查询日志都调用在高 QPS 下是显著开销。同一秒内复用缓存结果。"""
+    now = time.time()
+    sec = int(now)
+    cached = _now_ts._cache
+    if cached is not None and cached[0] == sec:
+        return cached[1]
+    t = time.localtime(now)
+    ms = int(now * 1000) % 1000
+    s = "%02d:%02d:%02d.%03d" % (t.tm_hour, t.tm_min, t.tm_sec, ms)
+    _now_ts._cache = (sec, s)
+    return s
+
+_now_ts._cache = None
