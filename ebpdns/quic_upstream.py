@@ -39,7 +39,7 @@ def available():
     return _HAVE_AIOQUIC
 def _host_port(up):
     addr = up.get("addr", "")
-    port = int(up.get("port") or (853 if up.get("proto") == "doq" else 443))
+    port = int(up.get("port") or (853 if str(up.get("proto", "")).lower() == "doq" else 443))
     return addr, port
 if _HAVE_AIOQUIC:
     class _H3Client(QuicConnectionProtocol):

@@ -7,6 +7,7 @@ query_upstream() 返回 (ok, response_bytes, latency_ms, err_str)。
 """
 import collections
 import http.client
+import logging
 import socket
 import ssl
 import struct
@@ -14,6 +15,8 @@ import threading
 import time
 from . import dnsmsg
 from .dnsmsg import parse_tcp_frame, tcp_frame
+
+log = logging.getLogger("ebpdns.upstream")
 
 # DoH 默认路径（若配置未给 url）
 DOH_DEFAULT_PATH = "/dns-query"
@@ -35,6 +38,7 @@ _bootstrap_lock = threading.Lock()
 _addr_cache = {}
 _addr_cache_lock = threading.Lock()
 _ADDR_CACHE_TTL = 300.0
+_ADDR_CACHE_MAX = 256   # 安全上限: 上游 hostname 数量有限, 超限淘汰最旧项
 
 
 def _cached_udp_addrs(host):
@@ -57,6 +61,17 @@ def _cached_udp_addrs(host):
         fs = frozenset(ips)
         with _addr_cache_lock:
             _addr_cache[host] = (fs, now + _ADDR_CACHE_TTL)
+            # 安全上限: 超长运行/大量上游动态添加时防 dict 无限增长
+            if len(_addr_cache) > _ADDR_CACHE_MAX:
+                # 简单淘汰: 删除已过期或最旧的条目
+                expired = [k for k, (_, exp) in _addr_cache.items() if exp <= now]
+                for k in expired[:len(expired) // 2 + 1]:
+                    _addr_cache.pop(k, None)
+                if len(_addr_cache) > _ADDR_CACHE_MAX:
+                    # 仍超限: 删除前 1/4 最旧项
+                    sorted_items = sorted(_addr_cache.items(), key=lambda kv: kv[1][1])
+                    for k, _ in sorted_items[:len(sorted_items) // 4]:
+                        _addr_cache.pop(k, None)
         return fs
     return frozenset()
 
@@ -122,8 +137,8 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
                     _bootstrap_cache[host] = ip
                 return ip
             pos += 10 + rdlength
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("bootstrap resolve failed for %s: %r", host, e)
     return None
 
 
@@ -174,20 +189,6 @@ def _host_port(up):
         idx = addr.find("]")
         return addr[1:idx], port
     return addr, port
-
-
-def _resolve_host(host, timeout=3):
-    """解析上游 hostname，优先 IPv4。返回 sockaddr 元组或 None。"""
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_UDP)
-    except OSError:
-        return None
-    for fam, _, _, _, sockaddr in infos:
-        if fam == socket.AF_INET:
-            return (sockaddr[0], 0)
-    if infos:
-        return infos[0][4]
-    return None
 
 
 # ---------------- 连接复用池（DoH / DoT） ----------------
@@ -285,8 +286,8 @@ def discard_upstream_conns(up):
     if proto not in ("doh", "dot"):
         return
     host, port = _host_port(up)
-    path = str(up.get("url") or DOH_DEFAULT_PATH)
-    if not path.startswith("/"):
+    path = "" if proto == "dot" else str(up.get("url") or DOH_DEFAULT_PATH)
+    if path and not path.startswith("/"):
         path = "/" + path
     _pool.discard((proto, host, port, path))
 
@@ -398,17 +399,17 @@ def _dot_query(up, query_bytes, timeout_ms):
     def _exchange(sock):
         sock.settimeout(timeout)
         sock.sendall(frame)
-        buf = b""
+        buf = bytearray()
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 return None
-            buf += chunk
+            buf.extend(chunk)
             # 接收缓冲上限: 防止畸形/恶意上游无限累积 chunk 导致内存爆炸
             if len(buf) > 65536:
                 return None
             try:
-                msg, _ = parse_tcp_frame(buf)
+                msg, _ = parse_tcp_frame(bytes(buf))
                 return msg
             except Exception:
                 continue
@@ -445,7 +446,7 @@ def _dot_query(up, query_bytes, timeout_ms):
                     return True, msg
                 _pool.release(key, None)
                 return False, None
-            except (OSError, Exception):
+            except OSError:
                 _pool.release(key, None)
                 return False, None
     except Exception:
@@ -517,20 +518,24 @@ def _tcp_query(up, query_bytes, timeout_ms, use_tls=False):
             sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
         sock.settimeout(timeout_ms / 1000.0)
         sock.sendall(tcp_frame(query_bytes))
-        buf = b""
+        buf = bytearray()
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 return False, None
-            buf += chunk
+            buf.extend(chunk)
             if len(buf) > 65536:
                 return False, None
             try:
-                msg, _ = parse_tcp_frame(buf)
+                msg, rest = parse_tcp_frame(bytes(buf))
             except Exception:
                 continue
             # 明文 TCP 同样做 0x20 校验(加密 DoT 无投毒面, 跳过)
             if not use_tls and not dnsmsg.check_0x20(query_bytes, msg):
+                # 被投毒的这一帧丢弃并推进缓冲区到帧尾, 继续读取后续帧。
+                # 原实现 buf 不推进: 下次 recv 追加后 parse_tcp_frame 仍反复解析
+                # 同一帧, 0x20 持续失败, 直至 len(buf)>64KB 才返回 —— 等于白等。
+                buf = bytearray(rest)
                 continue
             return True, msg
     except OSError:

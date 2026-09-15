@@ -261,7 +261,7 @@ table.tbl{width:100%; border-collapse:collapse; font-family:var(--font-mono); fo
 .empty{color:var(--text3); font-family:var(--font-mono); font-size:12px; text-align:center; padding:26px 0}
 
 /* ===================== 配置视图 ===================== */
-.cfg-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(460px,1fr)); gap:18px; align-items:start}
+.cfg-grid{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:18px; align-items:start}
 .cfg-row{display:flex; align-items:center; gap:12px; padding:9px 0; border-bottom:1px solid var(--line)}
 .cfg-row:last-child{border-bottom:none}
 .cfg-row .lab{flex:1; font-size:13px}
@@ -358,9 +358,8 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
 /* 上游行 9 列: 开关|名称|协议|完整地址|端口|分组|基础延迟|连接健康度|删除
    首尾列固定宽度(auto 会因表头空span与行控件宽度不同导致表头整体错位) */
 .up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px}
-/* 上游卡片跨满整行; 分流卡片从第 3 列(测速后)延伸到行尾, 宽屏 4 列下占满第 3、4 列 */
+/* 上游卡片跨满整行; 四栏布局: 缓存(1) | 测速(2) | 高级(3) | 分流(4), 上游另起一行跨满 */
 .cfg-grid .card.up-card{grid-column:1/-1}
-.cfg-grid .card.rule-card{grid-column:3/-1}
 .cfg-grid .up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px !important}
 .cfg-grid .up-row input.text{width:100%; min-width:0}
 .cfg-grid .up-row select.q-sel{width:100%; min-width:0}
@@ -453,7 +452,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
     </nav>
     <div class="side-foot">
       <span class="dot"></span><span id="foot-mode">daemon 运行中</span>
-      <span class="uptime" id="foot-uptime">up 0m · v1.9.41</span>
+      <span class="uptime" id="foot-uptime">up 0m · v1.9.52</span>
     </div>
   </aside>
   <!-- ===================== 主区 ===================== -->
@@ -611,6 +610,12 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><input class="num" type="number" id="cfg-maxup" min="1" max="16" step="1"></div></div>
               <div class="cfg-row"><div class="lab">超时阈值<small>ms · 单次上游查询超时上限</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-timeout" min="200" max="5000" step="100"></div></div>
+              <div class="cfg-row"><div class="lab">测速探测超时<small>ms · 候选 IP 测速单次探测超时(默认 300)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-speedtimeout" min="50" max="5000" step="50"></div></div>
+              <div class="cfg-row"><div class="lab">候选 IP 探测方式<small>udp53=UDP:53 · tcp443=TCP:443 · both=两者并发取最快</small></div>
+                <div class="val"><select class="q-sel" id="cfg-ipsprobe"><option value="udp53">UDP:53</option><option value="tcp443">TCP:443</option><option value="both">两者并发</option></select></div></div>
+              <div class="cfg-row"><div class="lab">IP 测速结果缓存<small>seconds · 命中直接复用, 避免重复探测(默认 60)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-ipscachettl" min="0" max="3600" step="10"></div></div>
               <div class="cfg-row"><div class="lab">IPv4 优先<small>同时存在 A / AAAA 记录时优先返回 A 记录</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-v4first"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">启用 IPv6<small>关闭后 AAAA 查询直接判未命中并返回空应答 (全局一刀切)</small></div>
@@ -623,6 +628,35 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-padding"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">响应 IP 合法性校验<small>防 DNS 劫持/rebinding · 丢弃上游返回的私有/保留/环回地址(10.x/192.168.x/127.x/fc00::/7 等), forceIp 规则豁免</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-rebind"><span class="sl"></span></label></div></div>
+            </div>
+          </div>
+          <div class="card adv-card">
+            <div class="card-hd"><span class="t">高级选项</span><span class="s">advanced</span></div>
+            <div class="card-bd">
+              <div class="cfg-row"><div class="lab">EDNS0 总开关<small>出站是否携带 EDNS0 OPT 记录(含 UDP size 扩展)</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-edns"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">DNS 0x20 投毒防护<small>大小写随机化查询名, 提高缓存投毒难度</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-dnssec0x20"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">候选 IP 测速开关<small>对 A/AAAA 候选地址做 RTT 测速并择优返回</small></div>
+                <div class="val"><label class="switch"><input type="checkbox" id="cfg-ipspeedcheck"><span class="sl"></span></label></div></div>
+              <div class="cfg-row"><div class="lab">健康检查周期<small>seconds · 0=关闭主动健康检查</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="3600" step="10" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">规则订阅更新周期<small>seconds · 0=不自动更新订阅</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="86400" step="60" placeholder="0"></div></div>
+              <div class="cfg-row"><div class="lab">Bootstrap DNS<small>引导解析 DoH/DoT 主机名用的普通 DNS 地址, 多个用逗号分隔</small></div>
+                <div class="val"><input class="text" type="text" id="cfg-bootstrapdns" placeholder="如 223.5.5.5, 119.29.29.29" spellcheck="false" autocomplete="off"></div></div>
+              <div class="cfg-row"><div class="lab">熔断失败阈值<small>连续失败次数后打开熔断(默认 3)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-circfails" min="1" max="20" step="1"></div></div>
+              <div class="cfg-row"><div class="lab">熔断打开时长<small>seconds · 超时后半开探测(默认 30)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-circopens" min="5" max="300" step="5"></div></div>
+              <div class="cfg-row"><div class="lab">健康检查探测域名<small>绕过分流规则直连上游, 用于主动健康检查(默认 www.baidu.com)</small></div>
+                <div class="val"><input class="text" type="text" id="cfg-healthdomain" placeholder="www.baidu.com" spellcheck="false" autocomplete="off"></div></div>
+              <div class="cfg-row"><div class="lab">健康检查探测超时<small>ms · 主动健康检查单次探测超时(默认 2000)</small></div>
+                <div class="val"><input class="num" type="number" id="cfg-healthtimeout" min="500" max="10000" step="100"></div></div>
+              <div class="cfg-row"><div class="lab">日志级别<small>debug/info/warning/error · 重启后生效</small></div>
+                <div class="val"><select class="q-sel" id="cfg-loglevel"><option value="debug">debug</option><option value="info">info</option><option value="warning">warning</option><option value="error">error</option></select></div></div>
+              <div class="cfg-row"><div class="lab">日志格式<small>text=可读文本 · json=结构化 JSON · 重启后生效</small></div>
+                <div class="val"><select class="q-sel" id="cfg-logformat"><option value="text">text</option><option value="json">json</option></select></div></div>
             </div>
           </div>
           <div class="card rule-card">
@@ -684,7 +718,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div id="up-list"></div>
               </div>
               <div class="cfg-row up-add-row">
-                <input class="text" id="up-add-addr" placeholder="输入完整地址直接添加, 如 https://doh.opendns.com/dns-query / quic://dns.nextns.io / 223.5.5.5（自动识别协议端口）" spellcheck="false" autocomplete="off" style="flex:3;min-width:0">
+                <input class="text" id="up-add-addr" placeholder="输入完整地址直接添加, 如 https://doh.opendns.com/dns-query / http3://dns.alidns.com/dns-query / quic://dns.nextns.io / 223.5.5.5（自动识别协议端口; 支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3 前缀）" spellcheck="false" autocomplete="off" style="flex:3;min-width:0">
                 <select class="q-sel" id="up-add-proto">
                   <option value="auto" selected>自动</option><option value="udp">UDP</option><option value="tcp">TCP</option><option value="doh">DoH</option><option value="dot">DoT</option><option value="doq">DoQ</option><option value="doh3">DoH3</option>
                 </select>
@@ -703,23 +737,6 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 </button>
                 <span class="note">解析时并发全部可用上游做测速择优 · 回车直接添加</span>
               </div>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-hd"><span class="t">高级选项</span><span class="s">advanced</span></div>
-            <div class="card-bd">
-              <div class="cfg-row"><div class="lab">EDNS0 总开关<small>出站是否携带 EDNS0 OPT 记录(含 UDP size 扩展)</small></div>
-                <div class="val"><label class="switch"><input type="checkbox" id="cfg-edns"><span class="sl"></span></label></div></div>
-              <div class="cfg-row"><div class="lab">DNS 0x20 投毒防护<small>大小写随机化查询名, 提高缓存投毒难度</small></div>
-                <div class="val"><label class="switch"><input type="checkbox" id="cfg-dnssec0x20"><span class="sl"></span></label></div></div>
-              <div class="cfg-row"><div class="lab">候选 IP 测速开关<small>对 A/AAAA 候选地址做 RTT 测速并择优返回</small></div>
-                <div class="val"><label class="switch"><input type="checkbox" id="cfg-ipspeedcheck"><span class="sl"></span></label></div></div>
-              <div class="cfg-row"><div class="lab">健康检查周期<small>seconds · 0=关闭主动健康检查</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="3600" step="10" placeholder="0"></div></div>
-              <div class="cfg-row"><div class="lab">规则订阅更新周期<small>seconds · 0=不自动更新订阅</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="86400" step="60" placeholder="0"></div></div>
-              <div class="cfg-row"><div class="lab">Bootstrap DNS<small>引导解析 DoH/DoT 主机名用的普通 DNS 地址, 多个用逗号分隔</small></div>
-                <div class="val"><input class="text" type="text" id="cfg-bootstrapdns" placeholder="如 223.5.5.5, 119.29.29.29" spellcheck="false" autocomplete="off"></div></div>
             </div>
           </div>
         </div>
@@ -747,6 +764,20 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               重启服务
             </button>
             <span class="note" id="cfg-saved-note">配置修改即时生效, 点击「应用配置」持久化到后端</span>
+          </div>
+          <div style="padding:12px 20px; background:var(--bg2); border-radius:10px; margin-top:12px; font-size:13px; line-height:1.8; color:var(--text2)">
+            <div style="font-weight:600; color:var(--text1); margin-bottom:6px">缓存策略说明</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px">
+              <div>
+                <b style="color:var(--cyan)">LRU 分区</b>（默认）<br>
+                按分流 group 独立 LRU 淘汰 · 8 分桶锁并发友好 · 实现简单开销低 · 适合热点集中场景。缺点：大量一次性查询会污染缓存，挤出热点域名。
+              </div>
+              <div>
+                <b style="color:var(--cyan)">W-TinyLFU</b><br>
+                Caffeine 风格三段式：window(1%) → probation(20%) → protected(80%) + Count-Min Sketch 频率估计。一次性访问在窗口区即淘汰，高频条目受保护不被挤出，抗扫描污染，命中率通常高 5-15%。额外内存约 512KB。
+              </div>
+            </div>
+            <div style="margin-top:8px; color:var(--text3); font-size:12px">切换后自动热重载重建缓存（已有缓存会清空），建议运行 24 小时对比命中率再决定长期策略。</div>
           </div>
         </div>
       </section>
@@ -906,7 +937,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.48";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.54";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
 const API = {
   async req(method, path, body){
@@ -933,11 +964,11 @@ const API = {
 
 /* ---------------- 运行状态 (仿真) ---------------- */
 const DEFAULTS = {
-  cacheSize: 1024, ttl: 300, prefetch: true, kernelDirect: true, speedTest: true,
-  ttlMin: 0, ttlMax: 0, serveStale: false, staleTtl: 3600, persistTtl: 0,
-  speedInterval: 2000, fallback: true, maxParallelUpstreams: 3, ipv4First: true, ipv6: true, edns: true,
-  ednsUdpSize: 1232, padding: false, rebindProtection: true, preferIpv4: false,
-  hook: 'XDP 原生', mapType: 'LRU_HASH', percpu: true, liveRate: 10, timeout: 1500,
+  cacheSize: 1024, ttl: 300, prefetch: true, kernel_direct: true, speed_test: true,
+  ttl_min: 0, ttl_max: 0, serve_stale: false, stale_ttl: 3600, persist_ttl: 0,
+  speed_interval_ms: 2000, fallback: true, max_parallel_upstreams: 3, ipv4_first: true, ipv6: true, edns: true,
+  edns_udp_size: 1232, padding: false, rebind_protection: true, prefer_ipv4: false,
+  hook: 'XDP 原生', mapType: 'LRU_HASH', percpu: true, liveRate: 10, timeout_ms: 1500,
   upstreams: [
     { id:'ali-udp', name:'AliDNS UDP', proto:'udp', addr:'223.5.5.5', port:53, url:'', group:'domestic', latency:8, enabled:true },
     { id:'dnspod-udp', name:'DNSPod UDP', proto:'udp', addr:'119.29.29.29', port:53, url:'', group:'domestic', latency:10, enabled:true },
@@ -1059,10 +1090,10 @@ function simResolve(domain, qtype, opts = {}){
   const c = sim.cache.get(key);
   let hit = c && c.expiresAt > now && !(qtype === 'AAAA' && !config.ipv6);
   if (hit){
-    sim.counters.hit++; if (config.kernelDirect) sim.counters.kernelDirect++;
+    sim.counters.hit++; if (config.kernel_direct) sim.counters.kernelDirect++;
     c.accessAt = now; sim.cache.delete(key); sim.cache.set(key, c);
     const lat = 0.2 + Math.random() * 0.4, ttlLeft = Math.max(0, Math.round((c.expiresAt - now) / 1000));
-    trace.push({ tag:'bpf', text:'BPF LRU map 命中 (TTL 剩余 ' + ttlLeft + 's), ' + (config.kernelDirect ? '由用户态直答' : '经用户态直答') });
+    trace.push({ tag:'bpf', text:'BPF LRU map 命中 (TTL 剩余 ' + ttlLeft + 's), ' + (config.kernel_direct ? '由用户态直答' : '经用户态直答') });
     trace.push({ tag:'ok', text:'应答 ' + c.chosen + '  耗时 ' + lat.toFixed(2) + 'ms (缓存直答)' });
     simPushLat(lat);
     if (!opts.silent) simLog(domain, qtype, 'hit', c.chosen, lat);
@@ -1121,7 +1152,7 @@ function simResolve(domain, qtype, opts = {}){
     if (!cand[v].from.includes(r.u.name)) cand[v].from.push(r.u.name);
   }));
   let list = Object.values(cand).map(a => ({ value:a.value, from:a.from, latency:a.latency, measured:a.latency }));
-  if (config.speedTest && list.length > 1){
+  if (config.speed_test && list.length > 1){
     list.forEach(a => a.measured = a.latency + Math.random() * 12);
     list.sort((a, b) => a.measured - b.measured);
     trace.push({ tag:'eng', text:'测速择优: ' + list[0].value + ' 最快 (' + list[0].measured.toFixed(1) + 'ms), 已按速度排序' });
@@ -1272,7 +1303,7 @@ function renderPipeline(){
   sim.packets.forEach(p => p.el.remove()); sim.packets = [];
   const c = MODE === 'real' ? (real.pipeline || {}) : {};
   const hook = c.hook || config.hook, mapType = c.map_type || config.mapType, cacheSize = c.cache_size || config.cacheSize;
-  const kdirect = MODE === 'real' ? (c.kernel_direct !== undefined ? c.kernel_direct : config.kernelDirect) : config.kernelDirect;
+  const kdirect = MODE === 'real' ? (c.kernel_direct !== undefined ? c.kernel_direct : config.kernel_direct) : config.kernel_direct;
   const ups = MODE === 'real' ? (c.upstreams || []) : config.upstreams.filter(u => u.enabled).slice(0, 3);
   rail.insertAdjacentHTML('beforeend', stnHTML(ST.client.x, ST.client.y, 13, STN_ICONS.server, '客户端', 'LAN / Pod · 发往 :53', ''));
   rail.insertAdjacentHTML('beforeend', stnHTML(ST.xdp.x, ST.xdp.y, 13, STN_ICONS.xdp, 'XDP Hook', hook + ' · 报文旁路', 'hot'));
@@ -1478,7 +1509,7 @@ function refreshTelemetryUI(){
     const tc = $('#top-clients'); if (tc) tc.innerHTML = fmtTop(stTop.top_clients, '');
     const tu = $('#top-ups'); if (tu) tu.innerHTML = fmtTop(stTop.top_upstreams, ' 次');
   } else {
-    ['top-domains','top-clients','top-ups'].forEach(id => { const el = $(id); if (el) el.textContent = '–'; });
+    ['top-domains','top-clients','top-ups'].forEach(id => { const el = $('#' + id); if (el) el.textContent = '–'; });
   }
 }
 
@@ -1569,6 +1600,15 @@ function renderConfig(){
     $('#cfg-healthint').value = c.health_check_interval || 0;
     $('#cfg-rulesubint').value = c.rule_sub_interval || 0;
     $('#cfg-bootstrapdns').value = c.bootstrap_dns || '';
+    $('#cfg-speedtimeout').value = c.speed_timeout_ms || 300;
+    $('#cfg-ipsprobe').value = c.ip_speed_probe || 'both';
+    $('#cfg-ipscachettl').value = c.ip_speed_cache_ttl || 60;
+    $('#cfg-circfails').value = c.circuit_fails || 3;
+    $('#cfg-circopens').value = c.circuit_open_s || 30;
+    $('#cfg-healthdomain').value = c.health_probe_domain || 'www.baidu.com';
+    $('#cfg-healthtimeout').value = c.health_probe_timeout_ms || 2000;
+    $('#cfg-loglevel').value = c.log_level || 'info';
+    $('#cfg-logformat').value = c.log_format || 'text';
     renderUpstreams(c.upstreams || []); renderRules(c.rules || []); renderRuleSubs(c.rule_subscriptions || []);
     // 合并连接级健康度(来自 /api/upstreams): 配置页上游表格显示真实连接延迟
     API.get('/api/upstreams').then(r => {
@@ -1582,21 +1622,30 @@ function renderConfig(){
   } else {
     $('#cfg-size').value = config.cacheSize; $('#cfg-size-r').value = config.cacheSize;
     $('#cfg-ttl').value = config.ttl; $('#cfg-ttl-r').value = config.ttl;
-    $('#cfg-prefetch').checked = config.prefetch; $('#cfg-kdirect').checked = config.kernelDirect;
-    $('#cfg-ttlmin').value = config.ttlMin || 0; $('#cfg-ttlmax').value = config.ttlMax || 0;
-    $('#cfg-stale').checked = config.serveStale; $('#cfg-stalettl').value = config.staleTtl;
-    $('#cfg-persistttl').value = config.persistTtl || 0;
-    $('#cfg-speed').checked = config.speedTest; $('#cfg-spint').value = config.speedInterval;
-    $('#cfg-fallback').checked = config.fallback; $('#cfg-maxup').value = config.maxParallelUpstreams || 3; $('#cfg-v4first').checked = config.ipv4First;
-    $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.preferIpv4;
-    $('#cfg-ednssize').value = config.ednsUdpSize || 1232; $('#cfg-padding').checked = config.padding; $('#cfg-rebind').checked = config.rebindProtection !== false;
-    $('#cfg-timeout').value = config.timeout;
+    $('#cfg-prefetch').checked = config.prefetch; $('#cfg-kdirect').checked = config.kernel_direct;
+    $('#cfg-ttlmin').value = config.ttl_min || 0; $('#cfg-ttlmax').value = config.ttl_max || 0;
+    $('#cfg-stale').checked = config.serve_stale; $('#cfg-stalettl').value = config.stale_ttl;
+    $('#cfg-persistttl').value = config.persist_ttl || 0;
+    $('#cfg-speed').checked = config.speed_test; $('#cfg-spint').value = config.speed_interval_ms;
+    $('#cfg-fallback').checked = config.fallback; $('#cfg-maxup').value = config.max_parallel_upstreams || 3; $('#cfg-v4first').checked = config.ipv4_first;
+    $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.prefer_ipv4;
+    $('#cfg-ednssize').value = config.edns_udp_size || 1232; $('#cfg-padding').checked = config.padding; $('#cfg-rebind').checked = config.rebind_protection !== false;
+    $('#cfg-timeout').value = config.timeout_ms || 1500;
     $('#cfg-cache-policy').value = 'lru';
     $('#cfg-edns').checked = config.edns !== false; $('#cfg-dnssec0x20').checked = !!config.dnssec_0x20;
     $('#cfg-ipspeedcheck').checked = !!config.ip_speed_check;
     $('#cfg-healthint').value = config.health_check_interval || 0;
     $('#cfg-rulesubint').value = config.rule_sub_interval || 0;
     $('#cfg-bootstrapdns').value = config.bootstrap_dns || '';
+    $('#cfg-speedtimeout').value = config.speed_timeout_ms || 300;
+    $('#cfg-ipsprobe').value = config.ip_speed_probe || 'both';
+    $('#cfg-ipscachettl').value = config.ip_speed_cache_ttl || 60;
+    $('#cfg-circfails').value = config.circuit_fails || 3;
+    $('#cfg-circopens').value = config.circuit_open_s || 30;
+    $('#cfg-healthdomain').value = config.health_probe_domain || 'www.baidu.com';
+    $('#cfg-healthtimeout').value = config.health_probe_timeout_ms || 2000;
+    $('#cfg-loglevel').value = config.log_level || 'info';
+    $('#cfg-logformat').value = config.log_format || 'text';
     renderUpstreams(config.upstreams); renderRules(config.rules); renderRuleSubs(config.ruleSubscriptions || []);
   }
   bindConfigEvents();
@@ -1605,7 +1654,7 @@ function fullAddr(u){
   // 上游完整地址(地址+URL路径合并, 端口独立列): https://dns.alidns.com/dns-query
   if (!u) return '';
   const proto = String(u.proto || 'udp').toLowerCase();
-  const scheme = { udp:'udp', tcp:'tcp', doh:'https', doh3:'https', dot:'tls', doq:'quic' }[proto] || proto;
+  const scheme = { udp:'udp', tcp:'tcp', doh:'https', doh3:'http3', dot:'tls', doq:'quic' }[proto] || proto;
   let s = scheme + '://' + (u.addr || '');
   let url = u.url || '';
   if (/^(doh|doh3|doq)$/.test(proto)){
@@ -1632,7 +1681,7 @@ function renderUpstreams(ups){
     '<label class="switch"><input type="checkbox" data-f="enabled" data-id="' + u.id + '"' + (u.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
     '<input class="text" data-f="name" data-id="' + u.id + '" value="' + esc(u.name) + '" title="上游名称">' +
     '<select class="q-sel" data-f="proto" data-id="' + u.id + '">' + ['udp','tcp','doh','dot','doq','doh3'].map(p => '<option value="' + p + '"' + (String(u.proto||'udp').toLowerCase() === p ? ' selected' : '') + '>' + PROTO_LABEL[p] + '</option>').join('') + '</select>' +
-    '<input class="text" data-f="fulladdr" data-id="' + u.id + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29)">' +
+    '<input class="text" data-f="fulladdr" data-id="' + u.id + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / http3://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29; 支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3 前缀)">' +
     '<select class="q-sel" data-f="port" data-id="' + u.id + '">' + portHtml + '</select>' +
     '<select class="q-sel" data-f="group" data-id="' + u.id + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
     (u.latency != null
@@ -1762,7 +1811,17 @@ function bindConfigEvents(){
   bindCfg('#cfg-ipspeedcheck','ip_speed_check', e => e.target.checked);
   bindCfg('#cfg-healthint','health_check_interval', e => clamp(+e.target.value,0,3600));
   bindCfg('#cfg-rulesubint','rule_sub_interval', e => clamp(+e.target.value,0,86400));
-  $('#cfg-bootstrapdns').addEventListener('change', e => { const v = (e.target.value || '').trim(); if (MODE==='real') real.config.bootstrap_dns = v; else config.bootstrapDns = v; });
+  $('#cfg-bootstrapdns').addEventListener('change', e => { const v = (e.target.value || '').trim(); if (MODE==='real') real.config.bootstrap_dns = v; else config.bootstrap_dns = v; });
+  // 性能/高级补全: 测速探测超时 / IP 探测方式 / IP 测速缓存 / 熔断 / 健康探测 / 日志
+  bindCfg('#cfg-speedtimeout','speed_timeout_ms', e => clamp(+e.target.value,50,5000));
+  bindCfg('#cfg-ipsprobe','ip_speed_probe', e => e.target.value);
+  bindCfg('#cfg-ipscachettl','ip_speed_cache_ttl', e => clamp(+e.target.value,0,3600));
+  bindCfg('#cfg-circfails','circuit_fails', e => clamp(+e.target.value,1,20));
+  bindCfg('#cfg-circopens','circuit_open_s', e => clamp(+e.target.value,5,300));
+  bindCfg('#cfg-healthdomain','health_probe_domain', e => (e.target.value||'').trim());
+  bindCfg('#cfg-healthtimeout','health_probe_timeout_ms', e => clamp(+e.target.value,500,10000));
+  bindCfg('#cfg-loglevel','log_level', e => e.target.value);
+  bindCfg('#cfg-logformat','log_format', e => e.target.value);
   // 缓存策略热切换 (P1-3): lru <-> tinylfu, 保存后自动热重载重建缓存容器
   $('#cfg-cache-policy').addEventListener('change', e => { if (MODE==='real'){ real.config.cache_policy = e.target.value; _cachePolicyDirty = true; } });
   $('#up-list').addEventListener('change', e => {
@@ -1773,7 +1832,7 @@ function bindConfigEvents(){
     else if (f === 'fulladdr') {
       // 完整地址(地址+URL路径合并, 端口独立列)编辑: 自动解析拆回分字段
       const parsed = parseUpstreamAddr(el.value, u.proto);
-      if (!parsed){ note('地址格式无法识别: ' + el.value, 'var(--red)'); el.value = fullAddr(u); return; }
+      if (!parsed || parsed.error){ note(parsed ? parsed.error : '地址格式无法识别: ' + el.value, 'var(--red)'); el.value = fullAddr(u); return; }
       const hadExplicitPort = /:\d+(\/|$)/.test(el.value.trim());  // 地址里显式写了端口
       const oldPort = u.port;
       u.proto = parsed.proto; u.addr = parsed.addr; u.url = parsed.url;
@@ -1824,13 +1883,14 @@ function bindConfigEvents(){
       rest = m[2];
       if (scheme === 'https'){ proto = 'doh'; url = '/dns-query'; }
       else if (scheme === 'http'){ proto = 'doh'; url = '/dns-query'; }   // 明文 DoH(端口 80)
-      else if (scheme === 'quic'){ proto = 'doq'; url = '/dns-query'; }
+      else if (scheme === 'quic' || scheme === 'doq'){ proto = 'doq'; url = '/dns-query'; }
       else if (scheme === 'tls' || scheme === 'dot'){ proto = 'dot'; url = ''; }
       else if (scheme === 'udp'){ proto = 'udp'; url = ''; }
       else if (scheme === 'tcp'){ proto = 'tcp'; url = ''; }
       else if (scheme === 'doh'){ proto = 'doh'; url = '/dns-query'; }
       else if (scheme === 'doh3'){ proto = 'doh3'; url = '/dns-query'; }
-      else return { error: '无法识别的协议前缀 ' + scheme + '://（支持 https/http/quic/tls/udp/tcp）' };
+      else if (scheme === 'http3' || scheme === 'h3'){ proto = 'doh3'; url = '/dns-query'; }
+      else return { error: '无法识别的协议前缀 ' + scheme + '://（支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3）' };
     } else if (protoSel && protoSel !== 'auto'){
       proto = protoSel;   // 用户显式指定协议
       if (proto === 'doh' || proto === 'doh3' || proto === 'doq') url = '/dns-query';
@@ -1877,9 +1937,10 @@ function bindConfigEvents(){
     renderConfig();
     $('#up-add-addr').value = '';
     $('#up-add-addr').focus();
-    const disp = parsed.proto === 'doh' || parsed.proto === 'doh3' || parsed.proto === 'doq'
-      ? parsed.proto + '://' + parsed.addr + ':' + parsed.port + parsed.url
-      : parsed.proto + '://' + parsed.addr + ':' + parsed.port;
+    const _dispProto = { udp:'udp', tcp:'tcp', doh:'https', doh3:'http3', dot:'tls', doq:'quic' }[parsed.proto] || parsed.proto;
+    const disp = (parsed.proto === 'doh' || parsed.proto === 'doh3' || parsed.proto === 'doq')
+      ? _dispProto + '://' + parsed.addr + parsed.url
+      : _dispProto + '://' + parsed.addr + ':' + parsed.port;
     note('已添加上游 ' + disp + ' (' + (PROTO_LABEL[parsed.proto] || parsed.proto.toUpperCase()) + ':' + parsed.port + ')', 'var(--green)');
   }
   $('#btn-add-up').addEventListener('click', addUpstreamFromInput);
@@ -1892,7 +1953,7 @@ function bindConfigEvents(){
       const res = await API.post('/api/reprobe');
       const rs = res.results || [];
       const okN = rs.filter(r => r.ok).length;
-      const parts = rs.map(r => r.name + ' ' + r.old + '→' + (r.ok ? r.new : r.new + '(保留)') + 'ms');
+      const parts = rs.map(r => r.name + ' ' + r.old + '→' + (r.new != null ? (r.new + (r.ok ? 'ms' : '(保留)ms')) : '–'));
       note('重新测速完成 ' + okN + '/' + rs.length + ' 个: ' + parts.join('  ·  '), okN ? 'var(--green)' : 'var(--red)');
       const c = await API.get('/api/config');
       real.config = c; renderConfig();

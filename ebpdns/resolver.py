@@ -24,6 +24,60 @@ from . import dnsmsg
 
 # match_rule 缓存哨兵: 区分"未缓存"与"命中 None"(无规则)
 _MISS = object()
+
+# 正则匹配超时保护: 防止恶意正则规则(如 (a+)+$)配合长域名导致 ReDoS 阻塞 worker
+_REGEX_TIMEOUT_SEC = 0.5
+_REGEX_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="regex-safe")
+
+def _detect_catastrophic_regex(pat):
+    """静态检测可能引发灾难性回溯的正则模式(嵌套量词)。
+    返回 True 表示高风险, 调用方应拒绝或强警告。"""
+    # 匹配形如 (X)+ (X)* (X)? (X){n,m} 其中 X 本身含量词 +*?{
+    # 简化检测: 查找组内包含量词且组后紧跟量词
+    i = 0
+    while i < len(pat):
+        if pat[i] == '(':
+            depth = 1
+            j = i + 1
+            has_quant_inside = False
+            while j < len(pat) and depth > 0:
+                if pat[j] == '\\':
+                    j += 2
+                    continue
+                if pat[j] == '(':
+                    depth += 1
+                elif pat[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif pat[j] in '+*?' and depth == 1:
+                    # 检查是否是非转义量词
+                    has_quant_inside = True
+                j += 1
+            # 组结束后检查是否有量词(j 指向闭合 ')', 检查其后一个字符)
+            if j + 1 < len(pat) and pat[j + 1] in '+*?{':
+                if has_quant_inside:
+                    return True
+            i = j + 1
+        else:
+            i += 1
+    return False
+
+def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
+    """带超时的正则搜索, 防止 ReDoS。超时返回 None(视为不匹配)。"""
+    try:
+        fut = _REGEX_POOL.submit(pattern.search, text)
+        return fut.result(timeout=timeout)
+    except Exception:
+        return None
+
+def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
+    """带超时的正则匹配(match), 防止 ReDoS。超时返回 None(视为不匹配)。"""
+    try:
+        fut = _REGEX_POOL.submit(pattern.match, text)
+        return fut.result(timeout=timeout)
+    except Exception:
+        return None
 from .cache import PartitionedCache, TinyLFUCache
 from .upstream import probe_ip, probe_tcp, query_upstream, _tcp_query
 
@@ -125,6 +179,11 @@ class Resolver:
         # 候选 IP 测速结果缓存: ip -> (rtt_ms, ts)。命中直接复用, 避免重复探测。
         self._ip_speed_cache = {}
         self._ip_speed_lock = threading.Lock()
+        # 上游延迟排序缓存: 避免每次 miss 都对所有上游做 sorted() + 多次 _upstream_eff_lat 调用。
+        # 延迟值变化较慢(EWMA), 缓存排序结果 5s 刷新一次即可, 减少 miss 热路径开销。
+        self._sorted_ups_cache = None       # (sorted_list, backup_list) 元组
+        self._sorted_ups_ts = 0.0
+        self._sorted_ups_key = None        # 配置指纹(上游列表变化时失效)
         # 测速节流表: 按域名记录最近测速时间, 用 OrderedDict 限长(防长时压测
         # 随机域名导致 dict 无限增长的内存泄漏)
         self._last_speed_test = OrderedDict()   # domain -> ts
@@ -167,7 +226,7 @@ class Resolver:
         # events(控制台可见)与 journal(可审计), 但压测/故障高峰每秒可能
         # 数十条同类错误, 不限速会刷爆 events deque 与 systemd journal。
         # 按错误类别每 5s 最多上报一条, 既保留异常可见性又防刷屏。
-        self._err_log_ts = {}
+        self._err_log_ts = OrderedDict()  # OrderedDict: popitem(last=False) 淘汰最旧项(原 plain dict 不支持该参数导致内存泄漏)
         self._err_log_lock = threading.Lock()
         # 共享上游查询线程池：miss 吞吐受限于 worker 数 x 上游并发。
         # 每 miss 并行占用 max_par 个 worker, 池太小会让并发 miss 排队拖垮吞吐。
@@ -305,6 +364,16 @@ class Resolver:
                             rule=self._rule_label(_rule) if _rule else None)
                 return self._result(d, qtype, [], None, True, False, None,
                                     latency=lat, trace=trace, ttl_left=ttl_left, rcode=3)
+            if not c.get("answers"):
+                # 负缓存 NODATA (rcode=0 但无答案)
+                trace.append({"tag": "bpf", "text": "BPF LRU map 命中 (负缓存 NODATA, TTL 剩余 %ds)" % ttl_left})
+                trace.append({"tag": "ok", "text": "应答 NODATA  耗时 %.2fms" % lat})
+                if not silent:
+                    tel.log(d, qtype, "hit", "缓存直答 NODATA", lat,
+                            client_ip=client_ip, upstream="缓存直答", answer="NODATA",
+                            rule=self._rule_label(_rule) if _rule else None)
+                return self._result(d, qtype, [], None, True, False, None,
+                                    latency=lat, trace=trace, ttl_left=ttl_left, empty=True, rcode=0)
             mode = "内核直接构造应答" if cfg.get("kernel_direct", True) else "用户态直答(内核直答已关闭)"
             trace.append({"tag": "bpf", "text": "BPF LRU map 命中 (TTL 剩余 %ds), %s" % (ttl_left, mode)})
             trace.append({"tag": "ok", "text": "应答 %s  耗时 %.2fms (%s)" % (c["chosen"], lat, "内核直答" if cfg.get("kernel_direct", True) else "缓存直答")})
@@ -345,6 +414,16 @@ class Resolver:
                             client_ip=client_ip, upstream="serve-stale", answer="")
                 return self._result(d, qtype, [], None, True, False, None,
                                     latency=lat, trace=trace, ttl_left=0, rcode=3)
+            if not stale_entry.get("answers"):
+                # 过期 NODATA 负缓存兜底
+                trace.append({"tag": "bpf", "text": "过期缓存兜底: NODATA 负缓存(已过期, TTL 0s)"})
+                trace.append({"tag": "ok", "text": "应答 NODATA(serve-stale)  耗时 %.2fms" % lat})
+                if not silent:
+                    tel.log(d, qtype, "hit", "serve-stale NODATA", lat,
+                            client_ip=client_ip, upstream="serve-stale", answer="")
+                self._trigger_stale_refresh(key, d, qtype)
+                return self._result(d, qtype, [], None, True, False, None,
+                                    latency=lat, trace=trace, ttl_left=0, empty=True, rcode=0)
             ans = [dict(a, ttl=0) for a in stale_entry.get("answers", [])]  # 下发 TTL=0: 告知客户端勿缓存
             chosen = stale_entry.get("chosen", "") or (ans[0]["value"] if ans else "")
             trace.append({"tag": "bpf", "text": "过期缓存兜底 serve-stale: 返回旧数据 %s (TTL 0s), 后台刷新中" % chosen})
@@ -387,7 +466,9 @@ class Resolver:
             filtered = [u for u in ups if u.get("group") == g]
             if filtered:
                 ups = filtered
-            trace.append({"tag": "rule", "text": "分流规则 [%s] 命中: 仅使用「%s」组上游" % (rule.get("match"), g)})
+                trace.append({"tag": "rule", "text": "分流规则 [%s] 命中: 仅使用「%s」组上游 (%d 个)" % (rule.get("match"), g, len(filtered))})
+            else:
+                trace.append({"tag": "warn", "text": "分流规则 [%s] 命中: 「%s」组无启用上游, 回退全部上游" % (rule.get("match"), g)})
             if not silent:
                 tel.log(d, qtype, "rule", "分流规则 → 「%s」组" % g, 0,
                         client_ip=client_ip, upstream="分流规则", answer="", rule=self._rule_label(rule))
@@ -396,6 +477,15 @@ class Resolver:
             ip = rule.get("ip", "")
             rtype = self._guess_type(ip, qtype)
             lat = (time.monotonic() - t0) * 1000
+            # 查询类型与强制 IP 类型不匹配(如 AAAA 查询但配置 IPv4) → 返回 NODATA
+            qtype_code = dnsmsg.type_code(qtype) or dnsmsg.TYPE_A
+            if rtype != qtype_code:
+                trace.append({"tag": "rule", "text": "分流规则 [%s] 强制 IP %s 与查询类型 %s 不匹配 → NODATA" % (rule.get("match"), ip, qtype)})
+                if not silent:
+                    tel.log(d, qtype, "rule", "forceIp 类型不匹配 → NODATA", lat,
+                            client_ip=client_ip, upstream="分流规则", answer="", rule=self._rule_label(rule))
+                return self._result(d, qtype, [], None, False, False, None,
+                                    latency=lat, trace=trace, ttl_left=0, empty=True, rcode=0)
             rttl = self._clamp_ttl(cfg.get("ttl", 300), rule)   # 规则级 TTL 覆盖
             ans = [{"value": ip, "from": "分流规则", "ttl": rttl, "type": rtype}]
             self._fill_cache(key, d, qtype, ans, rule=rule)
@@ -419,7 +509,17 @@ class Resolver:
             # 全部失败时自动回退到剩余上游(保持旧版容错性, 同时减少正常场景的上游请求)
             _n = max_upstreams if max_upstreams is not None else int(cfg.get("max_parallel_upstreams", 3))
             _n = max(1, min(_n, len(ups)))
-            _all_ups = sorted(ups, key=lambda u: self._upstream_eff_lat(u))
+            # 排序缓存: 延迟值变化慢(EWMA), 5s 刷新一次避免每次 miss 都做 sorted()
+            _now_sort = time.monotonic()
+            _ups_sig = tuple(u.get("id", "") for u in ups)
+            if (self._sorted_ups_cache is None
+                    or self._sorted_ups_key != _ups_sig
+                    or _now_sort - self._sorted_ups_ts > 5.0):
+                self._all_ups_sorted = sorted(ups, key=self._upstream_eff_lat)
+                self._sorted_ups_cache = self._all_ups_sorted
+                self._sorted_ups_ts = _now_sort
+                self._sorted_ups_key = _ups_sig
+            _all_ups = self._sorted_ups_cache
             ups = _all_ups[:_n]
             _backup_ups = _all_ups[_n:] if _n < len(_all_ups) else []
             trace.append({"tag": "eng", "text": "解析失败降级开 → 先并发最快 %d/%d 个上游(实测延迟排序): %s%s" % (
@@ -459,10 +559,11 @@ class Resolver:
                 # 修复: 旧逻辑 max(neg_ttl, min(mn,60)) 在 ttl_max 生效时会"抬高"而非钳制,
                 # 导致负缓存 TTL 不服从 TTL 管控(如 ttl_max=30 时负缓存仍 45s)。
                 neg_ttl = max(10, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
+                now_neg = time.time()
                 self.cache.put(key, {
                     "domain": d, "qtype": qtype, "answers": [], "chosen": "",
                     "ttl": neg_ttl, "rcode": 3,
-                    "expires_at": time.time() + neg_ttl, "access_at": time.time(),
+                    "expires_at": now_neg + neg_ttl, "access_at": now_neg,
                 })
                 tel.push_latency(lat)
                 trace.append({"tag": "eng", "text": "上游确认域名不存在 (NXDOMAIN), 负缓存 %ds" % neg_ttl})
@@ -517,15 +618,23 @@ class Resolver:
                         return self._result(d, qtype, fall, fall[0]["value"], False, False, None,
                                             latency=lat, trace=trace, ttl_left=cfg.get("ttl", 300), rcode=0)
                 lat = (time.monotonic() - t0) * 1000
+                # NODATA 负缓存: 与 NXDOMAIN 一致, 默认 [10,60] 秒, 受 ttl_min/ttl_max 管控
+                neg_ttl = max(10, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
+                now_neg = time.time()
+                self.cache.put(key, {
+                    "domain": d, "qtype": qtype, "answers": [], "chosen": "",
+                    "ttl": neg_ttl, "rcode": 0,
+                    "expires_at": now_neg + neg_ttl, "access_at": now_neg,
+                })
                 tel.push_latency(lat)
-                trace.append({"tag": "eng", "text": "上游无该类型记录 (NODATA) → 空应答 NOERROR"})
+                trace.append({"tag": "eng", "text": "上游无该类型记录 (NODATA), 负缓存 %ds → 空应答 NOERROR" % neg_ttl})
                 if not silent:
-                    tel.log(d, qtype, "miss", "NODATA", lat,
+                    tel.log(d, qtype, "miss", "NODATA (负缓存)", lat,
                             client_ip=client_ip,
                             upstream=" / ".join(r.get("up_name", "?") for r in nodata[:3]),
                             answer="")
                 return self._result(d, qtype, [], None, False, False, None,
-                                    latency=lat, trace=trace, ttl_left=0, empty=True, rcode=0)
+                                    latency=lat, trace=trace, ttl_left=neg_ttl, empty=True, rcode=0)
             # ---- 启动预热重试: 冷启动/重启早期(45s)上游 TLS 未就绪, 全部失败时
             #      延迟 1s 重试一次, 避免用户刚部署/重启就遇到 SERVFAIL。全局至多
             #      3 次, 稳态完全不受影响(压测/故障高峰不会放大延迟)。
@@ -638,7 +747,9 @@ class Resolver:
         q = msg["questions"][0]
         if q["qclass"] != dnsmsg.CLASS_IN:
             return None
-        domain = q["name"]
+        # DNS 名不区分大小写: parse_message 返回的 name 保留线上大小写(0x20 随机大小写),
+        # 必须小写后做缓存 key, 否则 "WWW.BAIDU.COM" 与 "www.baidu.com" 命中不同缓存条目。
+        domain = q["name"].lower()
         qtype_name = q.get("qtype_name") or dnsmsg.type_name(q["qtype"])
         key = self._ckey(domain, qtype_name)
         t0 = time.monotonic()
@@ -674,13 +785,10 @@ class Resolver:
                 if not stale:
                     c["resp_body"] = body
             resp = dnsmsg.build_response_header(raw_query, 3, 0) + body
-            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0, lat)
-            # 快路径命中 → 实时查询日志(带客户端IP), 与完整路径事件同构
-            try:
-                tel.log(domain, qtype_name, "hit", "缓存直答 NXDOMAIN", lat,
-                        client_ip=client_addr, upstream="缓存直答", answer="NXDOMAIN")
-            except Exception:
-                pass
+            # 合并 fast_hit + log: 一次加锁(原两次锁竞争)
+            tel.fast_hit_logged(qtype_name, len(raw_query), len(resp) if resp else 0, lat,
+                                domain, "缓存直答 NXDOMAIN",
+                                upstream="缓存直答", answer="NXDOMAIN")
             return resp
         if rcode == 0:
             if stale:
@@ -693,18 +801,21 @@ class Resolver:
                     body = dnsmsg.build_response_body(domain, q["qtype"], c["answers"])
                     c["resp_body"] = body
             resp = dnsmsg.build_response_header(raw_query, 0, len(c["answers"])) + body
-            tel.fast_hit(qtype_name, len(raw_query), len(resp) if resp else 0, lat,
-                         kernel_direct=kd)
-            # 快路径命中 → 实时查询日志(带客户端IP)
-            try:
-                chosen = c.get("chosen", "") or (c["answers"][0]["value"] if c.get("answers") else "")
-                tel.log(domain, qtype_name, "hit",
-                        ("serve-stale → %s" if stale else "内核直答 → %s") % chosen, lat,
-                        client_ip=client_addr,
-                        upstream="serve-stale" if stale else ("内核直答" if kd else "缓存直答"),
-                        answer=chosen)
-            except Exception:
-                pass
+            chosen = c.get("chosen", "") or (c["answers"][0]["value"] if c.get("answers") else "")
+            _up = "serve-stale" if stale else ("内核直答" if kd else "缓存直答")
+            _msg = ("serve-stale → %s" if stale else "内核直答 → %s") % chosen
+            # 合并 fast_hit + log: 一次加锁(原两次锁竞争)
+            tel.fast_hit_logged(qtype_name, len(raw_query), len(resp) if resp else 0, lat,
+                                domain, _msg, upstream=_up, answer=chosen,
+                                kernel_direct=kd)
+            # 快路径缓存命中也调度预取(原仅 resolve() 完整路径调度, UDP 主线程快路径
+            # 直接返回导致预取对大部分缓存命中永不触发)
+            if not stale:
+                try:
+                    self.schedule_prefetch(key, domain, qtype_name,
+                                           max(0, int(c.get("expires_at", 0) - now)))
+                except Exception:
+                    pass
             return resp
         return None
 
@@ -766,12 +877,19 @@ class Resolver:
             pass
 
     def _cb_fail(self, up_id):
-        """上游查询失败: 失败计数++, 达阈值打开熔断。"""
+        """上游查询失败: 失败计数++, 达阈值打开熔断。
+
+        阈值(circuit_fails)与熔断时长(circuit_open_s)每次失败时实时从 cfg 读取,
+        使控制台修改后经 PUT /api/config 或 /api/reload 热重载即时生效,
+        不必重启进程(原实现 __init__ 缓存为标量, 热重载后仍用旧值)。
+        """
+        cb_fails = int(self.cfg.get("circuit_fails", self._cb_fails))
+        cb_open_s = int(self.cfg.get("circuit_open_s", self._cb_open_s))
         with self._cb_lock:
             st = self._cb.setdefault(up_id, {"fails": 0, "until": 0.0})
             st["fails"] += 1
-            if st["fails"] >= self._cb_fails:
-                st["until"] = time.time() + self._cb_open_s
+            if st["fails"] >= cb_fails:
+                st["until"] = time.time() + cb_open_s
 
     def _cb_ok(self, up_id):
         """上游查询成功: 关闭熔断, 计数清零。"""
@@ -892,7 +1010,6 @@ class Resolver:
         except Exception:
             pass
         return float(u.get("latency", 9999))
-
     @staticmethod
     def _is_private_ip(ip_str):
         """判断 IP 是否为私有/保留/环回/链路本地地址(防 DNS 劫持/rebinding)。
@@ -925,18 +1042,26 @@ class Resolver:
         _tel = self.tel
         SLOW_THRESH = max(800, int(timeout * 0.6))
 
+        # 批量读取熔断状态(一次加锁, 避免每个上游一次锁竞争)
+        with self._cb_lock:
+            _cb_snapshot = {uid: (st.get("until", 0.0) and time.time() < st.get("until", 0.0))
+                            for uid, st in self._cb.items()}
+
+        def _is_cb_open(u):
+            return _cb_snapshot.get(u.get("id", ""), False)
+
         def _is_slow_up(u):
             try:
-                st = _tel.upstream_stat(u.get("id"))
+                st = _tel.per_upstream.get(u.get("id"))
             except Exception:
                 return False
             if not st or st.get("ok", 0) < 10:  # 采样不足不判定, 避免单次抖动误杀
                 return False
             return st["lat_sum"] / st["ok"] > SLOW_THRESH
 
-        healthy = [u for u in ups if not self._cb_is_open(u.get("id")) and not _is_slow_up(u)]
+        healthy = [u for u in ups if not _is_cb_open(u) and not _is_slow_up(u)]
         if not healthy:
-            healthy = [u for u in ups if not self._cb_is_open(u.get("id"))]  # 全部偏慢则降级为仅熔断过滤
+            healthy = [u for u in ups if not _is_cb_open(u)]  # 全部偏慢则降级为仅熔断过滤
         if not healthy:
             healthy = ups  # 全部熔断时兜底仍尝试, 上游可能已恢复
         fut2u = {}
@@ -1008,9 +1133,9 @@ class Resolver:
                 rcode = parsed.get("rcode")
                 if rcode == 0:
                     ans = self._extract_answers(parsed, qtype)
+                    _ck = self._conn_key(u)
                     if ans:
-                        self.tel.upstream_ok(u["id"], lat)
-                        self.tel.conn_ok(self._conn_key(u), lat)
+                        self.tel.upstream_ok_conn_ok(u["id"], _ck, lat)
                         self._cb_ok(u["id"])
                         for a in ans:
                             trace.append({"tag": "ans", "text": "%-12s %s  %dms" % (u["name"][:12], a["value"], lat)})
@@ -1021,8 +1146,7 @@ class Resolver:
                     if parsed.get("answers"):
                         _cns = [a for a in parsed.get("answers", []) if a["type"] == dnsmsg.TYPE_CNAME]
                         if _cns:
-                            self.tel.upstream_ok(u["id"], lat)
-                            self.tel.conn_ok(self._conn_key(u), lat)
+                            self.tel.upstream_ok_conn_ok(u["id"], _ck, lat)
                             self._cb_ok(u["id"])
                             trace.append({"tag": "ans", "text": "%-12s CNAME 链 → %s (%dms)" % (
                                 u["name"][:12], _cns[0].get("rdata", ""), lat)})
@@ -1031,22 +1155,19 @@ class Resolver:
                                         (str(_cns[0].get("rdata", "")).rstrip(".").lower(),
                                          max(1, int(_cns[0].get("ttl", 300))))]}
                     # NOERROR 但无目标答案 = NODATA
-                    self.tel.upstream_ok(u["id"], lat)
-                    self.tel.conn_ok(self._conn_key(u), lat)
+                    self.tel.upstream_ok_conn_ok(u["id"], _ck, lat)
                     self._cb_ok(u["id"])
                     trace.append({"tag": "ans-fail", "text": "%-12s 无该类型记录 (NODATA) %dms" % (u["name"][:12], lat)})
                     return {"ok": True, "up_name": u["name"], "lat": lat,
                             "rcode": 0, "answers": [], "nodata": True}
                 if rcode == 3:
-                    self.tel.upstream_ok(u["id"], lat)
-                    self.tel.conn_ok(self._conn_key(u), lat)
+                    self.tel.upstream_ok_conn_ok(u["id"], self._conn_key(u), lat)
                     self._cb_ok(u["id"])
                     trace.append({"tag": "ans-fail", "text": "%-12s NXDOMAIN (域名不存在) %dms" % (u["name"][:12], lat)})
                     return {"ok": True, "up_name": u["name"], "lat": lat,
                             "rcode": 3, "answers": []}
             # rcode 其它（如 SERVFAIL/REFUSED）视为失败
-        self.tel.upstream_fail(u["id"])
-        self.tel.conn_fail(self._conn_key(u))
+        self.tel.upstream_fail_conn_fail(u["id"], self._conn_key(u))
         self._cb_fail(u["id"])
         trace.append({"tag": "ans-fail", "text": "%-12s 查询失败 / 超时 (%dms)" % (u["name"][:12], lat)})
         return {"ok": False, "up_name": u["name"], "lat": lat, "rcode": None, "answers": []}
@@ -1151,7 +1272,7 @@ class Resolver:
             if now - last < interval:
                 return cand_list  # 间隔内复用上次排序
             self._mark_speed_test(d, now)
-        cache_ttl = float(self.cfg.get("ip_speed_cache_ttl", 300))
+        cache_ttl = float(self.cfg.get("ip_speed_cache_ttl", 60))
         work = cand_list[:8]
         for a in work:
             ip = a["value"]
@@ -1170,7 +1291,7 @@ class Resolver:
                                 self._ip_speed_cache.pop(_k, None)
                 self._probe_pool.submit_drop(
                     self._probe_candidate_ip, ip, query_bytes,
-                    a.get("probe", "udp53"), int(self.cfg.get("speed_timeout_ms", 800)))
+                    a.get("probe", "udp53"), int(self.cfg.get("speed_timeout_ms", 300)))
         # 加权随机选优(不放回抽样): 权重=1/(rtt+10), 快 IP 概率性优先
         out = []
         pool = list(work)
@@ -1350,7 +1471,9 @@ class Resolver:
             ttl = entry.get("ttl", 0)
             if ttl < 5:
                 continue                        # 过短 TTL 不值得预取
-            key = key[1:] if len(key) == 3 else key   # 分区 key 去掉 group 维
+            # 保持完整分区 key (group, domain, qtype): 存入 pending 后由 _scan_prefetch
+            # 按原 key 查缓存(PartitionedCache 据此路由到 domestic/global/default 分区),
+            # 剥离 group 会导致非 default 分区条目查不到、预取调度静默丢失。
             with self._prefetch_lock:
                 if key not in self._prefetch_pending:
                     self._prefetch_pending.add(key)
@@ -1404,11 +1527,15 @@ class Resolver:
             entry = self.cache.get(key, now)
             if entry is None:
                 continue
-            if len(key) == 3:
-                key = key[1:]
-            d, qtype = key
+            # 先按原始(分区)key 从待预取集合移除, 再剥离 group 得到 (d, qtype)。
+            # 原实现先把 key 重绑定为 2 元组再 discard, 而 _prefetch_pending 存的
+            # 是 3 元组 (group, d, qtype), discard(2元组) 永远 miss, 旧 key 残留。
             with self._prefetch_lock:
                 self._prefetch_pending.discard(key)
+            if len(key) == 3:
+                d, qtype = key[1], key[2]
+            else:
+                d, qtype = key[0], key[1]
             self._prefetch_pool.submit_drop(self._do_prefetch, d, qtype)
 
     def _do_prefetch(self, d, qtype):
@@ -1470,6 +1597,30 @@ class Resolver:
         return (g, d, qtype)
 
     # ---------------- 配置热重载 ---------------- #
+    def switch_cache_policy(self, policy):
+        """按目标策略重建缓存容器(保留当前容量)。
+
+        以【实际缓存对象类型】与目标策略比对, 而非 cfg 字符串新旧值——
+        PUT /api/config 可能已先把 cfg.cache_policy 改掉并重绑定 resolver.cfg,
+        此时 reload() 里 old_cfg/new_cfg 的字符串相同会漏检。本方法看
+        self.cache 真实类型(PartitionedCache vs TinyLFUCache), 与目标不一致
+        就重建。幂等: 类型已匹配则 no-op。返回是否发生了切换。"""
+        policy = str(policy or "lru").lower()
+        want_tinylfu = (policy == "tinylfu")
+        is_tinylfu = isinstance(self.cache, TinyLFUCache)
+        if want_tinylfu == is_tinylfu:
+            return False
+        cap = self.cache.capacity
+        # 策略不同步迁移数据(新旧算法频率语义不同), 直接重建容器, 冷启动短暂
+        # 命中率下降是热重载低频操作下的可接受代价
+        if want_tinylfu:
+            self.cache = TinyLFUCache(cap)
+        else:
+            self.cache = PartitionedCache(cap, self.cfg.get("cache_partitions"))
+        log.info("缓存策略切换 %s → %s (容量 %d, 容器已重建)",
+                 "tinylfu" if is_tinylfu else "lru", policy, cap)
+        return True
+
     def reload(self, new_cfg, config_path=None):
         """热重载: 替换运行配置并重建受影响资源, 不重启进程。
 
@@ -1490,18 +1641,14 @@ class Resolver:
                 changed.append("cache_size %d→%d" % (old_cap, new_cap))
         except Exception:
             pass
-        # 缓存策略切换(lru <-> tinylfu): 重建容器(保留容量)
-        old_p = str(old_cfg.get("cache_policy", "lru")).lower()
+        # 缓存策略切换(lru <-> tinylfu): 以实际缓存对象类型与目标策略比对重建,
+        # 不依赖 cfg 新旧字符串(因 PUT 可能已先改 cfg)
         new_p = str(new_cfg.get("cache_policy", "lru")).lower()
-        if old_p != new_p:
-            cap = self.cache.capacity
-            # 策略不同步迁移数据(新旧算法频率语义不同), 直接重建容器, 冷启动短暂
-            # 命中率下降是热重载低频操作下的可接受代价
-            if new_p == "tinylfu":
-                self.cache = TinyLFUCache(cap)
-            else:
-                self.cache = PartitionedCache(cap, new_cfg.get("cache_partitions"))
-            changed.append("cache_policy %s→%s (缓存已重建)" % (old_p, new_p))
+        try:
+            if self.switch_cache_policy(new_p):
+                changed.append("cache_policy → %s (缓存已重建)" % new_p)
+        except Exception as e:
+            log.error("缓存策略切换失败: %r", e)
         # 规则索引(独立文件为准)
         try:
             self.rebuild_rule_index()
@@ -1669,6 +1816,9 @@ class Resolver:
             is_allow = r.get("action") == "allow"
             if m.startswith("re:"):
                 pat = m[3:]
+                if _detect_catastrophic_regex(pat):
+                    logging.warning("正则规则 %r 含嵌套量词(疑似 ReDoS 风险), 已忽略", m)
+                    continue
                 try:
                     c = re.compile(pat)
                 except re.error:
@@ -1837,24 +1987,18 @@ class Resolver:
             group = sw.get(core)
             if group:
                 for c, rule in group:
-                    try:
-                        if c.match(n):
-                            self._cache_rule(n, rule)
-                            return rule
-                    except Exception:
-                        continue
+                    if _regex_match_safe(c, n):
+                        self._cache_rule(n, rule)
+                        return rule
             idx = core.find(".")
             if idx == -1:
                 break
             core = core[idx + 1:]
-        # 正则规则: 编译已缓存, 按配置顺序首个命中生效
+        # 正则规则: 编译已缓存, 按配置顺序首个命中生效(带 ReDoS 超时保护)
         for c, rule in self._rule_regex:
-            try:
-                if c.search(n):
-                    self._cache_rule(n, rule)
-                    return rule
-            except Exception:
-                continue
+            if _regex_search_safe(c, n):
+                self._cache_rule(n, rule)
+                return rule
         self._cache_rule(n, None)
         return None
 

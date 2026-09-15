@@ -90,6 +90,11 @@ class AppContext:
             for u in old_cfg.get("upstreams", []):
                 if u.get("id") not in new_ids:
                     upstream.discard_upstream_conns(u)
+                    try:
+                        from . import quic_upstream
+                        quic_upstream.discard_upstream(u)
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
@@ -163,11 +168,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, OSError):
+            pass  # 客户端已提前断开连接, 静默忽略
 
     MAX_BODY = 64 * 1024 * 1024   # 64MB: 容纳数十万条分流规则的大配置
 
-    def _read_json(self):
+    def _read_json(self, expect_dict=True):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             if n <= 0:
@@ -182,7 +190,12 @@ class _Handler(BaseHTTPRequestHandler):
                         break
                     remaining -= len(chunk)
                 return None
-            return json.loads(self.rfile.read(n).decode("utf-8"))
+            obj = json.loads(self.rfile.read(n).decode("utf-8"))
+            # 防御: 绝大多数端点期望 JSON 对象; 收到数组等非对象时返回 None,
+            # 配合调用方 `or {}` 避免 body.get() 触发 AttributeError。
+            if expect_dict and not isinstance(obj, dict):
+                return None
+            return obj
         except Exception:
             return None
 
@@ -381,6 +394,11 @@ class _Handler(BaseHTTPRequestHandler):
         # 逐条规则独立存储: 前端回传的 rules 从配置主体剥离, 单独写 rules_local.json
         # (config.json 不再保存逐条规则; 避免 deep_merge 把前端 rules 写回 config)
         data_rules = data.pop("rules", None)
+        # 合并前先快照旧上游列表, 用于事后 diff: 被删除/地址变更的上游要回收
+        # DoH/DoT 连接池、QUIC 常驻连接与遥测统计, 否则随控制台"删除+保存"泄漏。
+        old_ups = list(self.app.cfg.get("upstreams", []))
+        old_by_id = {u.get("id"): u for u in old_ups}
+        old_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
         with self.app._lock:
             self.app.cfg = config_mod.deep_merge(self.app.cfg, data)
             # deep_merge 返回新 dict, resolver/DNSServer 持有旧引用。
@@ -389,6 +407,50 @@ class _Handler(BaseHTTPRequestHandler):
             self.app.resolver.cfg = self.app.cfg
             # 同步缓存容量
             self.app.resolver.cache.capacity = int(self.app.cfg.get("cache_size", 1024))
+            # 缓存策略变更立即重建容器(保存即生效, 不必等 /api/reload)。
+            # switch_cache_policy 按实际对象类型判定, 幂等。
+            new_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
+            if new_policy != old_policy:
+                try:
+                    self.app.resolver.switch_cache_policy(new_policy)
+                except Exception:
+                    pass
+            # 上游 diff: 删除的回收连接/统计; 保留但 proto/addr/port/url 变更的
+            # 旧连接池 key 已失效, 一并回收(与 AppContext.reload 路径行为一致)
+            new_ups = self.app.cfg.get("upstreams", [])
+            new_ids = {u.get("id") for u in new_ups}
+            for o in old_ups:
+                uid = o.get("id")
+                if uid not in new_ids:
+                    # 整条删除
+                    try:
+                        self.app.telemetry.per_upstream.pop(uid, None)
+                    except Exception:
+                        pass
+                    try:
+                        upstream.discard_upstream_conns(o)
+                    except Exception:
+                        pass
+                    try:
+                        quic_upstream.discard_upstream(o)
+                    except Exception:
+                        pass
+                    continue
+                nu = next((x for x in new_ups if x.get("id") == uid), None)
+                if nu is None:
+                    continue
+                if (str(o.get("proto", "")).lower() != str(nu.get("proto", "")).lower()
+                        or o.get("addr") != nu.get("addr")
+                        or o.get("port") != nu.get("port")
+                        or (o.get("url") or "") != (nu.get("url") or "")):
+                    try:
+                        upstream.discard_upstream_conns(o)
+                    except Exception:
+                        pass
+                    try:
+                        quic_upstream.discard_upstream(o)
+                    except Exception:
+                        pass
             # 规则可能整体替换 → 重建索引
             try:
                 self.app.resolver.rebuild_rule_index()
@@ -509,12 +571,13 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self._send(200, {"ok": True, "upstream": u, "auto_parsed": True})
+        proto = str(body.get("proto") or "udp").lower()
+        _default_port = {"udp": 53, "tcp": 53, "doh": 443, "dot": 853, "doq": 853, "doh3": 443}
         try:
-            port = int(body.get("port") or 53)
+            port = int(body.get("port") or _default_port.get(proto, 53))
             int(body.get("latency") or 20)  # 仅校验合法性; 新上游延迟统一 0=待后台实测写回
         except (TypeError, ValueError):
             return self._send(400, {"error": "port/latency 必须是整数"})
-        proto = str(body.get("proto") or "udp").lower()
         if proto in ("doh", "doh3", "doq"):
             url = body.get("url") or "/dns-query"
         else:

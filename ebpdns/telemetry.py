@@ -119,6 +119,26 @@ class Telemetry:
             st = self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
             st["fail"] += 1
 
+    def upstream_ok_conn_ok(self, up_id, conn_key, lat_ms):
+        """合并 upstream_ok + conn_ok: 一次加锁更新两个统计, 减少 _classify_one 热路径锁竞争。"""
+        with self._lock:
+            st = self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
+            st["ok"] += 1
+            st["lat_sum"] += lat_ms
+            st["last"] = lat_ms
+            cst = self.conn_stats.setdefault(conn_key, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
+            cst["ok"] += 1
+            cst["lat_sum"] += lat_ms
+            cst["last"] = lat_ms
+
+    def upstream_fail_conn_fail(self, up_id, conn_key):
+        """合并 upstream_fail + conn_fail: 一次加锁更新两个统计。"""
+        with self._lock:
+            st = self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
+            st["fail"] += 1
+            cst = self.conn_stats.setdefault(conn_key, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
+            cst["fail"] += 1
+
     # ---- 连接维度健康度细化 (proto|addr|port|url) ----
     # 多 IP 上游/多协议同上游场景下, 按 ID 聚合会掩盖单连接劣化(如某 IP 故障
     # 拖低整上游均值)。按连接独立统计, 测速/健康判断可精确到具体端点。
@@ -161,6 +181,35 @@ class Telemetry:
             self.counters["bytes_in"] += raw_len
             self.counters["bytes_out"] += resp_len
             self.qtype_dist[self.qtype_cat(qtype)] += 1
+        self.qps_window.append(time.time())
+        self.latency_window.append(lat_ms)
+
+    def fast_hit_logged(self, qtype, raw_len, resp_len, lat_ms, domain, msg,
+                        upstream, answer, kernel_direct=False, level="hit"):
+        """合并 fast_hit + log: 一次加锁完成计数器更新与事件记录。
+        原 fast_hit + log 各获取一次锁, 热路径(每 QPS 两次锁竞争)减半。"""
+        with self._lock:
+            self.counters["total"] += 1
+            self.counters["hit"] += 1
+            if kernel_direct:
+                self.counters["kernel_direct"] += 1
+            self.counters["bytes_in"] += raw_len
+            self.counters["bytes_out"] += resp_len
+            self.qtype_dist[self.qtype_cat(qtype)] += 1
+            self._ev_seq += 1
+            self.events.append({
+                "seq": self._ev_seq,
+                "ts": _now_ts(),
+                "domain": domain,
+                "qtype": qtype,
+                "level": level,
+                "msg": msg,
+                "lat": lat_ms,
+                "client_ip": None,
+                "upstream": upstream,
+                "answer": answer,
+                "rule": None,
+            })
         self.qps_window.append(time.time())
         self.latency_window.append(lat_ms)
 

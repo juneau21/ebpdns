@@ -164,8 +164,9 @@ UP_PORT_DEFAULT = {"udp": 53, "tcp": 53, "doh": 443, "dot": 853, "doq": 853, "do
 def parse_upstream_addr(raw, proto_sel=None):
     """从完整地址自动识别上游协议/地址/端口/路径（与前端规则一致）。
 
-    支持: https://host/path  http://host/path  quic://host  tls://host
+    支持: https://host/path  http://host/path  quic://host  doq://host  tls://host
           dot://host  udp://host  tcp://host  doh://host  doh3://host
+          http3://host/path  h3://host/path (DoH3/HTTP3 别名)
           host:port  host  ip  ip:port
     proto_sel 非空且非 'auto' 时强制指定协议(无 scheme 前缀时生效)。
     返回 dict{proto,addr,port,url}; 无法识别返回 None。
@@ -190,6 +191,8 @@ def parse_upstream_addr(raw, proto_sel=None):
             proto, url = "doh", "/dns-query"
         elif scheme == "quic":
             proto, url = "doq", "/dns-query"
+        elif scheme == "doq":
+            proto, url = "doq", "/dns-query"
         elif scheme in ("tls", "dot"):
             proto, url = "dot", ""
         elif scheme == "udp":
@@ -199,6 +202,8 @@ def parse_upstream_addr(raw, proto_sel=None):
         elif scheme == "doh":
             proto, url = "doh", "/dns-query"
         elif scheme == "doh3":
+            proto, url = "doh3", "/dns-query"
+        elif scheme in ("http3", "h3"):
             proto, url = "doh3", "/dns-query"
         else:
             return None

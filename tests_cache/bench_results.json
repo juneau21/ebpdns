@@ -1,0 +1,56 @@
+[
+  {
+    "policy": "lru",
+    "cap": 1024,
+    "hit_rate": 60.14,
+    "p50_us": 0.53,
+    "p99_us": 0.9,
+    "entries": 1024,
+    "serialized_bytes": 64585
+  },
+  {
+    "policy": "partitioned",
+    "cap": 1024,
+    "hit_rate": 53.99,
+    "p50_us": 0.71,
+    "p99_us": 1.15,
+    "entries": 608,
+    "serialized_bytes": 39599
+  },
+  {
+    "policy": "tinylfu",
+    "cap": 1024,
+    "hit_rate": 64.77,
+    "p50_us": 1.49,
+    "p99_us": 2.48,
+    "entries": 1024,
+    "serialized_bytes": 64585
+  },
+  {
+    "policy": "lru",
+    "cap": 4096,
+    "hit_rate": 77.51,
+    "p50_us": 0.54,
+    "p99_us": 1.0,
+    "entries": 4096,
+    "serialized_bytes": 258154
+  },
+  {
+    "policy": "partitioned",
+    "cap": 4096,
+    "hit_rate": 70.95,
+    "p50_us": 0.72,
+    "p99_us": 1.1,
+    "entries": 2456,
+    "serialized_bytes": 159741
+  },
+  {
+    "policy": "tinylfu",
+    "cap": 4096,
+    "hit_rate": 79.07,
+    "p50_us": 1.57,
+    "p99_us": 2.94,
+    "entries": 4096,
+    "serialized_bytes": 258154
+  }
+]
