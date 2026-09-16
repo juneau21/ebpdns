@@ -193,12 +193,10 @@ class Resolver:
         self._stale_refreshing = set()      # serve-stale 后台刷新去重
         # 分流规则索引: 10 万条规则线性扫描每查询 20ms+ 严重拖慢 miss 吞吐。
         # 精确规则按域名哈希, 通配规则按 core 后缀哈希; 规则变更时 rebuild。
-        self._rule_exact = {}               # lower_domain -> rule
-        self._rule_wild = {}                # core -> rule  (匹配 core 及其全部子域)
-        self._rule_suffix_wild = {}         # 中缀通配(*x*.com): 固定后缀 -> [(compiled, rule)]
-        self._rule_regex = []               # [(compiled, rule)]  re: 前缀(按序首个命中)
-        self._rule_allow_exact = {}         # 白名单精确匹配(优先于 block)
-        self._rule_allow_wild = {}          # 白名单通配匹配(优先于 block)
+        # H-4: 六个索引引用打包为单个元组, 重建时单次原子赋值。match_rule 一次
+        # 解包得到一致快照, 绝不会读到"旧 exact + 新 wild"的混合状态。
+        # 元组布局: (exact, wild, allow_exact, allow_wild, suffix_wild, regex)
+        self._rule_index = ({}, {}, {}, {}, {}, [])
         self._rule_match_cache = {}         # domain -> rule/None(哨兵), 规则重建时清空
         self._rule_cache_max = 8192
         self._has_group_rules = False       # 有无 group 分流规则: 无则 _ckey 跳过 match_rule
@@ -336,17 +334,16 @@ class Resolver:
             # 规则复查: 屏蔽规则优先级高于缓存(含内核直答/负缓存/过期兜底), 防止规则添加前已缓存的答案绕过屏蔽
             _rule = self.match_rule(d)
             if _rule and _rule.get("action") == "block":
-                tel.inc("errors")
                 tel.inc_rule("block")
                 lat = (time.monotonic() - t0) * 1000
-                trace.append({"tag": "rule", "text": "分流规则 [%s] 命中(缓存命中复查): 屏蔽该域名 → SERVFAIL" % _rule.get("match")})
+                trace.append({"tag": "rule", "text": "分流规则 [%s] 命中(缓存命中复查): 屏蔽该域名 → NXDOMAIN" % _rule.get("match")})
                 if not silent:
-                    tel.log(d, qtype, "rule", "规则屏蔽(缓存命中复查) → SERVFAIL", lat,
+                    tel.log(d, qtype, "rule", "规则屏蔽(缓存命中复查) → NXDOMAIN", lat,
                             client_ip=client_ip, upstream="规则屏蔽", answer="", rule=self._rule_label(_rule))
-                self._err_report(key, d, qtype, "SERVFAIL (规则屏蔽 %s)" % _rule.get("match"), lat,
+                self._err_report(key, d, qtype, "NXDOMAIN (规则屏蔽 %s)" % _rule.get("match"), lat,
                                  client_ip=client_ip, upstream="规则屏蔽", answer="")
-                return self._result(d, qtype, [], None, False, True, "blocked",
-                                    latency=lat, trace=trace, ttl_left=0, rcode=2)
+                return self._result(d, qtype, [], None, False, False, "blocked",
+                                    latency=lat, trace=trace, ttl_left=0, rcode=3)
             lat = (time.monotonic() - t0) * 1000
             if counted:
                 tel.inc("hit")
@@ -389,17 +386,16 @@ class Resolver:
         if stale_entry is not None:
             _rule = self.match_rule(d)
             if _rule and _rule.get("action") == "block":
-                tel.inc("errors")
                 tel.inc_rule("block")
                 lat = (time.monotonic() - t0) * 1000
-                trace.append({"tag": "rule", "text": "分流规则 [%s] 命中(过期缓存复查): 屏蔽该域名 → SERVFAIL" % _rule.get("match")})
+                trace.append({"tag": "rule", "text": "分流规则 [%s] 命中(过期缓存复查): 屏蔽该域名 → NXDOMAIN" % _rule.get("match")})
                 if not silent:
-                    tel.log(d, qtype, "rule", "规则屏蔽(过期缓存复查) → SERVFAIL", lat,
+                    tel.log(d, qtype, "rule", "规则屏蔽(过期缓存复查) → NXDOMAIN", lat,
                             client_ip=client_ip, upstream="规则屏蔽", answer="", rule=self._rule_label(_rule))
-                self._err_report(key, d, qtype, "SERVFAIL (规则屏蔽 %s)" % _rule.get("match"), lat,
+                self._err_report(key, d, qtype, "NXDOMAIN (规则屏蔽 %s)" % _rule.get("match"), lat,
                                  client_ip=client_ip, upstream="规则屏蔽", answer="")
-                return self._result(d, qtype, [], None, False, True, "blocked",
-                                    latency=lat, trace=trace, ttl_left=0, rcode=2)
+                return self._result(d, qtype, [], None, False, False, "blocked",
+                                    latency=lat, trace=trace, ttl_left=0, rcode=3)
             lat = (time.monotonic() - t0) * 1000
             if counted:
                 tel.inc("hit")
@@ -448,17 +444,16 @@ class Resolver:
                         client_ip=client_ip, upstream="白名单", answer="", rule=self._rule_label(rule))
             rule = None  # 置空, 后续 block/group/forceIp 分支均不触发
         if rule and rule.get("action") == "block":
-            tel.inc("errors")
             tel.inc_rule("block")
             lat = (time.monotonic() - t0) * 1000
-            trace.append({"tag": "rule", "text": "分流规则 [%s] 命中: 屏蔽该域名 → 返回 SERVFAIL" % rule.get("match")})
+            trace.append({"tag": "rule", "text": "分流规则 [%s] 命中: 屏蔽该域名 → 返回 NXDOMAIN" % rule.get("match")})
             if not silent:
-                tel.log(d, qtype, "rule", "规则屏蔽 → SERVFAIL", lat,
+                tel.log(d, qtype, "rule", "规则屏蔽 → NXDOMAIN", lat,
                         client_ip=client_ip, upstream="规则屏蔽", answer="", rule=self._rule_label(rule))
-            self._err_report(key, d, qtype, "SERVFAIL (规则屏蔽 %s)" % rule.get("match"), lat,
+            self._err_report(key, d, qtype, "NXDOMAIN (规则屏蔽 %s)" % rule.get("match"), lat,
                              client_ip=client_ip, upstream="规则屏蔽", answer="")
-            return self._result(d, qtype, [], None, False, True, "blocked",
-                                latency=lat, trace=trace, ttl_left=0, rcode=2)
+            return self._result(d, qtype, [], None, False, False, "blocked",
+                                latency=lat, trace=trace, ttl_left=0, rcode=3)
         ups = [u for u in cfg.get("upstreams", []) if u.get("enabled", True)]
         if rule and rule.get("action") == "group":
             g = rule.get("group")
@@ -481,11 +476,20 @@ class Resolver:
             qtype_code = dnsmsg.type_code(qtype) or dnsmsg.TYPE_A
             if rtype != qtype_code:
                 trace.append({"tag": "rule", "text": "分流规则 [%s] 强制 IP %s 与查询类型 %s 不匹配 → NODATA" % (rule.get("match"), ip, qtype)})
+                # M2: 写空 answers 负缓存(与 NODATA 负缓存格式一致), 避免每次同类型
+                # 不匹配查询都走完整 miss 路径。
+                neg_ttl = max(1, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
+                now_neg = time.time()
+                self.cache.put(key, {
+                    "domain": d, "qtype": qtype, "answers": [], "chosen": "",
+                    "ttl": neg_ttl, "rcode": 0,
+                    "expires_at": now_neg + neg_ttl, "access_at": now_neg,
+                })
                 if not silent:
                     tel.log(d, qtype, "rule", "forceIp 类型不匹配 → NODATA", lat,
                             client_ip=client_ip, upstream="分流规则", answer="", rule=self._rule_label(rule))
                 return self._result(d, qtype, [], None, False, False, None,
-                                    latency=lat, trace=trace, ttl_left=0, empty=True, rcode=0)
+                                    latency=lat, trace=trace, ttl_left=neg_ttl, empty=True, rcode=0)
             rttl = self._clamp_ttl(cfg.get("ttl", 300), rule)   # 规则级 TTL 覆盖
             ans = [{"value": ip, "from": "分流规则", "ttl": rttl, "type": rtype}]
             self._fill_cache(key, d, qtype, ans, rule=rule)
@@ -558,7 +562,7 @@ class Resolver:
                 # 负缓存 TTL: 默认 [10,60] 秒, 再经 _clamp_ttl 统一受 ttl_min/ttl_max 管控。
                 # 修复: 旧逻辑 max(neg_ttl, min(mn,60)) 在 ttl_max 生效时会"抬高"而非钳制,
                 # 导致负缓存 TTL 不服从 TTL 管控(如 ttl_max=30 时负缓存仍 45s)。
-                neg_ttl = max(10, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
+                neg_ttl = max(1, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
                 now_neg = time.time()
                 self.cache.put(key, {
                     "domain": d, "qtype": qtype, "answers": [], "chosen": "",
@@ -619,7 +623,7 @@ class Resolver:
                                             latency=lat, trace=trace, ttl_left=cfg.get("ttl", 300), rcode=0)
                 lat = (time.monotonic() - t0) * 1000
                 # NODATA 负缓存: 与 NXDOMAIN 一致, 默认 [10,60] 秒, 受 ttl_min/ttl_max 管控
-                neg_ttl = max(10, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
+                neg_ttl = max(1, self._clamp_ttl(min(int(cfg.get("ttl", 300)), 60), rule))
                 now_neg = time.time()
                 self.cache.put(key, {
                     "domain": d, "qtype": qtype, "answers": [], "chosen": "",
@@ -767,6 +771,12 @@ class Resolver:
             stale = True
         if c is None:
             return None
+        # H1: 快路径缓存命中后复查 block 规则——管理员新增 block 规则后, 已缓存的
+        # 被屏蔽域名不能仍由快路径直接返回答案。命中 block 则 fallthrough 到完整路径
+        # 走 block 分支(match_rule 有结果缓存, O(1) 热路径开销可接受)。
+        _rule = self.match_rule(domain)
+        if _rule and _rule.get("action") == "block":
+            return None
         tel = self.tel
         rcode = c.get("rcode", 0)
         if stale:
@@ -828,7 +838,8 @@ class Resolver:
             try:
                 msg = dnsmsg.parse_message(raw_query)
             except Exception:
-                return dnsmsg.build_error_response(raw_query, 2)
+                # L5: 报文解析失败按 RFC 应返回 FORMERR(1), 而非 SERVFAIL(2)
+                return dnsmsg.build_error_response(raw_query, 1)
         else:
             msg = parsed
         if not msg["questions"]:
@@ -1423,7 +1434,12 @@ class Resolver:
                 return
             self._stale_refreshing.add(key)
         try:
-            self._prefetch_pool.submit_drop(self._do_stale_refresh, key, d, qtype)
+            fut = self._prefetch_pool.submit_drop(self._do_stale_refresh, key, d, qtype)
+            # H2: submit_drop 在信号量满时返回 None(不是异常), except 分支不执行,
+            # 必须显式回滚 _stale_refreshing 标记, 否则该 key 永远无法再次触发刷新。
+            if fut is None:
+                with self._prefetch_lock:
+                    self._stale_refreshing.discard(key)
         except Exception as e:
             log.warning("提交 stale 刷新异常 %s %s: %r", d, qtype, e)
             with self._prefetch_lock:
@@ -1502,6 +1518,11 @@ class Resolver:
         due = []
         with self._prefetch_lock:
             pending = list(self._prefetch_pending)
+            # 快照正在被 serve-stale 后台刷新的 key: 这些 key 虽仍在 pending 中
+            # (_do_stale_refresh 完成后才会从 pending 移除), 若本扫描也选中并
+            # 提交 _do_prefetch, 会与正在跑的 force_refresh 并发打重复上游请求。
+            # 跳过它们并保留在 pending 中, 等刷新完成后由下一轮扫描自然处理。
+            stale_refreshing = set(self._stale_refreshing)
         # 分批轮转扫描: 大容量缓存(持久化恢复可能上万条)时避免每 tick 全量遍历
         if len(pending) > self._prefetch_batch:
             n = len(pending)
@@ -1511,6 +1532,8 @@ class Resolver:
         else:
             window = pending
         for key in window:
+            if key in stale_refreshing:
+                continue
             entry = self.cache.get(key, now)
             if entry is None:
                 with self._prefetch_lock:
@@ -1716,13 +1739,9 @@ class Resolver:
                 log.debug("健康检查异常 %s: %r", u.get("name"), e)
 
     def _fetch_sub_text(self, url, timeout=20):
-        """拉取订阅文本(与 api 实现一致, resolver 后台更新独立使用)。"""
-        from .api import _sub_url_blocked
-        if _sub_url_blocked(url):
-            raise ValueError("subscription URL blocked (private/loopback address): %s" % url)
-        req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace")
+        """拉取订阅文本(共享实现): SSRF 初始+每跳重定向校验, 16MB 流式上限。"""
+        from .api import fetch_subscription_text
+        return fetch_subscription_text(url, timeout=timeout)
 
     def _update_rule_subs_once(self):
         """规则订阅自动更新: 对 config 元信息中的订阅链接重新拉取并覆盖
@@ -1810,6 +1829,7 @@ class Resolver:
         suffix_wild = {}   # 中缀/前缀通配(*ac*.com / *foo.net): 按固定后缀分组索引
         rules = self._load_local_rules() + self._load_sub_rules()
         for r in rules:
+            self._normalize_rule(r)   # P0-1: 兼容配置文件 pattern/value 旧字段名
             m = (r.get("match") or "").strip().lower()
             if not m:
                 continue
@@ -1855,17 +1875,37 @@ class Resolver:
                     allow_exact[m] = r
                 else:
                     exact[m] = r
-        self._rule_exact = exact
-        self._rule_wild = wild
-        self._rule_allow_exact = allow_exact
-        self._rule_allow_wild = allow_wild
-        self._rule_suffix_wild = suffix_wild
-        self._rule_regex = regex
+        # H-4: 六个索引引用打包成元组, 单次赋值原子发布。Python 元组赋值是
+        # 原子的, match_rule 读取时要么看到旧快照要么看到新快照, 无混合状态。
+        self._rule_index = (exact, wild, allow_exact, allow_wild, suffix_wild, regex)
         self._rule_match_cache = {}   # 规则集变更, 全部缓存结论失效
         # 检测是否有 group 分流规则: 无则 _ckey 直接用 default 分区, 跳过 match_rule
         self._has_group_rules = any(
             (r.get("action") == "group") for r in rules
         )
+
+    @staticmethod
+    def _normalize_rule(r):
+        """P0-1: 兼容配置文件旧字段名。历史配置/迁移文件用 pattern/value, 新代码与
+        前端用 match/ip/group。在规则入库前原地归一化:
+          pattern -> match   (域名匹配表达式)
+          value   -> 按 action 落到对应参数字段:
+                     forceIp -> ip (目标 IP)
+                     group   -> group (上游组名)
+                     其它     -> ip (block/allow 无此参数, 映射无害)
+        已有 match/ip 的规则保持不变, 两种写法都可用。"""
+        if not isinstance(r, dict):
+            return
+        if not r.get("match") and r.get("pattern"):
+            r["match"] = r.pop("pattern")
+        if "value" in r:
+            act = r.get("action")
+            if act == "group":
+                if not r.get("group"):
+                    r["group"] = r.pop("value")
+            else:
+                if not r.get("ip"):
+                    r["ip"] = r.pop("value")
 
     def _load_local_rules(self):
         """从逐条规则独立文件(rules_local.json)加载规则明细(不写入 config.json)。
@@ -1943,19 +1983,22 @@ class Resolver:
         性能: 结果按域名缓存(规则不变时结论不变), 重建规则时清空;
         热路径(缓存命中复查 + miss 分流)避免重复遍历正则。"""
         n = domain.lower()
+        # H-4: 单次解包原子快照——整次匹配看到的是同一份规则索引, 重建期间
+        # 不会读到混合状态。解包开销为 O(1)(六个引用), 远小于字典查找本身。
+        exact, wild, allow_exact, allow_wild, suffix_wild, regex = self._rule_index
         # 规则缓存优先: allow 检查结果也在缓存中, 避免 hot path 每次遍历
         cache = self._rule_match_cache
         hit = cache.get(n, _MISS)
         if hit is not _MISS:
             return hit if hit is not None else None
         # ---- 白名单(allow)优先: 仅缓存未命中时检查 ----
-        r = self._rule_allow_exact.get(n)
+        r = allow_exact.get(n)
         if r is not None:
             self._cache_rule(n, r)
             return r
         core = n
         while core:
-            r = self._rule_allow_wild.get(core)
+            r = allow_wild.get(core)
             if r is not None:
                 self._cache_rule(n, r)
                 return r
@@ -1963,13 +2006,12 @@ class Resolver:
             if idx == -1:
                 break
             core = core[idx + 1:]
-        r = self._rule_exact.get(n)
+        r = exact.get(n)
         if r is not None:
             self._cache_rule(n, r)
             return r
         # 通配: *.core 匹配 core 及其全部子域。从完整域名自身开始逐级剥离
         # (最长匹配优先): a.b.deep.sub.com -> deep.sub.com -> sub.com -> com
-        wild = self._rule_wild
         core = n
         while core:
             r = wild.get(core)
@@ -1981,10 +2023,9 @@ class Resolver:
                 break
             core = core[idx + 1:]
         # 中缀/前缀通配(*ac*.com 等): 同一剥离路径按固定后缀定位小组后逐条正则
-        sw = self._rule_suffix_wild
         core = n
         while core:
-            group = sw.get(core)
+            group = suffix_wild.get(core)
             if group:
                 for c, rule in group:
                     if _regex_match_safe(c, n):
@@ -1995,7 +2036,7 @@ class Resolver:
                 break
             core = core[idx + 1:]
         # 正则规则: 编译已缓存, 按配置顺序首个命中生效(带 ReDoS 超时保护)
-        for c, rule in self._rule_regex:
+        for c, rule in regex:
             if _regex_search_safe(c, n):
                 self._cache_rule(n, rule)
                 return rule

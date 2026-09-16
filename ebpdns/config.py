@@ -16,7 +16,7 @@ DEFAULTS = {
         "tcp6": "[::]:53",   # IPv6 TCP 监听(可选)
     },
     "api": {
-        "host": "127.0.0.1",
+        "host": "127.0.0.1",   # API 监听地址, 默认仅本机回环(天然安全, 无需 token)
         "port": 8080,
     },
     "cache_size": 131072,
@@ -258,6 +258,76 @@ def default_paths():
     return cands
 
 
+# ---- 加载期字段类型/范围校验(防坏配置把服务静默改坏) ----
+# 数值字段: (下限, 上限); None 表示该方向不限
+_NUM_RANGES = {
+    "cache_size": (1, 10_000_000),
+    "ttl": (0, None),
+    "ttl_min": (0, None),
+    "ttl_max": (0, None),
+    "timeout_ms": (1, 60000),
+    "port": (1, 65535),
+    "health_check_interval": (0, None),
+    "max_parallel_upstreams": (1, 16),
+    "stale_ttl": (0, None),
+    "persist_ttl": (0, None),
+    "speed_interval_ms": (0, None),
+    "speed_timeout_ms": (1, 60000),
+}
+# 枚举字段: 合法取值集合
+_ENUM_VALUES = {
+    "log_level": {"debug", "info", "warning", "error"},
+    "log_format": {"text", "json"},
+    "cache_policy": {"lru", "partitioned", "tinylfu"},
+    # ip_speed_probe 是字符串枚举(udp53/tcp443/both), 不是布尔; 误放入
+    # _BOOL_KEYS 会导致每次启动把用户值回退为默认 "both" 并刷一条告警。
+    "ip_speed_probe": {"udp53", "tcp443", "both"},
+}
+# 布尔字段
+_BOOL_KEYS = {
+    "prefetch", "serve_stale", "kernel_direct", "speed_test", "fallback",
+    "ipv4_first", "ipv6", "edns", "padding", "rebind_protection",
+    "ip_speed_check", "dnssec_0x20",
+}
+
+
+def _fallback(cfg, key):
+    """把 key 还原为 DEFAULTS 默认值并告警。"""
+    cfg[key] = copy.deepcopy(DEFAULTS.get(key))
+    logging.warning("配置字段 %s 非法, 已回退默认值 %r", key, cfg[key])
+
+
+def _validate_cfg(cfg):
+    """加载后对顶层标量字段做类型/范围校验; 非法值回退默认并告警,
+    不抛异常中断启动。"""
+    for key, (lo, hi) in _NUM_RANGES.items():
+        if key not in cfg:
+            continue   # 顶层无此键(如 port 仅嵌套在上游/api 内), 不注入
+        v = cfg.get(key)
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            _fallback(cfg, key)
+            continue
+        if (lo is not None and iv < lo) or (hi is not None and iv > hi):
+            _fallback(cfg, key)
+            continue
+        cfg[key] = iv
+    for key, allowed in _ENUM_VALUES.items():
+        if key not in cfg:
+            continue
+        v = cfg.get(key)
+        if not isinstance(v, str) or v.lower() not in allowed:
+            _fallback(cfg, key)
+        else:
+            cfg[key] = v.lower()
+    for key in _BOOL_KEYS:
+        if key not in cfg:
+            continue
+        if not isinstance(cfg.get(key), bool):
+            _fallback(cfg, key)
+
+
 def load_config(path=None):
     cfg = default_config()
     chosen = path
@@ -273,6 +343,12 @@ def load_config(path=None):
             cfg = deep_merge(cfg, data)
         except Exception as e:
             sys.stderr.write("warning: 读取配置失败 %s: %s\n" % (chosen, e))
+    # 加载后校验数值/枚举/布尔字段类型与范围, 非法值回退默认并告警
+    _validate_cfg(cfg)
+    # v1.9.59 起移除 API token 认证(默认仅监听 127.0.0.1)。旧配置里残留的
+    # api.token 键已无任何代码读取, 这里顺手 pop 掉, 避免死字段随 save_config 写回。
+    if isinstance(cfg.get("api"), dict):
+        cfg["api"].pop("token", None)
     if cfg.get("web_root") is None:
         cfg["web_root"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
     return cfg

@@ -88,6 +88,7 @@ def decode_name(data, offset):
     pos = offset
     jumps = 0
     dlen = len(data)  # 缓存长度避免每次循环调用 len()
+    name_len = 0      # 解码出的域名总长度(标签字节 + 分隔点), 上限 255
     while True:
         if pos >= dlen:
             raise DNSError("truncated name")
@@ -118,6 +119,10 @@ def decode_name(data, offset):
             labels.append(data[pos:pos + length].decode("ascii"))
         except UnicodeDecodeError:
             labels.append(data[pos:pos + length].decode("ascii", errors="replace"))
+        # 累计 presentation 长度: 标签字节 + 其后分隔点(首个标签前无点)
+        name_len += length + (1 if name_len else 0)
+        if name_len > 255:
+            raise DNSError("name too long")
         pos += length
     return ".".join(labels), end
 

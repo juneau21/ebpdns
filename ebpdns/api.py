@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ import logging
 from .probe import probe_upstream_latencies
 
 log = logging.getLogger("ebpdns.api")
-from . import upstream, quic_upstream
+from . import upstream, quic_upstream, dnsmsg
 
 
 def _sub_url_blocked(url):
@@ -53,6 +54,57 @@ def _sub_url_blocked(url):
             return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)"
     return None
 
+
+class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """每跳重定向都重新过 SSRF 检查: 初始 URL 在外网但 302 跳到内网
+    (http://169.254.169.254/ 云元数据等) 时, 必须在 redirect_request 拦截。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        blocked = _sub_url_blocked(newurl)
+        if blocked:
+            raise urllib.error.HTTPError(
+                req.full_url, code, "redirect blocked: %s" % blocked, headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# 模块级复用: 带 SSRF 重定向校验的 opener(替代默认 urlopen)
+_SSRF_OPENER = urllib.request.build_opener(_SSRFRedirectHandler)
+
+# 订阅响应大小上限: 16MB, 防止恶意/损坏订阅把整份内容读入内存(OOM)
+SUB_TEXT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def fetch_subscription_text(url, timeout=20):
+    """拉取订阅文本(共享实现, 三处共用):
+    1. 初始 URL 过 SSRF 检查(拒绝内网/环回/链路本地);
+    2. 用带每跳重定向复检的 opener 打开, 防止 302 跳到内网绕过 SSRF;
+    3. 流式 read(65536) 累积, 超过 SUB_TEXT_MAX_BYTES(16MB) 立即中止。
+    返回解码后的 str; 被阻止或超限时抛 ValueError。"""
+    blocked = _sub_url_blocked(url)
+    if blocked:
+        raise ValueError(blocked)
+    req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
+    with _SSRF_OPENER.open(req, timeout=timeout) as r:
+        chunks = []
+        total = 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > SUB_TEXT_MAX_BYTES:
+                raise ValueError("订阅响应超过 16MB 上限, 已中止")
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+
+# PUT /api/config 允许写入的顶层配置键白名单: 从 DEFAULTS 提取, 排除
+# listen(监听地址)/api(API 绑定)/web_root(静态根) 这些需重启才能生效的字段。
+# 防止前端 JSON 回传时注入任意键(如覆盖 listen 指向别的地址)。
+_CFG_WRITABLE_KEYS = (
+    set(config_mod.DEFAULTS.keys()) - {"listen", "api", "web_root"}
+)
+
+
 class AppContext:
     """应用上下文：解析引擎 / 遥测 / 缓存 / 配置 / DNS 服务器引用。"""
 
@@ -66,6 +118,14 @@ class AppContext:
         self._lock = threading.Lock()
 
     def reload(self):
+        """热重载入口(H-2): 全程持 self._lock, 与 _api_update_config 串行化,
+        避免 reload 与写配置竞争——原 reload 不持锁, 可在 HTTP 线程读 old_cfg
+        与进锁之间替换 self.cfg, 导致 deep_merge 基于陈旧 base 而丢配置变更。
+        SIGHUP 经此入口调用时会短暂阻塞等待持锁方, 读文件+换引用耗时可忽略。"""
+        with self._lock:
+            return self._reload_body()
+
+    def _reload_body(self):
         """热重载: 重新读取 config.json 并增量应用(无需重启进程)。
 
         1) 重新 load_config(保留运行时注入键 cache_file/rule_sub_file/rule_local_file)
@@ -199,6 +259,38 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _csrf_ok(self):
+        """CSRF 防护: 对非 GET 写操作校验 Origin/Referer。
+        - 有 Origin: 其 host 必须等于浏览器实际访问的 Host(任意绑定地址/IP 访问都通过),
+          或等于配置的 api host:port
+        - 无 Origin 但有 Referer: 其 host 必须与 Host 头一致, 或以配置的 api host:port/ 开头
+        - 两者都没有(curl/脚本直连): 放行, 兼容命令行工具。"""
+        api_cfg = self.app.cfg.get("api", {}) or {}
+        configured = "http://%s:%s" % (api_cfg.get("host", "127.0.0.1"),
+                                       api_cfg.get("port", 8080))
+        expected_host = self.headers.get("Host", "") or ""
+
+        def _netloc(url):
+            try:
+                return urllib.parse.urlparse(url).netloc
+            except Exception:
+                return ""
+
+        origin = self.headers.get("Origin")
+        if origin:
+            onetloc = _netloc(origin)
+            # 浏览器同源请求: Origin 的 host 必然等于请求 Host(含反向代理/局域网 IP 访问)
+            if onetloc and expected_host and onetloc == expected_host:
+                return True
+            return origin.rstrip("/") == configured.rstrip("/")
+        referer = self.headers.get("Referer")
+        if referer:
+            rnetloc = _netloc(referer)
+            if rnetloc and expected_host and rnetloc == expected_host:
+                return True
+            return referer.startswith(configured.rstrip("/") + "/")
+        return True
+
     def _route(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -214,6 +306,26 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_static(path[len("/static/"):])
 
         # ---------- API ----------
+        if path == "/api/health":
+            tel = self.app.telemetry
+            return self._send(200, {
+                "status": "ok",
+                "running": True,
+                "version": __version__,
+                "uptime_s": int(time.time() - tel.boot_time),
+            })
+        if path == "/api/cache/stats":
+            # 缓存统计独立端点(功能测试要求): 透传 cache.summary() + 补充大小
+            cache = self.app.resolver.cache
+            try:
+                summ = cache.summary()
+            except Exception as e:
+                return self._send(500, {"error": "cache stats failed: %s" % e})
+            try:
+                summ["size"] = cache.size()
+            except Exception:
+                pass
+            return self._send(200, summ)
         if path == "/api/status":
             return self._send(200, self._status())
         if path == "/api/snapshot":
@@ -287,10 +399,12 @@ class _Handler(BaseHTTPRequestHandler):
             "health_check_interval": int(self.app.cfg.get("health_check_interval", 30) or 0),
             "rule_sub_interval": int(self.app.cfg.get("rule_sub_interval", 3600) or 0),
             "cache_file": (app.cfg.get("cache_file") or ""),
-            "top_domains": tel.top_domains.most_common(10),
-            "top_clients": tel.top_clients.most_common(10),
+            # H-3: 共享容器迭代必须走加锁快照, 否则并发 count_top/upstream_ok
+            # 触发 RuntimeError: dictionary changed size during iteration
+            "top_domains": tel.top_domains_snapshot(10),
+            "top_clients": tel.top_clients_snapshot(10),
             "top_upstreams": sorted(
-                ((u, st.get("ok", 0) + st.get("fail", 0)) for u, st in tel.per_upstream.items()),
+                ((u, st.get("ok", 0) + st.get("fail", 0)) for u, st in tel.upstreams_snapshot()),
                 key=lambda x: x[1], reverse=True)[:10],
             "config_path": app.config_path,
             "endpoints": app.dns_server.endpoints() if app.dns_server else None,
@@ -325,17 +439,23 @@ class _Handler(BaseHTTPRequestHandler):
         qtype = (body.get("qtype") or "A").upper()
         if not domain:
             return self._send(400, {"error": "domain required"})
-        res = self.app.resolver.resolve(domain, qtype, silent=False, client_ip="查询控制台")
+        if len(domain) > 253:
+            return self._send(400, {"error": "domain too long (max 253)"})
+        # qtype 必须是已知类型名, 未知类型(畸形/拼写错误)直接 400
+        if dnsmsg.type_code(qtype) == 0:
+            return self._send(400, {"error": "bad qtype: %r" % (qtype,)})
+        try:
+            res = self.app.resolver.resolve(domain, qtype, silent=False, client_ip="查询控制台")
+        except Exception as e:
+            return self._send(502, {"error": "resolve failed", "detail": str(e)})
         tel = self.app.telemetry
-        tel.manual_history.append({
+        tel.add_manual_entry({
             "ts": _now_ts(),
             "domain": res["domain"],
             "qtype": res["qtype"],
-            "answer": res.get("chosen") or "SERVFAIL",
+            "answer": res.get("chosen") or "NXDOMAIN",
             "lat": res.get("latency", 0),
         })
-        if len(tel.manual_history) > 20:
-            tel.manual_history = tel.manual_history[-20:]
         return self._send(200, res)
 
     def _api_reprobe(self):
@@ -386,84 +506,110 @@ class _Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         if not isinstance(data, dict):
             return self._send(400, {"error": "bad config"})
-        # 防御: cache_size 必须为 1..10,000,000 的整数(防止前端部分回传/坏值
-        # 把 LRU 容量静默改坏, 例如默认 1024 覆盖 131072)
-        cs = data.get("cache_size")
-        if cs is not None and not (isinstance(cs, int) and 1 <= cs <= 10_000_000):
-            return self._send(400, {"error": "bad cache_size: %r" % (cs,)})
+        # 白名单: 只允许写配置主体中既有的顶层键(排除 listen/api/web_root)。
+        # 防止 deep_merge 把攻击者注入的任意键(如伪装 listen/钩子字段)写回。
+        data = {k: v for k, v in data.items() if k in _CFG_WRITABLE_KEYS}
+        # 防御: cache_size 仅在请求中显式传入时校验; 未传则保留现有值。
+        # 显式 null/非整数/越界均拒绝, 否则后续 int(None) 崩溃或容量被静默清空。
+        if "cache_size" in data:
+            cs = data["cache_size"]
+            if cs is None or not (isinstance(cs, int) and not isinstance(cs, bool)
+                                  and 1 <= cs <= 10_000_000):
+                return self._send(400, {"error": "bad cache_size: %r" % (cs,)})
+        # upstreams 必须是列表, 否则后续遍历/保存会类型错误
+        if "upstreams" in data and not isinstance(data["upstreams"], list):
+            return self._send(400, {"error": "bad upstreams: must be a list"})
         # 逐条规则独立存储: 前端回传的 rules 从配置主体剥离, 单独写 rules_local.json
         # (config.json 不再保存逐条规则; 避免 deep_merge 把前端 rules 写回 config)
         data_rules = data.pop("rules", None)
         # 合并前先快照旧上游列表, 用于事后 diff: 被删除/地址变更的上游要回收
         # DoH/DoT 连接池、QUIC 常驻连接与遥测统计, 否则随控制台"删除+保存"泄漏。
-        old_ups = list(self.app.cfg.get("upstreams", []))
-        old_by_id = {u.get("id"): u for u in old_ups}
-        old_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
-        with self.app._lock:
-            self.app.cfg = config_mod.deep_merge(self.app.cfg, data)
-            # deep_merge 返回新 dict, resolver/DNSServer 持有旧引用。
-            # 必须重绑定, 否则除 cache_size 外的配置(ttl/预取/测速/超时/IPv6/
-            # 规则/上游/fallback/ipv4_first)都不会即时生效, 需重启才生效。
-            self.app.resolver.cfg = self.app.cfg
-            # 同步缓存容量
-            self.app.resolver.cache.capacity = int(self.app.cfg.get("cache_size", 1024))
-            # 缓存策略变更立即重建容器(保存即生效, 不必等 /api/reload)。
-            # switch_cache_policy 按实际对象类型判定, 幂等。
-            new_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
-            if new_policy != old_policy:
-                try:
-                    self.app.resolver.switch_cache_policy(new_policy)
-                except Exception:
-                    pass
-            # 上游 diff: 删除的回收连接/统计; 保留但 proto/addr/port/url 变更的
-            # 旧连接池 key 已失效, 一并回收(与 AppContext.reload 路径行为一致)
-            new_ups = self.app.cfg.get("upstreams", [])
-            new_ids = {u.get("id") for u in new_ups}
-            for o in old_ups:
-                uid = o.get("id")
-                if uid not in new_ids:
-                    # 整条删除
+        # H-2: old_cfg / old_ups / old_policy 必须在锁内读取, 否则与 reload() 竞争——
+        # 锁外读 old_cfg=v1, reload 中途把 self.cfg 换成 v2, 进锁后 deep_merge(v1)
+        # 会把 v2 的变更覆盖丢失。
+        old_by_id = {}
+        old_policy = "lru"
+        old_ups = []
+        old_cfg = None
+        try:
+            with self.app._lock:
+                old_cfg = self.app.cfg   # 回滚用: 合并失败时还原旧配置引用
+                old_ups = list(old_cfg.get("upstreams", []))
+                old_by_id = {u.get("id"): u for u in old_ups}
+                old_policy = str(old_cfg.get("cache_policy", "lru")).lower()
+                self.app.cfg = config_mod.deep_merge(old_cfg, data)
+                # deep_merge 返回新 dict, resolver/DNSServer 持有旧引用。
+                # 必须重绑定, 否则除 cache_size 外的配置(ttl/预取/测速/超时/IPv6/
+                # 规则/上游/fallback/ipv4_first)都不会即时生效, 需重启才生效。
+                self.app.resolver.cfg = self.app.cfg
+                # 同步缓存容量
+                self.app.resolver.cache.capacity = int(self.app.cfg.get("cache_size", 1024))
+                # 缓存策略变更立即重建容器(保存即生效, 不必等 /api/reload)。
+                # switch_cache_policy 按实际对象类型判定, 幂等。
+                new_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
+                if new_policy != old_policy:
                     try:
-                        self.app.telemetry.per_upstream.pop(uid, None)
+                        self.app.resolver.switch_cache_policy(new_policy)
                     except Exception:
                         pass
-                    try:
-                        upstream.discard_upstream_conns(o)
-                    except Exception:
-                        pass
-                    try:
-                        quic_upstream.discard_upstream(o)
-                    except Exception:
-                        pass
-                    continue
-                nu = next((x for x in new_ups if x.get("id") == uid), None)
-                if nu is None:
-                    continue
-                if (str(o.get("proto", "")).lower() != str(nu.get("proto", "")).lower()
-                        or o.get("addr") != nu.get("addr")
-                        or o.get("port") != nu.get("port")
-                        or (o.get("url") or "") != (nu.get("url") or "")):
-                    try:
-                        upstream.discard_upstream_conns(o)
-                    except Exception:
-                        pass
-                    try:
-                        quic_upstream.discard_upstream(o)
-                    except Exception:
-                        pass
-            # 规则可能整体替换 → 重建索引
-            try:
-                self.app.resolver.rebuild_rule_index()
-            except Exception:
-                pass
-            saved = config_mod.save_config(self.app.cfg, self.app.config_path)
-            # 逐条规则单独持久化(若前端回传了 rules)
-            if isinstance(data_rules, list):
-                self._save_local_rules(data_rules)
+                # 上游 diff: 删除的回收连接/统计; 保留但 proto/addr/port/url 变更的
+                # 旧连接池 key 已失效, 一并回收(与 AppContext.reload 路径行为一致)
+                new_ups = self.app.cfg.get("upstreams", [])
+                new_ids = {u.get("id") for u in new_ups}
+                for o in old_ups:
+                    uid = o.get("id")
+                    if uid not in new_ids:
+                        # 整条删除
+                        try:
+                            self.app.telemetry.per_upstream.pop(uid, None)
+                        except Exception:
+                            pass
+                        try:
+                            upstream.discard_upstream_conns(o)
+                        except Exception:
+                            pass
+                        try:
+                            quic_upstream.discard_upstream(o)
+                        except Exception:
+                            pass
+                        continue
+                    nu = next((x for x in new_ups if x.get("id") == uid), None)
+                    if nu is None:
+                        continue
+                    if (str(o.get("proto", "")).lower() != str(nu.get("proto", "")).lower()
+                            or o.get("addr") != nu.get("addr")
+                            or o.get("port") != nu.get("port")
+                            or (o.get("url") or "") != (nu.get("url") or "")):
+                        try:
+                            upstream.discard_upstream_conns(o)
+                        except Exception:
+                            pass
+                        try:
+                            quic_upstream.discard_upstream(o)
+                        except Exception:
+                            pass
+                # 规则可能整体替换 → 重建索引
                 try:
                     self.app.resolver.rebuild_rule_index()
                 except Exception:
                     pass
+                saved = config_mod.save_config(self.app.cfg, self.app.config_path)
+                # 逐条规则单独持久化(若前端回传了 rules)
+                if isinstance(data_rules, list):
+                    self._save_local_rules(data_rules)
+                    try:
+                        self.app.resolver.rebuild_rule_index()
+                    except Exception:
+                        pass
+        except Exception as e:
+            # 合并/应用过程中任何异常: 回滚配置引用, 避免半应用状态
+            log.exception("更新配置失败, 回滚到旧配置: %r", e)
+            self.app.cfg = old_cfg
+            try:
+                self.app.resolver.cfg = old_cfg
+            except Exception:
+                pass
+            return self._send(500, {"error": "apply config failed: %s" % e})
         # 新增上游自动实测延迟: 只测启用且未实测过的上游(新添加的), 后台线程不阻塞响应
         try:
             from . import probe
@@ -496,9 +642,10 @@ class _Handler(BaseHTTPRequestHandler):
         conns = tel.conn_summary()   # 连接维度健康度(proto|addr|port|url)
         out = []
         for u in cfg.get("upstreams", []):
-            st = tel.upstream_stat(u["id"])
+            st = tel.upstream_stat(u.get("id"))
             total = st["ok"] + st["fail"]
-            sr = total and st["ok"] / total * 100 or (100 if u.get("enabled", True) else 0)
+            # 显式三元: total>0 时按真实比例计算(含 0%), 避免 `and/or` 把 0% 误判为假值落到兜底分支
+            sr = (st["ok"] / total * 100.0) if total else (100.0 if u.get("enabled", True) else 0.0)
             base_lat = u.get("latency")
             base_lat = base_lat if isinstance(base_lat, (int, float)) else 0   # None 防护
             avg = st["lat_sum"] / st["ok"] if st["ok"] else base_lat
@@ -559,8 +706,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "latency_measured": False,
                 "enabled": bool(body.get("enabled", True)),
             }
-            cfg["upstreams"].append(u)
-            config_mod.save_config(cfg, self.app.config_path)
+            with self.app._lock:
+                cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
+                cfg["upstreams"].append(u)
+                config_mod.save_config(cfg, self.app.config_path)
             # 新上游后台实测延迟并写回
             try:
                 from . import probe
@@ -594,8 +743,10 @@ class _Handler(BaseHTTPRequestHandler):
             "latency_measured": False,
             "enabled": bool(body.get("enabled", True)),
         }
-        cfg["upstreams"].append(u)
-        config_mod.save_config(cfg, self.app.config_path)
+        with self.app._lock:
+            cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
+            cfg["upstreams"].append(u)
+            config_mod.save_config(cfg, self.app.config_path)
         # 新上游后台实测延迟并写回
         try:
             from . import probe
@@ -608,44 +759,45 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "upstream": u})
 
     def _api_upstream_op(self, up_id):
-        cfg = self.app.cfg
-        ups = cfg.get("upstreams", [])
-        idx = next((i for i, u in enumerate(ups) if u["id"] == up_id), None)
-        if idx is None:
-            return self._send(404, {"error": "upstream not found"})
-        if self.command == "DELETE":
-            removed = ups[idx]   # pop 前保存引用, 供连接池清理使用
-            ups.pop(idx)
-            config_mod.save_config(cfg, self.app.config_path)
-            # 同步清理该上游的遥测统计 + DoH/DoT 连接池 + QUIC 常驻连接
-            # (防 per_upstream/_pool 残留已删除上游的统计与连接对象/线程)
-            try:
-                self.app.telemetry.per_upstream.pop(up_id, None)
-            except Exception:
-                pass
-            try:
-                upstream.discard_upstream_conns(removed)
-            except Exception:
-                pass
-            try:
-                quic_upstream.discard_upstream(removed)
-            except Exception:
-                pass
-            return self._send(200, {"ok": True})
-        body = self._read_json() or {}
-        for k, v in body.items():
-            if k == "id":
-                continue
-            if k == "port" or k == "latency":
+        with self.app._lock:
+            cfg = self.app.cfg
+            ups = cfg.get("upstreams", [])
+            idx = next((i for i, u in enumerate(ups) if u.get("id") == up_id), None)
+            if idx is None:
+                return self._send(404, {"error": "upstream not found"})
+            if self.command == "DELETE":
+                removed = ups[idx]   # pop 前保存引用, 供连接池清理使用
+                ups.pop(idx)
+                config_mod.save_config(cfg, self.app.config_path)
+                # 同步清理该上游的遥测统计 + DoH/DoT 连接池 + QUIC 常驻连接
+                # (防 per_upstream/_pool 残留已删除上游的统计与连接对象/线程)
                 try:
-                    v = int(v)
-                except (TypeError, ValueError):
-                    return self._send(400, {"error": "%s 必须是整数" % k})
-            if k == "enabled":
-                v = bool(v)
-            ups[idx][k] = v
-        config_mod.save_config(cfg, self.app.config_path)
-        return self._send(200, {"ok": True, "upstream": ups[idx]})
+                    self.app.telemetry.per_upstream.pop(up_id, None)
+                except Exception:
+                    pass
+                try:
+                    upstream.discard_upstream_conns(removed)
+                except Exception:
+                    pass
+                try:
+                    quic_upstream.discard_upstream(removed)
+                except Exception:
+                    pass
+                return self._send(200, {"ok": True})
+            body = self._read_json() or {}
+            for k, v in body.items():
+                if k == "id":
+                    continue
+                if k == "port" or k == "latency":
+                    try:
+                        v = int(v)
+                    except (TypeError, ValueError):
+                        return self._send(400, {"error": "%s 必须是整数" % k})
+                if k == "enabled":
+                    v = bool(v)
+                ups[idx][k] = v
+            config_mod.save_config(cfg, self.app.config_path)
+            return self._send(200, {"ok": True, "upstream": ups[idx]})
 
     def _api_import_rules(self):
         """导入分流规则。URL 走规则订阅(独立文件 rules_sub.json, 卡片只显示链接);
@@ -664,32 +816,35 @@ class _Handler(BaseHTTPRequestHandler):
         action = body.get("action") or "group"
         group = body.get("group") or "global"
         wildcard = body.get("wildcard", True)
-        rules = self._local_rules()
-        existing = {r.get("match") for r in rules}
-        base = int(time.time() * 1000)
-        added = 0
-        for d in domains:
-            m = d
-            is_advanced = d.startswith("re:")
-            if wildcard and not d.startswith("*.") and not is_advanced:
-                m = "*." + d
-            if m in existing:
-                continue
-            r = {"id": "r%d" % (base + added), "match": m, "action": action}
-            if action == "group":
-                r["group"] = group
-            elif action == "forceIp":
-                r["ip"] = body.get("ip") or "1.2.3.4"
-            rules.append(r)
-            existing.add(m)
-            added += 1
-        if added:
-            self._save_local_rules(rules)
-            try:
-                self.app.resolver.rebuild_rule_index()
-            except Exception:
-                pass
-        return self._send(200, {"added": added, "total": len(rules)})
+        # 读改写全程持 app._lock: 并发导入/加规则时, 两线程同时读到旧规则集
+        # 各自 append 后落盘会互相覆盖静默丢规则(与上游 CRUD 加锁范式对齐)。
+        with self.app._lock:
+            rules = self._local_rules()
+            existing = {r.get("match") for r in rules}
+            base = int(time.time() * 1000)
+            added = 0
+            for d in domains:
+                m = d
+                is_advanced = d.startswith("re:")
+                if wildcard and not d.startswith("*.") and not is_advanced:
+                    m = "*." + d
+                if m in existing:
+                    continue
+                r = {"id": "r%d" % (base + added), "match": m, "action": action}
+                if action == "group":
+                    r["group"] = group
+                elif action == "forceIp":
+                    r["ip"] = body.get("ip") or "1.2.3.4"
+                rules.append(r)
+                existing.add(m)
+                added += 1
+            if added:
+                self._save_local_rules(rules)
+                try:
+                    self.app.resolver.rebuild_rule_index()
+                except Exception:
+                    pass
+            return self._send(200, {"added": added, "total": len(rules)})
 
     def _api_subscribe_rules_body(self, body):
         """订阅 body 处理(供 /api/rules/import url 复用): 下载→写独立文件→重建索引。"""
@@ -741,6 +896,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_add_rule(self):
         body = self._read_json() or {}
+        # 兼容旧字段名 pattern→match / value→group|ip (与 resolver._normalize_rule 一致)。
+        # 原实现只读 body.get("match")/get("ip"), 旧客户端用 pattern/value 提交时:
+        #   pattern 被丢弃 → match 落成默认 "*.example.com";
+        #   value   被丢弃 → ip/group 落成空值。
+        # 用户意图的域名与目标 IP 丢失, 还会误建一条影响所有 *.example.com 的全局规则。
+        if isinstance(body, dict):
+            try:
+                self.app.resolver._normalize_rule(body)
+            except Exception:
+                pass
         r = {
             "id": "r%d" % int(time.time() * 1000),
             "match": body.get("match") or "*.example.com",
@@ -756,24 +921,37 @@ class _Handler(BaseHTTPRequestHandler):
                     r[k] = max(0, int(v))
                 except (TypeError, ValueError):
                     pass
-        rules = self._local_rules()
-        rules.append(r)
-        self._save_local_rules(rules)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
+        # 读改写全程持 app._lock, 防并发加规则互相覆盖静默丢失(同 _api_import_rules)。
+        with self.app._lock:
+            rules = self._local_rules()
+            rules.append(r)
+            self._save_local_rules(rules)
+            try:
+                self.app.resolver.rebuild_rule_index()
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
         return self._send(200, {"ok": True, "rule": r})
 
     # ---- 逐条规则(独立文件 rules_local.json, 不写入 config.json) ----
     def _local_rules(self):
-        """读逐条规则独立文件; 文件不存在时回退 cfg['rules'](旧 config 迁移期兼容), 并惰性迁移。"""
+        """读逐条规则独立文件; 文件不存在时回退 cfg['rules'](旧 config 迁移期兼容), 并惰性迁移。
+        P0-2: 配置文件迁移来的历史规则没有 id 字段, 而 DELETE/PUT /api/rules/{id}
+        按 id 定位。这里对缺 id 的规则惰性补一个稳定 id 并落盘, 保证列表展示与
+        按 id 删除/编辑都可用, 不再触发 KeyError: 'id'。"""
         lr = config_mod.load_local_rules(self.app.config_path)
-        if lr is not None:
-            return lr
-        # 独立文件尚未建立: 用 config 里的旧 rules(迁移逻辑由 cli.run 执行, 此处兜底)
-        return list(self.app.cfg.get("rules", []))
+        if lr is None:
+            rules = list(self.app.cfg.get("rules", []))
+        else:
+            rules = lr
+        changed = False
+        for i, r in enumerate(rules):
+            if isinstance(r, dict) and not r.get("id"):
+                r["id"] = "rmig%d" % (i + 1)
+                changed = True
+        if changed:
+            self._save_local_rules(rules)
+        return rules
 
     def _save_local_rules(self, rules):
         config_mod.save_local_rules(rules, self.app.config_path)
@@ -833,13 +1011,8 @@ class _Handler(BaseHTTPRequestHandler):
         return {"rules": self._local_rules(), "subscriptions": subs}
 
     def _fetch_sub_text(self, url):
-        # SSRF 防护: 拒绝指向内网/环回/链路本地的订阅地址
-        blocked = _sub_url_blocked(url)
-        if blocked:
-            raise ValueError(blocked)
-        req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.read().decode("utf-8", "replace")
+        # 共享实现: SSRF 初始校验 + 每跳重定向复检 + 16MB 流式上限(见 fetch_subscription_text)
+        return fetch_subscription_text(url, timeout=20)
 
     def _api_subscribe_rules(self):
         """POST /api/rules/subscribe {url, action, group, ip}: 添加规则订阅。
@@ -946,34 +1119,39 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "url": url})
 
     def _api_rule_op(self, rid):
-        rules = self._local_rules()
-        idx = next((i for i, r in enumerate(rules) if r["id"] == rid), None)
-        if idx is None:
-            return self._send(404, {"error": "rule not found"})
-        if self.command == "DELETE":
-            rules.pop(idx)
+        # 读改写全程持 app._lock: 与 add/import 串行化, 防并发改删规则基于陈旧快照
+        # 互相覆盖(同上游 CRUD)。
+        with self.app._lock:
+            rules = self._local_rules()
+            # P0-2: 用 .get("id") 防御——_local_rules 已为迁移规则补 id,
+            # 但直接索引 r["id"] 遇无 id 规则仍会抛 KeyError 导致连接重置。
+            idx = next((i for i, r in enumerate(rules) if isinstance(r, dict) and (r.get("id") or "") == rid), None)
+            if idx is None:
+                return self._send(404, {"error": "rule not found"})
+            if self.command == "DELETE":
+                rules.pop(idx)
+                self._save_local_rules(rules)
+                try:
+                    self.app.resolver.rebuild_rule_index()
+                except Exception:
+                    pass
+                return self._send(200, {"ok": True})
+            body = self._read_json() or {}
+            for k, v in body.items():
+                if k == "id":
+                    continue
+                if v is None:
+                    # null 语义 = 移除该字段(如规则 ttl_min/ttl_max 留空), 避免 config 残留 null
+                    rules[idx].pop(k, None)
+                else:
+                    rules[idx][k] = v
             self._save_local_rules(rules)
             try:
                 self.app.resolver.rebuild_rule_index()
-            except Exception:
-                pass
-            return self._send(200, {"ok": True})
-        body = self._read_json() or {}
-        for k, v in body.items():
-            if k == "id":
-                continue
-            if v is None:
-                # null 语义 = 移除该字段(如规则 ttl_min/ttl_max 留空), 避免 config 残留 null
-                rules[idx].pop(k, None)
-            else:
-                rules[idx][k] = v
-        self._save_local_rules(rules)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
-        return self._send(200, {"ok": True, "rule": rules[idx]})
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
+            return self._send(200, {"ok": True, "rule": rules[idx]})
 
     def _logs(self, query):
         """实时查询日志接口, 支持过滤参数:
@@ -1091,7 +1269,8 @@ class _Handler(BaseHTTPRequestHandler):
             lines.append('ebpdns_rule_hits{rule="%s"} %d' % (k, v))
         lines.append("# HELP ebpdns_upstream_health 上游健康度(成功次数, 延迟ms)")
         lines.append("# TYPE ebpdns_upstream_health gauge")
-        for uid, st in (tel.per_upstream or {}).items():
+        # H-1: 加锁快照, 避免并发 setdefault 触发 dict changed size
+        for uid, st in tel.upstreams_snapshot():
             ok = st.get("ok", 0)
             avg = (st.get("lat_sum", 0) / ok) if ok else 0
             lines.append('ebpdns_upstream_health{upstream="%s",result="ok"} %d' % (uid, ok))
@@ -1127,19 +1306,28 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, OSError):
+            pass  # 客户端已提前断开, 静默忽略
 
     # ---------- BaseHTTPRequestHandler ----------
     def do_GET(self):
         self._route()
 
     def do_POST(self):
+        if not self._csrf_ok():
+            return self._send(403, {"error": "CSRF check failed"})
         self._route()
 
     def do_PUT(self):
+        if not self._csrf_ok():
+            return self._send(403, {"error": "CSRF check failed"})
         self._route()
 
     def do_DELETE(self):
+        if not self._csrf_ok():
+            return self._send(403, {"error": "CSRF check failed"})
         self._route()
 
     def log_message(self, fmt, *args):
@@ -1151,10 +1339,33 @@ class _Handler(BaseHTTPRequestHandler):
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # 并发连接上限: ThreadingHTTPServer 每连接一线程, 无界会被海量短连接/慢连接
+    # 耗尽线程。用有界信号量限流(与 DNS TCPDNSServer 一致), 满了在 accept 线程
+    # 阻塞形成背压, 而不是无界派生线程。
+    _conn_slots = threading.BoundedSemaphore(256)
 
     def __init__(self, app_ctx, host, port):
         self.app = app_ctx
         super().__init__((host, port), _Handler)
+        # API 默认监听 127.0.0.1 回环地址, 仅本机可达。
+        # 若显式绑定非回环地址, 提醒用户局域网/公网暴露风险。
+        _host = str(host or "127.0.0.1").strip().lower()
+        if _host not in ("127.0.0.1", "::1", "localhost"):
+            log.warning("API 绑定非回环地址 %s —— 局域网/公网主机可访问写接口, 请确保网络隔离", host)
+
+    def process_request(self, request, client_address):
+        self._conn_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_slots.release()
 
     def start_thread(self):
         t = threading.Thread(target=self.serve_forever, name="http-api", daemon=True)

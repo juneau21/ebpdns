@@ -209,13 +209,12 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                 if not url or url in have:
                     continue
                 try:
-                    from .api import _sub_url_blocked
-                    if _sub_url_blocked(url):
-                        log.warning("订阅冷启动补下载跳过被阻止的 URL (私有/回环地址): %s", url)
+                    from .api import fetch_subscription_text
+                    try:
+                        text = fetch_subscription_text(url, timeout=20)
+                    except ValueError as _ve:
+                        log.warning("订阅冷启动补下载跳过被阻止的 URL: %s (%s)", url, _ve)
                         continue
-                    req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
-                    with urllib.request.urlopen(req, timeout=20) as r:
-                        text = r.read().decode("utf-8", "replace")
                     domains = _parse_domain_list(text)
                     if not domains:
                         continue

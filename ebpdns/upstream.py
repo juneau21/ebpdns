@@ -250,6 +250,13 @@ class _ConnPool:
     def release(self, key, conn):
         e = self._entries.get(key)
         if e is None:
+            # 上游已被 discard: 连接无法回池(整个 key 已删除), 必须显式关闭,
+            # 否则 in-flight 查询归还时连接对象被丢弃而 fd 迟迟不释放。
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return
         if conn is not None:
             with self._lock:
@@ -314,7 +321,21 @@ def _doh_query(up, query_bytes, timeout_ms):
     # 必须独立连接池, 否则复用连接会把请求发到错误路径
     key = ("doh", host, port, path)
     timeout = timeout_ms / 1000.0
-    headers = _DOH_HEADERS
+    # H5: 进入函数即设总 deadline, 重试不再重发完整 timeout(原实现首败后
+    # 重试用完整 timeout, 总耗时可达 2×timeout)。建连/收发均用剩余时间。
+    deadline = time.monotonic() + timeout
+    # H3: 经 bootstrap-IP 直连时, HTTPSConnection(ip, ...) 会把 IP 当 Host 头发送,
+    # 反向代理/虚拟主机路由会失败; 必须手动把 Host 头设回原始域名。
+    bp_ip = _bootstrap_ip(host)
+    if bp_ip and bp_ip != host:
+        headers = dict(_DOH_HEADERS)
+        headers["Host"] = host
+    else:
+        headers = _DOH_HEADERS
+
+    def _remaining():
+        return deadline - time.monotonic()
+
     # 连接槽获取带超时: 池满(4 连接都在忙)时等待, 不无限阻塞
     got = _pool.acquire(key, timeout)
     if got is None:
@@ -323,8 +344,12 @@ def _doh_query(up, query_bytes, timeout_ms):
         conn = None if got == "NEW" else got
         # 连接有效判据：HTTPConnection.sock 非 None（Python 3.10 无 is_connected()）
         if conn is None or getattr(conn, "sock", None) is None:
+            rt = _remaining()
+            if rt <= 0:
+                _pool.release(key, None)
+                return False, None
             try:
-                conn = _doh_conn(host, port, timeout)
+                conn = _doh_conn(host, port, rt)
             except OSError:
                 _pool.release(key, None)
                 return False, None
@@ -342,13 +367,17 @@ def _doh_query(up, query_bytes, timeout_ms):
             _pool.release(key, conn)  # 复用成功，写回池
             return True, body
         except (OSError, http.client.HTTPException):
-            # 连接失效 → 关闭并一次性重试（新建连接）
+            # 连接失效 → 关闭并一次性重试（新建连接），仅用剩余预算
+            rt = _remaining()
+            if rt <= 0:
+                _pool.release(key, None)
+                return False, None
             try:
                 conn.close()
             except Exception:
                 pass
             try:
-                conn = _doh_conn(host, port, timeout)
+                conn = _doh_conn(host, port, rt)
                 conn.request("POST", path, body=query_bytes, headers=headers)
                 resp = conn.getresponse()
                 body = resp.read()
@@ -362,11 +391,21 @@ def _doh_query(up, query_bytes, timeout_ms):
                 _pool.release(key, conn)
                 return True, body
             except (OSError, http.client.HTTPException):
+                # 重试连接也失败: 该 conn 已损坏, 关闭后再归还槽位, 防 TLS socket 泄漏
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 _pool.release(key, None)
                 return False, None
     except Exception:
-        # 兜底: 任何异常路径都不泄漏连接槽
+        # 兜底: 任何异常路径都不泄漏连接槽; 若 conn 已建但未成功回池, 关闭防泄漏
         try:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
             _pool.release(key, None)
         except Exception:
             pass
@@ -384,8 +423,16 @@ def _dot_conn(host, port, timeout):
     sock = socket.create_connection((connect_host, port), timeout=timeout)
     # 使用 ssl.create_default_context() 默认校验(含 CA 校验 + 主机名校验)。
     # IP 直连场景通过 server_hostname=host 传 SNI, 证书校验仍按主机名进行。
-    ctx = ssl.create_default_context()
-    sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+    # wrap_socket 抛异常时必须关闭原始 TCP socket, 否则 fd 泄漏。
+    try:
+        ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
     return sock
 
 
@@ -394,10 +441,16 @@ def _dot_query(up, query_bytes, timeout_ms):
     host, port = _host_port(up)
     key = ("dot", host, port, "")
     timeout = timeout_ms / 1000.0
+    # H5: 总 deadline 控制重试预算, 首败后重试用剩余时间而非完整 timeout,
+    # 避免总耗时达 2×timeout。
+    deadline = time.monotonic() + timeout
     frame = tcp_frame(query_bytes)
 
     def _exchange(sock):
-        sock.settimeout(timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(remaining)
         sock.sendall(frame)
         buf = bytearray()
         while True:
@@ -420,8 +473,12 @@ def _dot_query(up, query_bytes, timeout_ms):
     try:
         sock = None if got == "NEW" else got
         if sock is None:
+            rt = deadline - time.monotonic()
+            if rt <= 0:
+                _pool.release(key, None)
+                return False, None
             try:
-                sock = _dot_conn(host, port, timeout)
+                sock = _dot_conn(host, port, rt)
             except OSError:
                 _pool.release(key, None)
                 return False, None
@@ -430,20 +487,35 @@ def _dot_query(up, query_bytes, timeout_ms):
             if msg is not None:
                 _pool.release(key, sock)  # 复用成功，写回池
                 return True, msg
+            # _exchange 返回 None(对端 EOF/超时/缓冲超限): 连接不可再用, 必须关闭
+            # 再归还槽位, 否则该 TLS socket 既不回池也不 close, fd 泄漏。
+            try:
+                sock.close()
+            except Exception:
+                pass
             _pool.release(key, None)
             return False, None
         except OSError:
-            # 连接失效 → 关闭重试一次
+            # 连接失效 → 关闭重试一次, 仅用剩余预算
+            rt = deadline - time.monotonic()
+            if rt <= 0:
+                _pool.release(key, None)
+                return False, None
             try:
                 sock.close()
             except Exception:
                 pass
             try:
-                sock = _dot_conn(host, port, timeout)
+                sock = _dot_conn(host, port, rt)
                 msg = _exchange(sock)
                 if msg is not None:
                     _pool.release(key, sock)
                     return True, msg
+                # 重试连接也不可用: 关闭后再归还槽位
+                try:
+                    sock.close()
+                except Exception:
+                    pass
                 _pool.release(key, None)
                 return False, None
             except OSError:
@@ -465,7 +537,10 @@ def _udp_query(up, query_bytes, timeout_ms):
         qid = struct.unpack(">H", query_bytes[:2])[0]
     except Exception:
         qid = None
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # H-5: 根据目标地址族选择 socket family。原硬编码 AF_INET 导致 IPv6 上游
+    # (如 2606:4700::1) sendto 抛 OSError 被静默吞掉、IPv6 UDP 上游永不工作。
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(fam, socket.SOCK_DGRAM)
     # 期望响应源 IP 集合: host 为域名时解析出全部 IP(A 记录可能多个,
     # 单值校验会误丢来自其他 IP 的响应); 解析失败则集合为空 → 不校验源,
     # 靠 qid(16bit 随机)兜底防投毒。
@@ -476,10 +551,16 @@ def _udp_query(up, query_bytes, timeout_ms):
         # 用带 TTL 的解析缓存, 避免 miss 热路径每次阻塞 getaddrinfo
         expect_ips = _cached_udp_addrs(host)
     try:
-        sock.settimeout(timeout_ms / 1000.0)
         sock.sendto(query_bytes, addr)
         deadline = time.monotonic() + timeout_ms / 1000.0
-        while time.monotonic() < deadline:
+        # H-5: 每轮 recvfrom 前按剩余时间重置超时。原实现 settimeout 只设一次,
+        # 收到伪造/无关响应 continue 后, 下一轮 recvfrom 仍等完整 timeout, 总耗时
+        # 可超 deadline 50% 甚至翻倍。改为剩余 deadline, 伪造响应不再延长等待。
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, None
+            sock.settimeout(remaining)
             try:
                 data, src = sock.recvfrom(4096)
             except socket.timeout:

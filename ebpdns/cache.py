@@ -18,6 +18,12 @@ class LRUCache:
     _SHARDS = 8
 
     def __init__(self, capacity=1024):
+        # cache_size=null/None 归一化: 配置显式设为 null 时 cfg.get 返回 None
+        # (key 存在), 直接 None//8 会 TypeError 崩溃。None 按默认容量, 0 由
+        # 下方 max(16,...) 钳到最小容量。
+        if capacity is None:
+            capacity = 1024
+        capacity = int(capacity)
         self._caps = [max(16, capacity // self._SHARDS)] * self._SHARDS
         self._maps = [OrderedDict() for _ in range(self._SHARDS)]
         self._locks = [threading.Lock() for _ in range(self._SHARDS)]
@@ -33,6 +39,8 @@ class LRUCache:
 
     @capacity.setter
     def capacity(self, n):
+        if n is None:
+            n = 1024
         n = max(16, int(n))
         per = n // self._SHARDS
         self._cap = n
@@ -207,6 +215,9 @@ _DEFAULT_PARTITIONS = {"domestic": 0.2, "global": 0.2, "default": 0.6}
 
 class PartitionedCache:
     def __init__(self, capacity=1024, partitions=None):
+        # cache_size=null/None 归一化(见 LRUCache.__init__ 说明): int(None) 会崩溃。
+        if capacity is None:
+            capacity = 1024
         self._cap = max(16, int(capacity))
         self._parts = dict(_DEFAULT_PARTITIONS if partitions is None else partitions)
         self._groups = sorted(self._parts)
@@ -232,6 +243,8 @@ class PartitionedCache:
 
     @capacity.setter
     def capacity(self, n):
+        if n is None:
+            n = 1024
         self._cap = max(16, int(n))
         for g, c in self._caches.items():
             share = max(16, int(self._cap * self._parts.get(g, 0.1)))
@@ -333,24 +346,32 @@ class _CMSketch:
         self._t = [[0] * self._W for _ in range(self._D)]
         self._ops = 0
 
+    # 每行使用独立的乘同余常数(黄金比例衍生), 行间互不相关, 避免单一 hash(k)
+    # 经移位/OR 派生导致的行间强相关与碰撞退化。
+    _ROW_MULTS = (
+        0x9E3779B97F4A7C15,
+        0xBF58476D1CE4E5B9,
+        0x94D049BB133111EB,
+        0xC2B2AE3D27D4EB4F,
+    )
+
     def inc(self, k, n=1):
         self._ops += n
         if self._ops >= 65536:
             self._age()
-        # 各行的列来自不同种子, 统一按行写入
-        h1 = hash(k)
+        h1 = hash(k) & 0xFFFFFFFFFFFFFFFF
         for i in range(_CMSketch._D):
-            h = (h1 >> (i * 8)) | (i * 2654435761)
-            col = (h & 0x7FFFFFFF) % _CMSketch._W
+            h = (h1 * self._ROW_MULTS[i]) & 0xFFFFFFFFFFFFFFFF
+            col = (h >> 32) % _CMSketch._W
             nv = self._t[i][col] + n
             self._t[i][col] = nv if nv < 255 else 255
 
     def freq(self, k):
         mn = 255
-        h1 = hash(k)
+        h1 = hash(k) & 0xFFFFFFFFFFFFFFFF
         for i in range(_CMSketch._D):
-            h = (h1 >> (i * 8)) | (i * 2654435761)
-            col = (h & 0x7FFFFFFF) % _CMSketch._W
+            h = (h1 * self._ROW_MULTS[i]) & 0xFFFFFFFFFFFFFFFF
+            col = (h >> 32) % _CMSketch._W
             v = self._t[i][col]
             if v < mn:
                 mn = v
@@ -377,6 +398,9 @@ class TinyLFUCache:
     被同频/低频条目从 LRU 队尾挤出, 长尾热点保持性更强。
     """
     def __init__(self, capacity=1024):
+        # cache_size=null/None 归一化(见 LRUCache.__init__ 说明): int(None) 会崩溃。
+        if capacity is None:
+            capacity = 1024
         self._cap = max(64, int(capacity))
         self._win_cap = self._prob_cap = self._prot_cap = self._main_cap = 16
         self._window = OrderedDict()      # 新条目窗口区
@@ -393,6 +417,8 @@ class TinyLFUCache:
 
     @capacity.setter
     def capacity(self, n):
+        if n is None:
+            n = 1024
         with self._lock:
             self._cap = max(64, int(n))
             self._repartition_locked()
@@ -512,7 +538,9 @@ class TinyLFUCache:
                 self._protected[wk] = wv
                 continue
             mk, _mv = next(iter(self._probation.items()))
-            if self._sketch.freq(wk) >= self._sketch.freq(mk):
+            # 严格 >: 频率相等时保留 probation 已有条目(Caffeine 标准语义),
+            # 平局不允许新条目挤掉旧条目。
+            if self._sketch.freq(wk) > self._sketch.freq(mk):
                 self._probation.pop(mk, None)
                 self._probation[wk] = wv
         # 2) protected 超容 → 队首挤回 probation(由 1 的准入裁决保护)
@@ -593,7 +621,12 @@ class TinyLFUCache:
             for e in entries or []:
                 try:
                     k = tuple(e.get("key") or [])
-                    if len(k) < 2 or len(k) > 3 or "answers" not in e or "rcode" not in e:
+                    # 兼容 PartitionedCache 写出的 3 元组 [group, domain, qtype]:
+                    # 运行期 get/put 用 2 元组 (domain, qtype), restore 必须剥掉
+                    # group, 否则重启后全部 miss(对齐 LRUCache.restore)。
+                    if len(k) == 3:
+                        k = (k[1], k[2])
+                    if len(k) != 2 or "answers" not in e or "rcode" not in e:
                         continue
                     e = dict(e)
                     if pt > 0:

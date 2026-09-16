@@ -51,15 +51,19 @@ class Telemetry:
     def count_top(self, domain=None, client=None):
         """Top N 统计(域名/客户端): 命中与 miss 路径都调用。
         有界: 超过 _top_max 时裁剪掉低频一半(保留高频), 防随机域名压测
-        让 Counter 无限增长的内存泄漏。裁剪后计数近似(仅影响 Top N 展示)。"""
-        if domain:
-            self.top_domains[domain] += 1
-        if client:
-            self.top_clients[client] += 1
-        if len(self.top_domains) > self._top_max:
-            self.top_domains = Counter(dict(self.top_domains.most_common(self._top_max // 2)))
-        if len(self.top_clients) > self._top_max:
-            self.top_clients = Counter(dict(self.top_clients.most_common(self._top_max // 2)))
+        让 Counter 无限增长的内存泄漏。裁剪后计数近似(仅影响 Top N 展示)。
+        自增与裁剪必须统一持锁: 原来自增在锁外, 两线程同时 +=1 会丢计数,
+        且裁剪会整体替换 Counter 对象, 锁外自增旧对象的增量会随旧对象一起
+        被 GC 丢弃(彻底丢失)。一次加锁完成自增+裁剪, 避免上述竞态。"""
+        with self._lock:
+            if domain:
+                self.top_domains[domain] += 1
+            if client:
+                self.top_clients[client] += 1
+            if len(self.top_domains) > self._top_max:
+                self.top_domains = Counter(dict(self.top_domains.most_common(self._top_max // 2)))
+            if len(self.top_clients) > self._top_max:
+                self.top_clients = Counter(dict(self.top_clients.most_common(self._top_max // 2)))
 
     def count_query(self, cat):
         """miss 路径合并计数: total+qtype 一次加锁(替代 inc+inc_qtype 两次),
@@ -171,6 +175,31 @@ class Telemetry:
                     "last_lat_ms": st.get("last"),
                 }
             return out
+
+    # ---- H-1/H-3: 共享容器的线程安全快照 ----
+    def upstreams_snapshot(self):
+        """per_upstream.items() 的加锁拷贝。直接在锁外 .items() 迭代时, 并发
+        upstream_ok() 的 setdefault 新增 key 会抛 RuntimeError: dictionary
+        changed size during iteration (Prometheus /metrics 抓取 500)。"""
+        with self._lock:
+            return list(self.per_upstream.items())
+
+    def top_domains_snapshot(self, n=10):
+        """top_domains.most_common(n) 的加锁拷贝。Counter 整体替换 / 新域名自增
+        与 most_common 内部迭代并发时同样会抛 RuntimeError。"""
+        with self._lock:
+            return self.top_domains.most_common(n)
+
+    def top_clients_snapshot(self, n=10):
+        with self._lock:
+            return self.top_clients.most_common(n)
+
+    def add_manual_entry(self, entry):
+        """手动查询历史: append + 截断统一在锁内, 避免并发 append 丢记录。"""
+        with self._lock:
+            self.manual_history.append(entry)
+            if len(self.manual_history) > 20:
+                self.manual_history = self.manual_history[-20:]
     # ---- 缓存命中快路径（一次加锁完成所有遥测更新, 减少热路径锁竞争）----
     def fast_hit(self, qtype, raw_len, resp_len, lat_ms, kernel_direct=False):
         with self._lock:
@@ -252,38 +281,49 @@ class Telemetry:
 
     # ---- 快照（API 用）----
     def snapshot(self):
-        al = self.avg_latency()
-        return {
-            "uptime_s": int(time.time() - self.boot_time),
-            "running": True,
-            "counters": dict(self.counters),
-            "rule_hits": dict(self.rule_hits),
-            "qtype_dist": dict(self.qtype_dist),
-            "qps": self.current_qps(),
-            "hit_rate": round(self.hit_rate(), 1),
-            "avg_latency_ms": round(al, 1) if al is not None else None,
-            "history": self.history[-60:],
-            "events": list(self.events),
-            "manual_history": list(self.manual_history[-20:]),
-            "top_domains": self.top_domains.most_common(10),
-            "top_clients": self.top_clients.most_common(10),
-            "top_upstreams": sorted(
-                ((u, st.get("ok", 0) + st.get("fail", 0)) for u, st in self.per_upstream.items()),
-                key=lambda x: x[1], reverse=True)[:10],
-        }
+        # 读路径统一持锁: counters/rule_hits/qtype_dist/per_upstream/conn_stats/events/
+        # top_* 均由各写方法在锁内更新。snapshot 不加锁时, 并发 count_top() 整体
+        # 替换 top_domains 或新域名自增会让 most_common() 迭代中 "dict changed
+        # size" 抛 RuntimeError; 锁内一次性拷贝保证读一致性。被调方法(hit_rate/
+        # current_qps/avg_latency)自身不再获取 _lock, 无重入死锁。
+        with self._lock:
+            al = self.avg_latency()
+            return {
+                "uptime_s": int(time.time() - self.boot_time),
+                "running": True,
+                "counters": dict(self.counters),
+                "rule_hits": dict(self.rule_hits),
+                "qtype_dist": dict(self.qtype_dist),
+                "qps": self.current_qps(),
+                "hit_rate": round(self.hit_rate(), 1),
+                "avg_latency_ms": round(al, 1) if al is not None else None,
+                "history": self.history[-60:],
+                "events": list(self.events),
+                "manual_history": list(self.manual_history[-20:]),
+                "top_domains": self.top_domains.most_common(10),
+                "top_clients": self.top_clients.most_common(10),
+                "top_upstreams": sorted(
+                    ((u, st.get("ok", 0) + st.get("fail", 0)) for u, st in self.per_upstream.items()),
+                    key=lambda x: x[1], reverse=True)[:10],
+            }
 
     def reset(self):
-        self.set_counters({k: 0 for k in self.counters}, {"A": 0, "AAAA": 0, "other": 0})
-        self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0}
-        self.qps_window.clear()
-        self.latency_window.clear()
-        self.history = []
-        self.events.clear()
-        self.per_upstream.clear()
-        self.conn_stats.clear()
-        self.manual_history = []
-        self.top_domains.clear()
-        self.top_clients.clear()
+        # 所有清状态操作统一持锁, 避免与并发查询/快照交错读到半重置状态。
+        # 注意: 内联计数器重置而非调用 set_counters(它也会抢同一把非可重入锁,
+        # 在外层 with 内再 acquire 会死锁)。
+        with self._lock:
+            self.counters = {k: 0 for k in self.counters}
+            self.qtype_dist = {"A": 0, "AAAA": 0, "other": 0}
+            self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0}
+            self.qps_window.clear()
+            self.latency_window.clear()
+            self.history = []
+            self.events.clear()
+            self.per_upstream.clear()
+            self.conn_stats.clear()
+            self.manual_history = []
+            self.top_domains.clear()
+            self.top_clients.clear()
 
 
 def _now_ts():

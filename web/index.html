@@ -452,7 +452,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
     </nav>
     <div class="side-foot">
       <span class="dot"></span><span id="foot-mode">daemon 运行中</span>
-      <span class="uptime" id="foot-uptime">up 0m · v1.9.52</span>
+      <span class="uptime" id="foot-uptime">up 0m · v1.9.56</span>
     </div>
   </aside>
   <!-- ===================== 主区 ===================== -->
@@ -745,6 +745,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
             <span style="font-size:12px;color:var(--text3);align-self:center" id="cache-policy-label">缓存策略: –</span>
             <select class="q-sel" id="cfg-cache-policy" title="缓存策略热切换 · 保存后自动热重载生效">
               <option value="lru">LRU 分区</option>
+              <option value="partitioned">分区 LRU (partitioned)</option>
               <option value="tinylfu">W-TinyLFU</option>
             </select>
             <button class="btn primary" id="btn-save-cfg">
@@ -937,8 +938,8 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.54";    // 前端兜底版本(后端 /api/status.version 优先)
-let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[] };
+const APP_VERSION = "v1.9.60";    // 前端兜底版本(后端 /api/status.version 优先)
+let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[], hiddenHistoryBefore:null };
 const API = {
   async req(method, path, body){
     const opt = { method, headers:{} };
@@ -1422,7 +1423,7 @@ function chartLatOpt(labels, data){
   return { grid:{ left:38, right:14, top:18, bottom:22 }, xAxis:{ type:'category', data:labels, boundaryGap:false, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, fontSize:9 } }, yAxis:{ type:'value', ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, formatter:'{value}ms' } }, series:[{ type:'line', data, smooth:true, symbol:'none', lineStyle:{ color:'#ffb454', width:2 }, areaStyle:{ color:'#ffb454', opacity:0.08 } }], tooltip:baseTooltip('axis') };
 }
 function chartQtypesOpt(qd, total){
-  return { tooltip: baseTooltip('item'), legend:{ orient:'vertical', right:4, top:'middle', textStyle:{ color:'#b8c6d6', fontSize:12 }, itemWidth:14, itemHeight:10, itemGap:16 }, series:[{ type:'pie', radius:['42%','72%'], center:['37%','48%'], color:['#2ee6c8','#5b8def','#ffb454'], label:{ show:true, formatter:(p) => p.name + '\n' + p.value + ' (' + p.percent + '%)', color:'#e6eef6', fontSize:11, lineHeight:17 }, labelLine:{ length:16, length2:12, lineStyle:{ color:'#2a3b4f' } }, data:[{ name:'A', value:qd.A || 0 },{ name:'AAAA', value:qd.AAAA || 0 },{ name:'其他', value:qd['其他'] || 0 }] }] };
+  return { tooltip: baseTooltip('item'), legend:{ orient:'vertical', right:4, top:'middle', textStyle:{ color:'#b8c6d6', fontSize:12 }, itemWidth:14, itemHeight:10, itemGap:16 }, series:[{ type:'pie', radius:['42%','72%'], center:['37%','48%'], color:['#2ee6c8','#5b8def','#ffb454'], label:{ show:true, formatter:(p) => p.name + '\n' + p.value + ' (' + p.percent + '%)', color:'#e6eef6', fontSize:11, lineHeight:17 }, labelLine:{ length:16, length2:12, lineStyle:{ color:'#2a3b4f' } }, data:[{ name:'A', value:qd.A || 0 },{ name:'AAAA', value:qd.AAAA || 0 },{ name:'其他', value:(qd.other != null ? qd.other : qd['其他']) || 0 }] }] };
 }
 function refreshCharts(){
   if (!charts.hit) return;
@@ -1459,23 +1460,24 @@ function chartUpOpt(ups){
   });
   return { grid:{ left:116, right:52, top:18, bottom:26 }, xAxis:{ type:'value', ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, formatter:'{value}ms', fontSize:11 } }, yAxis:{ type:'category', data:names, ...baseAxis(), axisLabel:{ ...baseAxis().axisLabel, color:'#b8c6d6', fontSize:12, width:110, overflow:'truncate' } }, series:[{ type:'bar', data, barWidth:10, barCategoryGap:'82%', label:{ show:true, position:'right', color:'#93a2b3', fontSize:11, formatter:(p) => p.value + 'ms' } }], tooltip: baseTooltip('item') };
 }
-function refreshTelemetryUI(){
-  let c, al, m, ups;
+function refreshKpiNums(){
+  // 轻量档(2s pollStatus 复用): 只刷 KPI 数字芯片 / 规则命中分项 / 缓存策略标签 / 缓存文件路径。
+  // 全部是 textContent 写入, 不重建 up-health 表与 TopN DOM。
+  let c, al, m;
   if (MODE === 'real' && real.status){
-    c = real.status.counters; al = real.status.avg_latency_ms; m = real.status.map; ups = real.snapshot ? real.snapshot.upstreams : [];
+    c = real.status.counters; al = real.status.avg_latency_ms; m = real.status.map;
   } else {
     c = sim.counters; al = simAvgLat(); m = { used: sim.cache.size, capacity: config.cacheSize };
-    ups = config.upstreams.filter(u => u.enabled).map(u => { const st = { ok:0, fail:0, latSum:0 }; return { name:u.name, proto:u.proto, addr:u.addr, port:u.port, queries:0, success_rate:100, avg_latency:u.latency, status:'待命' }; });
   }
-  $('#kpi-total').textContent = c.total; $('#kpi-hit').textContent = c.hit; $('#kpi-kd').textContent = (c.kernelDirect !== undefined ? c.kernelDirect : c.kernel_direct) || 0;
+  $('#kpi-total').textContent = c.total; $('#kpi-hit').textContent = c.hit; $('#kpi-kd').textContent = c.kernel_direct || 0;
   $('#kpi-lat').innerHTML = al != null ? al.toFixed(1) + '<span class="u">ms</span>' : '–';
-  $('#kpi-up').textContent = (c.upstreamQueries !== undefined ? c.upstreamQueries : c.upstream_queries) || 0; $('#kpi-err').textContent = c.errors || 0;
+  $('#kpi-up').textContent = c.upstream_queries || 0; $('#kpi-err').textContent = c.errors || 0;
   const rh = (MODE === 'real' && real.status && real.status.rule_hits) ? real.status.rule_hits : {};
-  const rhSum = (rh.block||0) + (rh.domestic||0) + (rh.global||0) + (rh.forceIp||0);
+  const rhSum = (rh.block||0) + (rh.domestic||0) + (rh.global||0) + (rh.forceIp||0) + (rh.allow||0);
   const rhEl = $('#kpi-rule');
   if (rhEl) rhEl.textContent = rhSum;
   const rhSub = $('#kpi-rule-sub');
-  if (rhSub) rhSub.innerHTML = '<span class="rd">屏蔽 ' + (rh.block||0) + '</span><span class="cy">国内 ' + (rh.domestic||0) + '</span><span class="am">国外 ' + (rh.global||0) + '</span><span class="gy">强制IP ' + (rh.forceIp||0) + '</span>';
+  if (rhSub) rhSub.innerHTML = '<span class="rd">屏蔽 ' + (rh.block||0) + '</span><span class="cy">国内 ' + (rh.domestic||0) + '</span><span class="am">国外 ' + (rh.global||0) + '</span><span class="gy">强制IP ' + (rh.forceIp||0) + '</span><span class="gy">放行 ' + (rh.allow||0) + '</span>';
   const cpl = $('#cache-policy-label');
   if (cpl){
     const cp = (MODE === 'real' && real.status && real.status.cache_policy) ? real.status.cache_policy
@@ -1486,6 +1488,16 @@ function refreshTelemetryUI(){
   if (cfEl && MODE === 'real' && real.status && real.status.cache_file){
     cfEl.textContent = real.status.cache_file; cfEl.title = real.status.cache_file;
   } else if (cfEl && MODE === 'sim'){ cfEl.textContent = '（仿真模式不落盘）'; cfEl.title = ''; }
+}
+function refreshTelemetryUI(){
+  let ups;
+  if (MODE === 'real' && real.status){
+    ups = real.snapshot ? real.snapshot.upstreams : [];
+  } else {
+    ups = config.upstreams.filter(u => u.enabled).map(u => { const st = { ok:0, fail:0, latSum:0 }; return { name:u.name, proto:u.proto, addr:u.addr, port:u.port, queries:0, success_rate:100, avg_latency:u.latency, status:'待命' }; });
+  }
+  refreshKpiNums();
+  const m = (MODE === 'real' && real.status) ? real.status.map : { used: sim.cache.size, capacity: config.cacheSize };
   refreshMapUI(m);
   const tb = $('#up-health tbody');
   let h = '';
@@ -1545,7 +1557,9 @@ async function runManualQuery(){
     renderHistory(sim.manualHistory);
   } else {
     const snap = await API.get('/api/snapshot');
-    renderHistory(snap.manual_history || []);
+    // 与 pollSnapshot 一致: 套用"清空"时间过滤, 避免刚清空发新查询时旧历史瞬间闪回
+    const _hist = (snap.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
+    renderHistory(_hist);
   }
 }
 function renderManualResult(result){
@@ -1949,7 +1963,6 @@ function bindConfigEvents(){
     if (MODE !== 'real'){ note('仿真模式使用内置估算延迟, 无需测速', 'var(--text3)'); return; }
     note('正在实测全部上游延迟…', 'var(--amber)');
     try {
-      note('正在实测上游延迟…', 'var(--amber)');
       const res = await API.post('/api/reprobe');
       const rs = res.results || [];
       const okN = rs.filter(r => r.ok).length;
@@ -1961,8 +1974,12 @@ function bindConfigEvents(){
   });
   // 导入域名列表: 取消 prompt 弹窗, 卡片内内联导入行直接执行
   $('#import-action').addEventListener('change', () => {
+    const v = $('#import-action').value;
     const ip = $('#import-ip');
-    if (ip) ip.style.display = ($('#import-action').value === 'forceIp') ? '' : 'none';
+    if (ip) ip.style.display = (v === 'forceIp') ? '' : 'none';
+    // 与 #sub-action 对齐: 仅 group 动作才需要"分组"下拉, 其余动作隐藏避免误显
+    const grp = $('#import-group');
+    if (grp) grp.style.display = (v === 'group') ? '' : 'none';
   });
   async function runImport(){
     if (MODE !== 'real'){ note('仿真模式无法导入, 请连接后端', 'var(--text3)'); return; }
@@ -2016,7 +2033,16 @@ function bindConfigEvents(){
   $('#btn-save-cfg').addEventListener('click', async () => {
     if (MODE === 'real'){
       try {
-        await API.put('/api/config', real.config);
+        // H-1: PUT 前深拷贝配置并剥离 /api/upstreams 合并进来的连接级遥测字段, 避免污染配置对象
+        const cfgCopy = JSON.parse(JSON.stringify(real.config));
+        if (cfgCopy.upstreams) cfgCopy.upstreams.forEach(u => {
+          delete u.conn_avg_lat; delete u.conn_ok; delete u.conn_fail; delete u.conn_key;
+          delete u.status; delete u.last_latency; delete u.queries; delete u.success_rate;
+          delete u.avg_latency;
+          // 注意: latency_measured 是持久化配置字段(非遥测), 不能删除——
+          // 删除后后端把所有上游视为"未测速", 每次保存都触发全量后台重测速。
+        });
+        await API.put('/api/config', cfgCopy);
         // P1-3: 缓存策略(lru<->tinylfu)需重建缓存容器, 保存后自动热重载生效
         const needReload = _cachePolicyDirty;
         if (needReload) _cachePolicyDirty = false;
@@ -2041,7 +2067,7 @@ function bindConfigEvents(){
     }
   });
   $('#btn-reset-cfg').addEventListener('click', () => {
-    if (MODE === 'real'){ API.get('/api/config').then(c => { real.config = c; renderConfig(); note('已重新加载后端配置', 'var(--text3)'); }); }
+    if (MODE === 'real'){ API.get('/api/config').then(c => { real.config = c; renderConfig(); note('已重新加载后端配置', 'var(--text3)'); }).catch(() => note('重新加载配置失败', 'var(--red)')); }
     else { config = JSON.parse(JSON.stringify(DEFAULTS)); renderConfig(); note('已恢复默认 (仿真模式)', 'var(--text3)'); }
   });
   // 热重载: 不重启进程, 重新读取 config.json 并增量应用(容量/规则/geo/策略)
@@ -2053,7 +2079,7 @@ function bindConfigEvents(){
       if (r && r.ok === false){ note('热重载失败: ' + (r.error || '未知错误'), 'var(--red)'); return; }
       const ch = (r && r.changed && r.changed.length) ? r.changed.join('; ') : '无实质变更';
       note('热重载完成: ' + ch, 'var(--green)');
-      API.get('/api/config').then(c => { if (c){ real.config = c; renderConfig(); } });
+      API.get('/api/config').then(c => { if (c){ real.config = c; renderConfig(); } }).catch(() => {});
       if (typeof refreshTelemetryUI === 'function') refreshTelemetryUI();
     } catch(e){ note('热重载失败: ' + e.message, 'var(--red)'); }
   });
@@ -2063,6 +2089,8 @@ function bindConfigEvents(){
     note('正在重启 ebpdns 服务… 控制台将自动重连', 'var(--amber)');
     try {
       await API.post('/api/restart');
+      // M-2: 服务重启后清空前端日志缓冲与控制台, 避免上一轮旧日志残留
+      real.logs = []; real.logSeq = 0; clearLogUI();
       note('重启指令已下发, 服务重启中…', 'var(--amber)');
       setTimeout(() => { if (typeof pollStatus === 'function') pollStatus(); }, 3500);
     } catch(e){ note('重启失败: ' + e.message, 'var(--red)'); }
@@ -2116,8 +2144,10 @@ async function pollStatus(){
     }
     updateTopbar({ qps: real.status.qps, hit_rate: real.status.hit_rate, avg_latency_ms: real.status.avg_latency_ms, map: real.status.map });
     $('#foot-uptime').textContent = 'up ' + Math.floor(real.status.uptime_s/60) + 'm ' + (real.status.uptime_s%60) + 's · v' + (real.status.version || APP_VERSION);
-    // 顶栏与 KPI 卡同一数据源同一轮刷新: 避免"顶部延时与下面延时不同步"
-    if (route === 'telemetry') refreshTelemetryUI();
+    // 顶栏与 KPI 卡同一数据源同一轮刷新: 避免"顶部延时与下面延时不同步"。
+    // 2s 档只刷轻量 KPI 数字(文本节点), up-health 表/TopN/map 的 DOM 重建
+    // 并入 5s pollSnapshot——上游健康秒级才变, 2s 全量重建 DOM 过重。
+    if (route === 'telemetry') refreshKpiNums();
   } catch(e){
     statusFail++;
   }
@@ -2127,7 +2157,9 @@ async function pollSnapshot(){
     real.snapshot = await API.get('/api/snapshot');
     refreshTelemetryUI();
     if (route === 'telemetry') refreshCharts();
-    renderHistory(real.snapshot.manual_history || []);
+    // H-3: 过滤掉「清空」按钮点击之前的历史记录, 防止 pollSnapshot 回填
+    const _hist = (real.snapshot.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
+    renderHistory(_hist);
   } catch(e){}
 }
 async function pollLogs(){
@@ -2145,17 +2177,40 @@ async function pollLogs(){
   } catch(e){}
 }
 async function pollPipeline(){
+  // 路由门控: 仅停留在 pipeline 页才向后端发请求, 其余路由直接跳过,
+  // 避免非 pipeline 页面/后台标签页每 5s 空拉一次响应即丢弃, 无谓占 API 线程。
+  if (route !== 'pipeline') return;
   try {
     real.pipeline = await API.get('/api/pipeline');
-    if (route === 'pipeline') renderPipeline();
+    renderPipeline();
   } catch(e){}
 }
+let _pollTimers = [];
 function startRealPolls(){
   pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
-  setInterval(pollStatus, 1000);
-  setInterval(pollSnapshot, 2500);
-  setInterval(pollLogs, 1500);
-  setInterval(pollPipeline, 5000);
+  // 轮询频率优化: 状态/KPI 2s, 遥测图表 5s, 上游延迟/流水线(仅 pipeline 路由) 5s, 日志 5s。
+  // 原 1s/1.5s 过于频繁, 在浏览器后台标签页与多客户端时无谓占用 API 线程与 CPU。
+  _pollTimers = [
+    setInterval(pollStatus, 2000),
+    setInterval(pollSnapshot, 5000),
+    setInterval(pollLogs, 5000),
+    setInterval(pollPipeline, 5000),
+  ];
+  // 后台标签页暂停全部 REAL 轮询(切回前台立即补一轮再继续), 省 CPU/网络/API 线程
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden){
+      _pollTimers.forEach(t => clearInterval(t));
+      _pollTimers = [];
+    } else if (!_pollTimers.length){
+      pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
+      _pollTimers = [
+        setInterval(pollStatus, 2000),
+        setInterval(pollSnapshot, 5000),
+        setInterval(pollLogs, 5000),
+        setInterval(pollPipeline, 5000),
+      ];
+    }
+  });
   $('#btn-run').style.display = 'none';
   $('#load-seg').style.display = 'none';
   $('#foot-mode').textContent = 'daemon 运行中 · REAL';
@@ -2185,7 +2240,8 @@ function bindEvents(){
   }));
   $('#btn-query').addEventListener('click', runManualQuery);
   $('#q-domain').addEventListener('keydown', e => { if (e.key === 'Enter') runManualQuery(); });
-  $('#btn-qclear').addEventListener('click', () => { if (MODE === 'sim'){ sim.manualHistory = []; renderHistory([]); } else { renderHistory([]); } });
+  // H-3: real 模式后端无清空 manual_history 的端点, 记录时钟游标隐藏点击前的历史 (ts 为 HH:mm:ss.mmm 定宽串, 字典序即可比较)
+  $('#btn-qclear').addEventListener('click', () => { if (MODE === 'sim'){ sim.manualHistory = []; renderHistory([]); } else { real.hiddenHistoryBefore = nowTs(); renderHistory([]); } });
   // 实时日志: 每栏筛选框 + 全局搜索(输入即过滤, 实时生效)
   $$('.lc-filter').forEach(inp => inp.addEventListener('input', () => {
     logFilters[inp.dataset.f] = inp.value;
@@ -2212,7 +2268,7 @@ async function boot(){
     if (s && s.app === 'ebpdns') MODE = 'real';
     if (MODE === 'real'){
       try { real.config = await API.get('/api/config'); real.configPath = (s && s.config_path) || '/etc/ebpdns/config.json'; } catch(e){}
-      appendLogLine({ ts: nowTs(), level: 'sys', msg: 'ebpdns ' + APP_VERSION + ' 已连接后端 daemon · REAL 模式' });
+      appendLogLine({ ts: nowTs(), level: 'sys', msg: 'ebpdns ' + ((s && s.version) ? s.version : APP_VERSION) + ' 已连接后端 daemon · REAL 模式' });
       renderPipeline(); bindEvents(); setRoute(initialRoute); initCharts();
       startRealPolls();
       requestAnimationFrame(frame);

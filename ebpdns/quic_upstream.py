@@ -65,8 +65,13 @@ if _HAVE_AIOQUIC:
                             if k == b":status":
                                 st["status"] = int(v)
                     elif isinstance(he, DataReceived):
-                        st["body"] += he.data
-                        if he.stream_ended:
+                        # H4: 响应体累积上限 _MAX_MSG, 恶意上游持续推数据可 OOM。
+                        # 未超限时按 room 截断追加; 已达上限则丢弃后续字节。
+                        # 达到上限即 set done, 让 waiter 返回并由调用方按失败处理。
+                        if len(st["body"]) < _MAX_MSG:
+                            room = _MAX_MSG - len(st["body"])
+                            st["body"] += he.data[:room]
+                        if he.stream_ended or len(st["body"]) >= _MAX_MSG:
                             st["done"].set()
             except Exception:
                 pass
@@ -89,10 +94,16 @@ if _HAVE_AIOQUIC:
                     st = self._doq.get(event.stream_id)
                     if st is None:
                         return
-                    st["buf"].extend(event.data)
+                    # H4: 流缓冲累积上限 _MAX_MSG, 超限丢弃后续字节并 set done,
+                    # 由 _doq_exchange 按长度校验判定失败(防恶意上游 OOM)。
+                    if len(st["buf"]) < _MAX_MSG:
+                        room = _MAX_MSG - len(st["buf"])
+                        st["buf"].extend(event.data[:room])
                     if event.end_stream:
                         if st["n"] < 0 and len(st["buf"]) >= 2:
                             st["n"] = struct.unpack(">H", bytes(st["buf"][:2]))[0]
+                        st["done"].set()
+                    elif len(st["buf"]) >= _MAX_MSG:
                         st["done"].set()
                 elif isinstance(event, StreamReset):
                     st = self._doq.get(event.stream_id)
@@ -138,8 +149,17 @@ class _QuicUpstream:
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         self._loop.set_exception_handler(self._loop_exc_handler)
-        self._loop.run_until_complete(self._maintain())
-        self._loop.close()
+        try:
+            self._loop.run_until_complete(self._maintain())
+        finally:
+            # 无论 _maintain 正常返回还是被取消/抛异常(CancelledError/连接清理期
+            # 未预期错误), 都必须关闭事件循环释放 fd/定时器, 否则重连或关闭路径
+            # 上一次未收尾的 loop 会泄漏(虽为 daemon 线程, 但 loop 持有的
+            # socket/timer 在进程退出前不释放)。
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _loop_exc_handler(loop, context):

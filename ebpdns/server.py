@@ -89,7 +89,15 @@ class _UDPHandler:
     def bind(self, spec):
         host, port = parse_bind(spec)
         self.sock = make_udp_socket(host)
-        self.sock.bind((host, port))
+        try:
+            self.sock.bind((host, port))
+        except OSError:
+            # bind 失败(如 udp6 无 IPv6 栈): 关闭已创建的 socket 防 fd 泄漏, 再向上抛
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            raise
         self.sock.settimeout(0.5)
         return self.sock.getsockname()
 
@@ -200,6 +208,10 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
     # 覆盖绝大多数 systemd 快速重启场景, 避免 TCP6/TCP 端口冲突告警
     _bind_retries = 3
     _bind_retry_interval = 0.2
+    # 并发连接数上限: ThreadingTCPServer 每连接一线程, 无上限会被海量短连接
+    # 拖垮线程数。用有界信号量限流(类变量, tcp/tcp6 共享总额度)。
+    # 达到上限时 process_request 在 accept 线程阻塞等待, 形成背压而非炸线程。
+    _conn_slots = threading.BoundedSemaphore(256)
 
     def __init__(self, resolver, spec):
         self.resolver = resolver
@@ -207,6 +219,22 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
         if is_ipv6_host(host):
             self.address_family = socket.AF_INET6
         super().__init__((host, port), _TCPRequestHandler)
+
+    def process_request(self, request, client_address):
+        # 新连接先占槽位; 满了就在此处阻塞(背压), 而不是无界派生线程
+        self._conn_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            # 连接处理结束(无论正常/异常)释放槽位
+            self._conn_slots.release()
 
     def server_bind(self):
         """绑定 socket, 失败时自动重试(解决重启 TIME_WAIT 端口冲突)。"""
@@ -255,7 +283,12 @@ class DNSServer:
 
     def _start_udp(self, spec, attr, name):
         handler = _UDPHandler(self.resolver)
-        addr = handler.bind(spec)
+        try:
+            addr = handler.bind(spec)
+        except OSError:
+            # bind 失败: 回收 __init__ 已创建的线程池, 防 worker 线程残留
+            handler.stop()
+            raise
         setattr(self, attr, handler)
         t = threading.Thread(target=handler.serve_forever, name=name, daemon=True)
         t.start()
