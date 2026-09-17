@@ -221,10 +221,14 @@ def parse_upstream_addr(raw, proto_sel=None):
         if proto in ("doh", "doh3", "doq"):
             url = p if p.startswith("/") else "/" + p
         host = host[:slash]
-    colon = host.rfind(":")
-    if colon > 0 and host[colon + 1:].isdigit():
-        port = int(host[colon + 1:])
-        host = host[:colon]
+    # 端口切分: 先排除裸 IPv6 字面量(含多个冒号且未用方括号包裹),
+    # 否则 rfind(":") 会把 2606:4700::1 的末段 ":1" 误切为 port=1。
+    # 裸 IPv6 整体作为 host, 不切端口; 带方括号形式 [v6]:port 由 _host_port 解析。
+    if not (host.count(":") > 1 and not host.startswith("[")):
+        colon = host.rfind(":")
+        if colon > 0 and host[colon + 1:].isdigit():
+            port = int(host[colon + 1:])
+            host = host[:colon]
     if not host:
         return None
     # 宽松校验 host: IP / 域名 / IPv6 字面量(带括号)

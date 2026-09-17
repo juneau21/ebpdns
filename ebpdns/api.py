@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -10,6 +11,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import http.client
+import socket as _socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__, config as config_mod
@@ -19,56 +22,130 @@ from .probe import probe_upstream_latencies
 log = logging.getLogger("ebpdns.api")
 from . import upstream, quic_upstream, dnsmsg
 
+# 上游/规则 id 生成器: 毫秒时间戳 + 进程内自增后缀, 消除同一毫秒 POST 两个
+# 上游/规则拿到相同 id 的碰撞窗口(按 id next(...) 定位只会命中第一个)。
+_id_seq = iter(range(1, 1 << 30))
+_id_seq_lock = threading.Lock()
+
+
+def _new_id(prefix):
+    with _id_seq_lock:
+        seq = next(_id_seq)
+    return "%s%d%04x" % (prefix, int(time.time() * 1000), seq & 0xFFFF)
+
 
 def _sub_url_blocked(url):
     """SSRF 防护: 解析订阅 URL 的主机名, 拒绝指向私有/环回/链路本地地址。
     解析出的任何一个 IP 命中即拒绝(防止 DNS rebinding 到内网)。
-    返回 None 表示放行, 返回错误字符串表示拒绝原因。"""
+    返回 (block_reason_or_None, [validated_public_ips]):
+      block_reason 非 None 表示拒绝; 否则第二个元素为该 hostname 解析出的全部公网 IP,
+      供连接层钉死(TCP 直连该 IP, Host/SNI 仍用原 hostname), 消除检查→连接间的
+      DNS rebinding TOCTOU 窗口。"""
     import ipaddress
-    import socket
     try:
         parsed = urllib.parse.urlparse(url)
     except Exception:
-        return "订阅 URL 解析失败"
+        return "订阅 URL 解析失败", []
     host = parsed.hostname or ""
     if not host:
-        return "订阅 URL 缺少主机名"
+        return "订阅 URL 缺少主机名", []
     # 主机名本身就是 IP: 直接判定
     try:
         ips = [ipaddress.ip_address(host)]
     except ValueError:
         ips = []
         try:
-            for fam, _t, _p, _c, sa in socket.getaddrinfo(host, parsed.port or 80):
+            for fam, _t, _p, _c, sa in _socket.getaddrinfo(host, parsed.port or 80):
                 try:
                     ips.append(ipaddress.ip_address(sa[0]))
                 except ValueError:
                     pass
         except OSError:
-            return "订阅主机名解析失败"
+            return "订阅主机名解析失败", []
     if not ips:
-        return "订阅主机名无可用 IP"
+        return "订阅主机名无可用 IP", []
     for ip in ips:
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)"
-    return None
+            return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)", []
+    return None, [str(ip) for ip in ips]
+
+
+class _PinnedHTTPConn(http.client.HTTPConnection):
+    """TCP 直连"已通过 SSRF 校验的公网 IP", 而非让 urllib 二次解析 hostname。
+
+    钉死 IP 后, 检查时刻(公网)与连接时刻(同一公网 IP)不再有 DNS rebinding 窗口;
+    Host 头仍由 urllib 按原 hostname 发送, 虚拟主机/反向代理路由不受影响。
+    pinned_ip 由 per-request 子类属性注入(见 _PinnedHTTPHandler), 线程安全。"""
+    pinned_ip = None
+
+    def connect(self):
+        self.sock = _socket.create_connection(
+            (self.pinned_ip or self.host, self.port), timeout=self.timeout)
+
+
+class _PinnedHTTPSConn(http.client.HTTPSConnection):
+    """HTTPS 版本: TCP 钉到已验公网 IP, TLS 握手 server_hostname=原 hostname
+    (SNI + 证书按 hostname 校验, 与 DoH 手工 TLS 路径一致)。"""
+    pinned_ip = None
+
+    def connect(self):
+        raw = _socket.create_connection(
+            (self.pinned_ip or self.host, self.port), timeout=self.timeout)
+        ctx = ssl.create_default_context()
+        self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    """用钉死 IP 的连接类发起 http 请求。"""
+
+    def http_open(self, req):
+        pinned = getattr(req, "pinned_ip", None)
+
+        class C(_PinnedHTTPConn):
+            pinned_ip = pinned
+
+        return self.do_open(C, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """用钉死 IP 的连接类发起 https 请求(SNI=原 hostname)。"""
+
+    def https_open(self, req):
+        pinned = getattr(req, "pinned_ip", None)
+
+        class C(_PinnedHTTPSConn):
+            pinned_ip = pinned
+
+        return self.do_open(C, req)
 
 
 class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
     """每跳重定向都重新过 SSRF 检查: 初始 URL 在外网但 302 跳到内网
-    (http://169.254.169.254/ 云元数据等) 时, 必须在 redirect_request 拦截。"""
+    (http://169.254.169.254/ 云元数据等) 时, 必须在 redirect_request 拦截。
+    复检通过后把该跳新 hostname 已验公网 IP 钉到新请求, 复用初始请求的防
+    rebinding 逻辑。"""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        blocked = _sub_url_blocked(newurl)
+        blocked, ips = _sub_url_blocked(newurl)
         if blocked:
             raise urllib.error.HTTPError(
                 req.full_url, code, "redirect blocked: %s" % blocked, headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            new_req.pinned_ip = ips[0] if ips else None
+        return new_req
 
 
-# 模块级复用: 带 SSRF 重定向校验的 opener(替代默认 urlopen)
-_SSRF_OPENER = urllib.request.build_opener(_SSRFRedirectHandler)
+# 模块级复用: 带 SSRF 重定向校验 + IP 钉死的 opener(替代默认 urlopen)。
+# 显式禁用代理(ProxyHandler({})): 走代理会由代理重新解析 DNS, 既破坏 IP 钉死,
+# 也可能被恶意配置的代理绕过 SSRF 检查; 订阅拉取必须直连已验公网 IP。
+# 残余风险说明: 多 IP 轮询域名只钉第一个已验公网 IP; 若该 IP 当时可达即可,
+# 后续不再二次解析。已检查-连接间的 rebinding 窗口被消除; 不引入新的连接失败
+# (pinned_ip 为空时回退原 hostname 直连, 行为与改造前一致)。
+_SSRF_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _SSRFRedirectHandler, _PinnedHTTPHandler, _PinnedHTTPSHandler)
 
 # 订阅响应大小上限: 16MB, 防止恶意/损坏订阅把整份内容读入内存(OOM)
 SUB_TEXT_MAX_BYTES = 16 * 1024 * 1024
@@ -76,14 +153,15 @@ SUB_TEXT_MAX_BYTES = 16 * 1024 * 1024
 
 def fetch_subscription_text(url, timeout=20):
     """拉取订阅文本(共享实现, 三处共用):
-    1. 初始 URL 过 SSRF 检查(拒绝内网/环回/链路本地);
-    2. 用带每跳重定向复检的 opener 打开, 防止 302 跳到内网绕过 SSRF;
+    1. 初始 URL 过 SSRF 检查(拒绝内网/环回/链路本地)并取得已验公网 IP;
+    2. 用带每跳重定向复检 + IP 钉死的 opener 打开, 防 302 跳内网 & DNS rebinding;
     3. 流式 read(65536) 累积, 超过 SUB_TEXT_MAX_BYTES(16MB) 立即中止。
     返回解码后的 str; 被阻止或超限时抛 ValueError。"""
-    blocked = _sub_url_blocked(url)
+    blocked, ips = _sub_url_blocked(url)
     if blocked:
         raise ValueError(blocked)
     req = urllib.request.Request(url, headers={"User-Agent": "ebpdns/subscribe"})
+    req.pinned_ip = ips[0] if ips else None
     with _SSRF_OPENER.open(req, timeout=timeout) as r:
         chunks = []
         total = 0
@@ -384,16 +462,18 @@ class _Handler(BaseHTTPRequestHandler):
         app = self.app
         tel = app.telemetry
         cache = app.resolver.cache
+        _counters, _rule_hits, _hit_rate, _qps, _avg_lat = tel.counters_snapshot()
         return {
             "app": "ebpdns",
             "version": __version__,
             "uptime_s": int(time.time() - tel.boot_time),
             "running": True,
-            "qps": tel.current_qps(),
-            "hit_rate": round(tel.hit_rate(), 1),
-            "avg_latency_ms": round(tel.avg_latency(), 1) if tel.avg_latency() is not None else None,
-            "counters": dict(tel.counters),
-            "rule_hits": dict(tel.rule_hits),
+            "qps": _qps,
+            "hit_rate": round(_hit_rate, 1),
+            "avg_latency_ms": round(_avg_lat, 1) if _avg_lat is not None else None,
+            # 锁内拷贝 counters/rule_hits, 避免 reset 瞬间读到不自洽中间态
+            "counters": _counters,
+            "rule_hits": _rule_hits,
             "map": cache.summary(),
             "cache_policy": str(self.app.cfg.get("cache_policy", "lru")).lower(),
             "health_check_interval": int(self.app.cfg.get("health_check_interval", 30) or 0),
@@ -460,9 +540,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_reprobe(self):
         """一键重新测速：强制对所有启用上游重新实测延迟并写回配置。"""
-        with self.app._lock:
-            results = probe_upstream_latencies(self.app.cfg, self.app.config_path,
-                                               force=True, tag="重新测速")
+        # 网络探测在锁外进行(避免多上游时阻塞所有 API 操作数秒),
+        # 锁内按 id 合并回写(与 _api_add_upstream 的 app_ctx 范式对齐,
+        # probe.py 内部已实现进锁重读最新 cfg + 按 id 合并 + save_config)。
+        results = probe_upstream_latencies(self.app.cfg, self.app.config_path,
+                                           force=True, tag="重新测速", app_ctx=self.app)
         return self._send(200, {"ok": True, "results": results})
 
     def _api_profile(self, query):
@@ -531,12 +613,19 @@ class _Handler(BaseHTTPRequestHandler):
         old_policy = "lru"
         old_ups = []
         old_cfg = None
+        old_cache = None
+        old_capacity = None
         try:
             with self.app._lock:
                 old_cfg = self.app.cfg   # 回滚用: 合并失败时还原旧配置引用
                 old_ups = list(old_cfg.get("upstreams", []))
                 old_by_id = {u.get("id"): u for u in old_ups}
                 old_policy = str(old_cfg.get("cache_policy", "lru")).lower()
+                # 回滚用: cache.capacity 可能已在下方被改, cache 对象可能被
+                # switch_cache_policy 整体替换; 异常时必须一并还原, 否则缓存策略/容量
+                # 停留在半应用状态, 与回滚后的 cfg 不一致。
+                old_cache = self.app.resolver.cache
+                old_capacity = getattr(old_cache, "capacity", None)
                 self.app.cfg = config_mod.deep_merge(old_cfg, data)
                 # deep_merge 返回新 dict, resolver/DNSServer 持有旧引用。
                 # 必须重绑定, 否则除 cache_size 外的配置(ttl/预取/测速/超时/IPv6/
@@ -609,6 +698,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self.app.resolver.cfg = old_cfg
             except Exception:
                 pass
+            # 还原缓存容量与 cache 对象(switch_cache_policy 可能已整体替换)
+            try:
+                if old_cache is not None:
+                    if old_capacity is not None:
+                        old_cache.capacity = old_capacity
+                    self.app.resolver.cache = old_cache
+            except Exception:
+                pass
             return self._send(500, {"error": "apply config failed: %s" % e})
         # 新增上游自动实测延迟: 只测启用且未实测过的上游(新添加的), 后台线程不阻塞响应
         try:
@@ -618,7 +715,8 @@ class _Handler(BaseHTTPRequestHandler):
                 def _probe():
                     try:
                         probe.probe_upstream_latencies(self.app.cfg, self.app.config_path,
-                                                       force=False, tag="新增测速")
+                                                       force=False, tag="新增测速",
+                                                       app_ctx=self.app)
                     except Exception:
                         pass
                 threading.Thread(target=_probe, daemon=True, name="newup-probe").start()
@@ -695,7 +793,7 @@ class _Handler(BaseHTTPRequestHandler):
             parsed = config_mod.parse_upstream_addr(addr_raw, body.get("proto"))
         if parsed is not None:
             u = {
-                "id": "u%d" % int(time.time() * 1000),
+                "id": _new_id("u"),
                 "name": body.get("name") or "上游 %d" % (len(cfg["upstreams"]) + 1),
                 "proto": parsed["proto"],
                 "addr": parsed["addr"],
@@ -715,7 +813,8 @@ class _Handler(BaseHTTPRequestHandler):
                 from . import probe
                 threading.Thread(target=probe.probe_upstream_latencies,
                                  args=(cfg, self.app.config_path),
-                                 kwargs={"force": False, "tag": "新增测速"},
+                                 kwargs={"force": False, "tag": "新增测速",
+                                         "app_ctx": self.app},
                                  daemon=True, name="newup-probe").start()
             except Exception:
                 pass
@@ -732,7 +831,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             url = ""
         u = {
-            "id": "u%d" % int(time.time() * 1000),
+            "id": _new_id("u"),
             "name": body.get("name") or "上游 %d" % (len(cfg["upstreams"]) + 1),
             "proto": proto,
             "addr": body.get("addr") or "223.5.5.5",
@@ -752,7 +851,8 @@ class _Handler(BaseHTTPRequestHandler):
             from . import probe
             threading.Thread(target=probe.probe_upstream_latencies,
                              args=(cfg, self.app.config_path),
-                             kwargs={"force": False, "tag": "新增测速"},
+                             kwargs={"force": False, "tag": "新增测速",
+                                     "app_ctx": self.app},
                              daemon=True, name="newup-probe").start()
         except Exception:
             pass
@@ -821,7 +921,6 @@ class _Handler(BaseHTTPRequestHandler):
         with self.app._lock:
             rules = self._local_rules()
             existing = {r.get("match") for r in rules}
-            base = int(time.time() * 1000)
             added = 0
             for d in domains:
                 m = d
@@ -830,7 +929,7 @@ class _Handler(BaseHTTPRequestHandler):
                     m = "*." + d
                 if m in existing:
                     continue
-                r = {"id": "r%d" % (base + added), "match": m, "action": action}
+                r = {"id": _new_id("r"), "match": m, "action": action}
                 if action == "group":
                     r["group"] = group
                 elif action == "forceIp":
@@ -862,35 +961,38 @@ class _Handler(BaseHTTPRequestHandler):
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
         items = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
-        cfg = self.app.cfg
-        subs = self._load_subs()
-        existed = False
-        for s in subs:
-            if s.get("url") == url:
-                s["action"], s["group"], s["ip"] = action, group, ip
-                s["rules"] = items
-                s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                existed = True
-                break
-        if not existed:
-            subs.append({"url": url, "action": action, "group": group, "ip": ip,
-                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "rules": items})
-        self._save_subs(subs)
-        meta = cfg.setdefault("rule_subscriptions", [])
-        for m in meta:
-            if m.get("url") == url:
-                m.update({"action": action, "group": group, "ip": ip, "count": len(items),
-                          "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-                break
-        else:
-            meta.append({"url": url, "action": action, "group": group, "ip": ip,
-                         "count": len(items), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-        config_mod.save_config(cfg, self.app.config_path)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
+        # 读改写全程持 app._lock(网络下载已在锁外完成), 与 _api_update_config/reload
+        # 串行化, 防持旧 cfg 引用被并发整体替换后 save_config 静默覆盖丢配置。
+        with self.app._lock:
+            cfg = self.app.cfg   # 进锁后重新取最新引用
+            subs = self._load_subs()
+            existed = False
+            for s in subs:
+                if s.get("url") == url:
+                    s["action"], s["group"], s["ip"] = action, group, ip
+                    s["rules"] = items
+                    s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    existed = True
+                    break
+            if not existed:
+                subs.append({"url": url, "action": action, "group": group, "ip": ip,
+                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "rules": items})
+            self._save_subs(subs)
+            meta = cfg.setdefault("rule_subscriptions", [])
+            for m in meta:
+                if m.get("url") == url:
+                    m.update({"action": action, "group": group, "ip": ip, "count": len(items),
+                              "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                    break
+            else:
+                meta.append({"url": url, "action": action, "group": group, "ip": ip,
+                             "count": len(items), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            config_mod.save_config(cfg, self.app.config_path)
+            try:
+                self.app.resolver.rebuild_rule_index()
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
         return self._send(200, {"ok": True, "subscribed": True, "url": url,
                                 "count": len(items), "added": 0 if existed else 1})
 
@@ -907,7 +1009,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         r = {
-            "id": "r%d" % int(time.time() * 1000),
+            "id": _new_id("r"),
             "match": body.get("match") or "*.example.com",
             "action": body.get("action") or "group",
             "group": body.get("group") or "domestic",
@@ -1032,36 +1134,38 @@ class _Handler(BaseHTTPRequestHandler):
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
         items = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
-        cfg = self.app.cfg
-        subs = self._load_subs()
-        existed = False
-        for s in subs:
-            if s.get("url") == url:
-                s["action"], s["group"], s["ip"] = action, group, ip
-                s["rules"] = items
-                s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                existed = True
-                break
-        if not existed:
-            subs.append({"url": url, "action": action, "group": group, "ip": ip,
-                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "rules": items})
-        self._save_subs(subs)
-        # 元信息写入 config.json(仅链接/动作/数量/时间, 不含域名明细)
-        meta = cfg.setdefault("rule_subscriptions", [])
-        for m in meta:
-            if m.get("url") == url:
-                m.update({"action": action, "group": group, "ip": ip, "count": len(items),
-                          "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-                break
-        else:
-            meta.append({"url": url, "action": action, "group": group, "ip": ip,
-                         "count": len(items), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-        config_mod.save_config(cfg, self.app.config_path)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
+        # 读改写全程持 app._lock(下载在锁外), 与本地规则 CRUD/upstream CRUD 同型。
+        with self.app._lock:
+            cfg = self.app.cfg   # 进锁后重新取最新引用
+            subs = self._load_subs()
+            existed = False
+            for s in subs:
+                if s.get("url") == url:
+                    s["action"], s["group"], s["ip"] = action, group, ip
+                    s["rules"] = items
+                    s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    existed = True
+                    break
+            if not existed:
+                subs.append({"url": url, "action": action, "group": group, "ip": ip,
+                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "rules": items})
+            self._save_subs(subs)
+            # 元信息写入 config.json(仅链接/动作/数量/时间, 不含域名明细)
+            meta = cfg.setdefault("rule_subscriptions", [])
+            for m in meta:
+                if m.get("url") == url:
+                    m.update({"action": action, "group": group, "ip": ip, "count": len(items),
+                              "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                    break
+            else:
+                meta.append({"url": url, "action": action, "group": group, "ip": ip,
+                             "count": len(items), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            config_mod.save_config(cfg, self.app.config_path)
+            try:
+                self.app.resolver.rebuild_rule_index()
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
         return self._send(200, {"ok": True, "url": url, "count": len(items),
                                 "added": 0 if existed else 1})
 
@@ -1069,9 +1173,9 @@ class _Handler(BaseHTTPRequestHandler):
         """POST /api/rules/subscribe/update {url}: 重新拉取订阅并覆盖明细。"""
         body = self._read_json() or {}
         url = (body.get("url") or "").strip()
-        subs = self._load_subs()
-        target = next((s for s in subs if s.get("url") == url), None)
-        if not target:
+        # 下载前的存在性快速预检(锁外, 仅优化; 权威判定在进锁后重做)
+        subs_pre = self._load_subs()
+        if not any(s.get("url") == url for s in subs_pre):
             return self._send(404, {"error": "订阅不存在: %s" % url})
         try:
             text = self._fetch_sub_text(url)
@@ -1080,21 +1184,27 @@ class _Handler(BaseHTTPRequestHandler):
         domains = _parse_domain_list(text)
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
-        target["rules"] = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
-        target["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        self._save_subs(subs)
-        cfg = self.app.cfg
-        for m in cfg.setdefault("rule_subscriptions", []):
-            if m.get("url") == url:
-                m["count"] = len(domains)
-                m["updated_at"] = target["updated_at"]
-                break
-        config_mod.save_config(cfg, self.app.config_path)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
+        # 读改写全程持 app._lock(下载在锁外), 进锁后重新取 subs/cfg 最新引用。
+        with self.app._lock:
+            subs = self._load_subs()
+            target = next((s for s in subs if s.get("url") == url), None)
+            if not target:
+                return self._send(404, {"error": "订阅不存在: %s" % url})
+            target["rules"] = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
+            target["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._save_subs(subs)
+            cfg = self.app.cfg
+            for m in cfg.setdefault("rule_subscriptions", []):
+                if m.get("url") == url:
+                    m["count"] = len(domains)
+                    m["updated_at"] = target["updated_at"]
+                    break
+            config_mod.save_config(cfg, self.app.config_path)
+            try:
+                self.app.resolver.rebuild_rule_index()
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
         return self._send(200, {"ok": True, "url": url, "count": len(domains)})
 
     def _api_subscribe_delete(self, query):
@@ -1102,20 +1212,22 @@ class _Handler(BaseHTTPRequestHandler):
         url = urllib.parse.unquote((query.get("url") or [""])[0]).strip()
         if not url:
             return self._send(400, {"error": "缺少 url 参数"})
-        subs = self._load_subs()
-        n = len(subs)
-        subs = [s for s in subs if s.get("url") != url]
-        if len(subs) == n:
-            return self._send(404, {"error": "订阅不存在: %s" % url})
-        self._save_subs(subs)
-        cfg = self.app.cfg
-        cfg["rule_subscriptions"] = [m for m in cfg.get("rule_subscriptions", []) if m.get("url") != url]
-        config_mod.save_config(cfg, self.app.config_path)
-        try:
-            self.app.resolver.rebuild_rule_index()
-        except Exception as e:
-            import logging as _lg
-            _lg.exception("rebuild_rule_index 失败: %s", e)
+        # 读改写全程持 app._lock, 进锁后重新取 subs/cfg 最新引用。
+        with self.app._lock:
+            subs = self._load_subs()
+            n = len(subs)
+            subs = [s for s in subs if s.get("url") != url]
+            if len(subs) == n:
+                return self._send(404, {"error": "订阅不存在: %s" % url})
+            self._save_subs(subs)
+            cfg = self.app.cfg
+            cfg["rule_subscriptions"] = [m for m in cfg.get("rule_subscriptions", []) if m.get("url") != url]
+            config_mod.save_config(cfg, self.app.config_path)
+            try:
+                self.app.resolver.rebuild_rule_index()
+            except Exception as e:
+                import logging as _lg
+                _lg.exception("rebuild_rule_index 失败: %s", e)
         return self._send(200, {"ok": True, "url": url})
 
     def _api_rule_op(self, rid):
@@ -1169,7 +1281,12 @@ class _Handler(BaseHTTPRequestHandler):
             since = int((query.get("since") or ["0"])[0])
         except (ValueError, TypeError):
             since = 0
-        events = [e for e in self.app.telemetry.events if e.get("seq", 0) > since]
+        # 在 telemetry 锁内取一份 events 快照, 避免无锁迭代 deque 时与写入交错
+        # (CPython deque 迭代 GIL 安全不会崩, 但 total/next_seq 两次读可能不一致)。
+        tm = self.app.telemetry
+        with tm._lock:
+            snap = list(tm.events)
+        events = [e for e in snap if e.get("seq", 0) > since]
         q = (query.get("q") or [""])[0].strip().lower()
         level = (query.get("level") or [""])[0].strip().lower()
         qtype = (query.get("qtype") or [""])[0].strip().upper()
@@ -1205,8 +1322,8 @@ class _Handler(BaseHTTPRequestHandler):
                         continue
                 f.append(e)
             events = f
-        return {"events": events, "total": len(self.app.telemetry.events),
-                "next_seq": max([e.get("seq", 0) for e in self.app.telemetry.events] or [0])}
+        return {"events": events, "total": len(snap),
+                "next_seq": max([e.get("seq", 0) for e in snap] or [0])}
 
     def _pipeline(self):
         cfg = self.app.cfg
@@ -1224,7 +1341,7 @@ class _Handler(BaseHTTPRequestHandler):
         app = self.app
         tel = app.telemetry
         cache = app.resolver.cache
-        c = tel.counters
+        c, rh, _hr, _qps, _al = tel.counters_snapshot()
         lines = [
             "# HELP ebpdns_queries_total 累计查询总数",
             "# TYPE ebpdns_queries_total counter",
@@ -1246,13 +1363,13 @@ class _Handler(BaseHTTPRequestHandler):
             "ebpdns_stale_served_total %d" % c.get("stale_served", 0),
             "# HELP ebpdns_hit_rate 命中率",
             "# TYPE ebpdns_hit_rate gauge",
-            "ebpdns_hit_rate %s" % round(tel.hit_rate(), 3),
+            "ebpdns_hit_rate %s" % round(_hr, 3),
             "# HELP ebpdns_qps 每秒查询数",
             "# TYPE ebpdns_qps gauge",
-            "ebpdns_qps %s" % round(tel.current_qps(), 3),
+            "ebpdns_qps %s" % round(_qps, 3),
             "# HELP ebpdns_avg_latency_ms 平均延迟毫秒",
             "# TYPE ebpdns_avg_latency_ms gauge",
-            "ebpdns_avg_latency_ms %s" % (round(tel.avg_latency(), 3) if tel.avg_latency() is not None else 0),
+            "ebpdns_avg_latency_ms %s" % (round(_al, 3) if _al is not None else 0),
             "# HELP ebpdns_cache_entries 缓存条目数",
             "# TYPE ebpdns_cache_entries gauge",
             "ebpdns_cache_entries %d" % cache.size(),
@@ -1265,7 +1382,7 @@ class _Handler(BaseHTTPRequestHandler):
             "# HELP ebpdns_rule_hits 规则命中统计",
             "# TYPE ebpdns_rule_hits gauge",
         ]
-        for k, v in (tel.rule_hits or {}).items():
+        for k, v in rh.items():
             lines.append('ebpdns_rule_hits{rule="%s"} %d' % (k, v))
         lines.append("# HELP ebpdns_upstream_health 上游健康度(成功次数, 延迟ms)")
         lines.append("# TYPE ebpdns_upstream_health gauge")

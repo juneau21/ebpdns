@@ -938,7 +938,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.60";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.68";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[], hiddenHistoryBefore:null };
 const API = {
   async req(method, path, body){
@@ -1256,7 +1256,7 @@ function appendLogLine(line, skipFilter){
 function renderLogBatch(events, triggerPacket){
   events.forEach(line => {
     appendLogLine(line);
-    if (triggerPacket) spawnPacket(line.domain || line.msg.split(' ')[0], line.level === 'hit', line.level === 'err', 0);
+    if (triggerPacket) spawnPacket(line.domain || (line.msg || '').split(' ')[0], line.level === 'hit', line.level === 'err', 0);
   });
 }
 function clearLogUI(){ consoleBody.innerHTML = ''; $('#log-count').textContent = '0 events · 显示 0'; }
@@ -1284,9 +1284,11 @@ const STN_ICONS = {
   server:'<rect x="4" y="4" width="16" height="6" rx="1.5"/><rect x="4" y="14" width="16" height="6" rx="1.5"/><path d="M7.5 7h.01M7.5 17h.01"/>'
 };
 function stnHTML(x, y, w, icon, nm, sub, cls){
+  // nm/sub 可能来自用户配置(上游 name/addr)或后端配置(hook/map_type), 统一转义,
+  // 防止上游名含 <img onerror=...> 这类自 XSS 在 pipeline 页执行。
   return '<div class="stn ' + cls + '" style="left:' + x + '%;top:' + y + '%;width:' + w + '%;transform:translate(-50%,-50%)">' +
     '<div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + icon + '</svg></div>' +
-    '<div class="nm">' + nm + '</div><div class="sub">' + sub + '</div></div>';
+    '<div class="nm">' + esc(nm) + '</div><div class="sub">' + esc(sub) + '</div></div>';
 }
 function addFlow(parent, x1, y1, x2, y2, cls, dir){
   const f = document.createElement('div'); f.className = 'flow ' + cls;
@@ -1298,14 +1300,23 @@ function addFlow(parent, x1, y1, x2, y2, cls, dir){
   else { hd.style.left = (x2 - 0.32) + '%'; hd.style.top = (y2 - 0.25) + '%'; }
   f.appendChild(ln); f.appendChild(hd); parent.appendChild(f);
 }
-function renderPipeline(){
+let _pipelineSig = '';
+function renderPipeline(force){
   const rail = $('#rail'); if (!rail) return;
-  rail.innerHTML = '';
-  sim.packets.forEach(p => p.el.remove()); sim.packets = [];
   const c = MODE === 'real' ? (real.pipeline || {}) : {};
   const hook = c.hook || config.hook, mapType = c.map_type || config.mapType, cacheSize = c.cache_size || config.cacheSize;
   const kdirect = MODE === 'real' ? (c.kernel_direct !== undefined ? c.kernel_direct : config.kernel_direct) : config.kernel_direct;
   const ups = MODE === 'real' ? (c.upstreams || []) : config.upstreams.filter(u => u.enabled).slice(0, 3);
+  // L1: 站点/连线重建与在途包清理分离。仅由 hook/mapType/cacheSize/kdirect 及前 3
+  // 上游 name/proto/addr 构成的结构签名变化时才整站重建并清包; 5s 周期 poll 结构
+  // 未变时跳过重建, 保留飞行中的数据包动画(不再走到一半被 rail.innerHTML='' 抹掉)。
+  // 进 pipeline 路由时 force=true 强制重建(切回时清旧包)。
+  const sig = [hook, mapType, cacheSize, kdirect,
+    ups.slice(0, 3).map(u => (u.name||'') + '|' + (u.proto||'') + '|' + (u.addr||'')).join(';')].join('~');
+  if (!force && sig === _pipelineSig) return;
+  _pipelineSig = sig;
+  rail.innerHTML = '';
+  sim.packets.forEach(p => p.el.remove()); sim.packets = [];
   rail.insertAdjacentHTML('beforeend', stnHTML(ST.client.x, ST.client.y, 13, STN_ICONS.server, '客户端', 'LAN / Pod · 发往 :53', ''));
   rail.insertAdjacentHTML('beforeend', stnHTML(ST.xdp.x, ST.xdp.y, 13, STN_ICONS.xdp, 'XDP Hook', hook + ' · 报文旁路', 'hot'));
   rail.insertAdjacentHTML('beforeend', stnHTML(ST.cache.x, ST.cache.y, 14, STN_ICONS.cache, 'BPF 缓存', mapType + ' · ' + cacheSize + ' 条目' + (kdirect ? ' · 缓存直答' : ''), 'hot'));
@@ -1348,10 +1359,13 @@ function posAt(p, elp){
   const b = p.waypoints[p.waypoints.length - 1]; return { x: b.x, y: b.y };
 }
 function frame(now){
+  // 路由门控 + 后台标签页短路: 非 pipeline 路由或 document.hidden 时不再遍历包内
+  // DOM 定位, 仅维持 rAF 递归(切回 pipeline 即恢复)。消除切走路由后每帧 60fps 空转。
+  if (route !== 'pipeline' || document.hidden){ requestAnimationFrame(frame); return; }
   for (let i = sim.packets.length - 1; i >= 0; i--){
     const p = sim.packets[i], elp = now - p.start;
     if (elp >= p.dur){ if (p.el.parentNode) p.el.parentNode.removeChild(p.el); sim.packets.splice(i, 1); continue; }
-    if (route === 'pipeline'){ const pos = posAt(p, elp); p.el.style.left = pos.x + '%'; p.el.style.top = pos.y + '%'; }
+    const pos = posAt(p, elp); p.el.style.left = pos.x + '%'; p.el.style.top = pos.y + '%';
   }
   requestAnimationFrame(frame);
 }
@@ -1378,7 +1392,12 @@ function setRoute(r){
       API.get('/api/config').then(c => { real.config = c; renderConfig(); }).catch(() => {});
     } else renderConfig();
   }
-  if (r === 'pipeline') renderPipeline();
+  if (r === 'pipeline'){
+    renderPipeline(true);   // 切回 pipeline 强制重建站点/连线并清旧包残影
+    // 立即补一轮 pollPipeline: 若启动后一直停在别的路由, real.pipeline 可能是
+    // 启动时残留或 null, 否则真实流水线数据最长要等下一个 5s 轮询 tick 才刷新。
+    if (MODE === 'real') pollPipeline();
+  }
 }
 
 /* ---------------- 顶栏 / 状态 ---------------- */
@@ -1401,10 +1420,16 @@ function refreshMapUI(m){
 
 /* ---------------- 遥测: ECharts ---------------- */
 let charts = {};
+let _echartsRetry = 0;
+const _ECHARTS_MAX_RETRY = 20; // ~6s: 同源 echarts.min.js 正常必加载, 仅在部署遗漏时兜底, 防无上限空转
 function baseTooltip(trigger){ return { trigger, confine:true, backgroundColor:'#0d141e', borderColor:'#2a3b4f', textStyle:{ color:'#e6eef6', fontSize:11 }, padding:[8,10] }; }
 function baseAxis(){ return { axisLine:{ lineStyle:{ color:'#2a3b4f' } }, axisTick:{ show:false }, axisLabel:{ color:'#5e6f82', fontSize:10 }, splitLine:{ lineStyle:{ color:'#141e2c' } } }; }
 function initCharts(){
-  if (typeof echarts === 'undefined'){ setTimeout(initCharts, 300); return; }
+  if (typeof echarts === 'undefined'){
+    if (++_echartsRetry <= _ECHARTS_MAX_RETRY){ setTimeout(initCharts, 300); }
+    else { var el = document.getElementById('ch-hit'); if (el) el.textContent = '图表库未加载'; }
+    return;
+  }
   charts.hit = echarts.init($('#ch-hit'));
   charts.qps = echarts.init($('#ch-qps'));
   charts.lat = echarts.init($('#ch-lat'));
@@ -1465,7 +1490,9 @@ function refreshKpiNums(){
   // 全部是 textContent 写入, 不重建 up-health 表与 TopN DOM。
   let c, al, m;
   if (MODE === 'real' && real.status){
-    c = real.status.counters; al = real.status.avg_latency_ms; m = real.status.map;
+    // 二级守卫: 后端版本错配时 status 有但 counters 可能缺失, 防御 c.total 抛 TypeError
+    c = real.status.counters || {total:0,hit:0,kernel_direct:0,upstream_queries:0,errors:0};
+    al = real.status.avg_latency_ms; m = real.status.map;
   } else {
     c = sim.counters; al = simAvgLat(); m = { used: sim.cache.size, capacity: config.cacheSize };
   }
@@ -1482,7 +1509,7 @@ function refreshKpiNums(){
   if (cpl){
     const cp = (MODE === 'real' && real.status && real.status.cache_policy) ? real.status.cache_policy
              : (MODE === 'sim' ? 'lru' : '');
-    if (cp) cpl.textContent = '缓存策略: ' + (cp === 'tinylfu' ? 'W-TinyLFU' : 'LRU 分区') + ' · 容量 ' + (m ? m.capacity : config.cacheSize);
+    if (cp) cpl.textContent = '缓存策略: ' + (cp === 'tinylfu' ? 'W-TinyLFU' : (cp === 'partitioned' ? '分区 LRU' : 'LRU 分区')) + ' · 容量 ' + (m ? m.capacity : config.cacheSize);
   }
   const cfEl = $('#cfg-cache-file');
   if (cfEl && MODE === 'real' && real.status && real.status.cache_file){
@@ -1510,16 +1537,21 @@ function refreshTelemetryUI(){
     const sr = u.success_rate != null ? u.success_rate : (isEnabled ? 100 : 0);
     const status = u.status || (sr >= 85 ? '健康' : (sr >= 60 ? '抖动' : '异常'));
     const dotColor = sr >= 85 ? 'var(--green)' : (sr >= 60 ? 'var(--amber)' : 'var(--red)');
-    h += '<tr><td class="ip">' + esc(u.name) + '</td><td>' + (u.proto||'') + '</td><td>' + (u.queries||0) + '</td><td>' + sr.toFixed(1) + '%</td><td>' + (u.avg_latency!=null?u.avg_latency.toFixed(1):'–') + 'ms</td><td><span class="mono" style="color:' + dotColor + '">● ' + esc(status) + '</span></td></tr>';
+    h += '<tr><td class="ip">' + esc(u.name) + '</td><td>' + esc(u.proto||'') + '</td><td>' + (u.queries||0) + '</td><td>' + sr.toFixed(1) + '%</td><td>' + (u.avg_latency!=null?u.avg_latency.toFixed(1):'–') + 'ms</td><td><span class="mono" style="color:' + dotColor + '">● ' + esc(status) + '</span></td></tr>';
   });
   tb.innerHTML = h || '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:12px">暂无已启用且产生查询的上游</td></tr>';
   // Top N 统计(域名/客户端/上游)
   const stTop = (MODE === 'real' && real.status) ? real.status : null;
   if (stTop){
+    // top_upstreams 元组首元素是上游 id(非 name), 用 real.snapshot.upstreams 建
+    // id→name 映射, 否则自建上游(id 形如 u1789580300926)在遥测页完全不可读。
+    const upName = {};
+    (real.snapshot && real.snapshot.upstreams || []).forEach(u => { upName[u.id] = u.name; });
     const fmtTop = (arr, unit) => (arr && arr.length ? arr.slice(0,8).map(x => esc(x[0]) + ' <span style="color:var(--text3)">' + x[1] + unit + '</span>').join('<br>') : '暂无数据');
+    const fmtTopUp = (arr, unit) => (arr && arr.length ? arr.slice(0,8).map(x => esc(upName[x[0]] || x[0]) + ' <span style="color:var(--text3)">' + x[1] + unit + '</span>').join('<br>') : '暂无数据');
     const td = $('#top-domains'); if (td) td.innerHTML = fmtTop(stTop.top_domains, '');
     const tc = $('#top-clients'); if (tc) tc.innerHTML = fmtTop(stTop.top_clients, '');
-    const tu = $('#top-ups'); if (tu) tu.innerHTML = fmtTop(stTop.top_upstreams, ' 次');
+    const tu = $('#top-ups'); if (tu) tu.innerHTML = fmtTopUp(stTop.top_upstreams, ' 次');
   } else {
     ['top-domains','top-clients','top-ups'].forEach(id => { const el = $('#' + id); if (el) el.textContent = '–'; });
   }
@@ -1556,10 +1588,15 @@ async function runManualQuery(){
     sim.manualHistory.push({ ts: nowTs(), domain, qtype, answer: result.chosen, lat: result.latency });
     renderHistory(sim.manualHistory);
   } else {
-    const snap = await API.get('/api/snapshot');
-    // 与 pollSnapshot 一致: 套用"清空"时间过滤, 避免刚清空发新查询时旧历史瞬间闪回
-    const _hist = (snap.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
-    renderHistory(_hist);
+    // 末尾 GET /api/snapshot 原无局部 try/catch: reject 会形成 unhandledrejection
+    // (全局处理器兜到 foot-uptime 显示 "JS REJ")。结果表 1579 已渲染成功, 仅本轮
+    // "会话记录"列表不刷新——包 try/catch 静默兜底, 避免无意义的全局告警。
+    try {
+      const snap = await API.get('/api/snapshot');
+      // 与 pollSnapshot 一致: 套用"清空"时间过滤, 避免刚清空发新查询时旧历史瞬间闪回
+      const _hist = (snap.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
+      renderHistory(_hist);
+    } catch(e){}
   }
 }
 function renderManualResult(result){
@@ -1623,16 +1660,22 @@ function renderConfig(){
     $('#cfg-healthtimeout').value = c.health_probe_timeout_ms || 2000;
     $('#cfg-loglevel').value = c.log_level || 'info';
     $('#cfg-logformat').value = c.log_format || 'text';
-    renderUpstreams(c.upstreams || []); renderRules(c.rules || []); renderRuleSubs(c.rule_subscriptions || []);
-    // 合并连接级健康度(来自 /api/upstreams): 配置页上游表格显示真实连接延迟
-    API.get('/api/upstreams').then(r => {
-      if (r && r.upstreams){
-        const m = {};
-        (r.upstreams).forEach(x => { m[x.id] = x; });
-        (c.upstreams || []).forEach(u => { const h = m[u.id]; if (h){ u.conn_avg_lat = h.conn_avg_lat; u.conn_ok = h.conn_ok; u.conn_fail = h.conn_fail; u.conn_key = h.conn_key; } });
-        renderUpstreams(c.upstreams || []);
-      }
-    }).catch(() => {});
+    renderRules(c.rules || []); renderRuleSubs(c.rule_subscriptions || []);
+    // L3: 合并连接级健康度(conn_ok/conn_fail/conn_avg_lat/conn_key)。这些字段
+    // 5s pollSnapshot 已随 /api/snapshot.upstreams 带回, 直接复用, 避免每次
+    // renderConfig 冗余 GET /api/upstreams; 仅首屏 snapshot 尚未就绪时拉一次兜底。
+    const mergeConn = (upsWithConn) => {
+      if (!upsWithConn) return;
+      const m = {};
+      upsWithConn.forEach(x => { m[x.id] = x; });
+      (c.upstreams || []).forEach(u => { const h = m[u.id]; if (h){ u.conn_avg_lat = h.conn_avg_lat; u.conn_ok = h.conn_ok; u.conn_fail = h.conn_fail; u.conn_key = h.conn_key; } });
+      renderUpstreams(c.upstreams || []);
+    };
+    if (real.snapshot && real.snapshot.upstreams){
+      mergeConn(real.snapshot.upstreams);
+    } else {
+      API.get('/api/upstreams').then(r => { if (r && r.upstreams) mergeConn(r.upstreams); else renderUpstreams(c.upstreams || []); }).catch(() => { renderUpstreams(c.upstreams || []); });
+    }
   } else {
     $('#cfg-size').value = config.cacheSize; $('#cfg-size-r').value = config.cacheSize;
     $('#cfg-ttl').value = config.ttl; $('#cfg-ttl-r').value = config.ttl;
@@ -1692,30 +1735,30 @@ function renderUpstreams(ups){
     const portHtml = portOpts.map(p => '<option value="' + p + '"' + (Number(u.port) === p ? ' selected' : '') + '>' + p + '</option>').join('') +
       (portOpts.indexOf(Number(u.port)) < 0 && u.port != null ? '<option value="' + u.port + '" selected>' + u.port + '</option>' : '');
     return '<div class="up-row">' +
-    '<label class="switch"><input type="checkbox" data-f="enabled" data-id="' + u.id + '"' + (u.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
-    '<input class="text" data-f="name" data-id="' + u.id + '" value="' + esc(u.name) + '" title="上游名称">' +
-    '<select class="q-sel" data-f="proto" data-id="' + u.id + '">' + ['udp','tcp','doh','dot','doq','doh3'].map(p => '<option value="' + p + '"' + (String(u.proto||'udp').toLowerCase() === p ? ' selected' : '') + '>' + PROTO_LABEL[p] + '</option>').join('') + '</select>' +
-    '<input class="text" data-f="fulladdr" data-id="' + u.id + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / http3://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29; 支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3 前缀)">' +
-    '<select class="q-sel" data-f="port" data-id="' + u.id + '">' + portHtml + '</select>' +
-    '<select class="q-sel" data-f="group" data-id="' + u.id + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
+    '<label class="switch"><input type="checkbox" data-f="enabled" data-id="' + esc(u.id) + '"' + (u.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
+    '<input class="text" data-f="name" data-id="' + esc(u.id) + '" value="' + esc(u.name) + '" title="上游名称">' +
+    '<select class="q-sel" data-f="proto" data-id="' + esc(u.id) + '">' + ['udp','tcp','doh','dot','doq','doh3'].map(p => '<option value="' + p + '"' + (String(u.proto||'udp').toLowerCase() === p ? ' selected' : '') + '>' + PROTO_LABEL[p] + '</option>').join('') + '</select>' +
+    '<input class="text" data-f="fulladdr" data-id="' + esc(u.id) + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / http3://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29; 支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3 前缀)">' +
+    '<select class="q-sel" data-f="port" data-id="' + esc(u.id) + '">' + portHtml + '</select>' +
+    '<select class="q-sel" data-f="group" data-id="' + esc(u.id) + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
     (u.latency != null
-      ? '<input class="num" type="number" data-f="latency" data-id="' + u.id + '" min="1" max="500" value="' + u.latency + '" title="基础延迟(ms), 实时查询延迟以遥测为准">'
+      ? '<input class="num" type="number" data-f="latency" data-id="' + esc(u.id) + '" min="1" max="500" value="' + u.latency + '" title="基础延迟(ms), 实时查询延迟以遥测为准">'
       : '<span class="lat-pending" title="应用配置后自动实测延迟">待测</span>') +
     connBadge(u) +
-    '<button class="del" data-del="' + u.id + '">×</button></div>';
+    '<button class="del" data-del="' + esc(u.id) + '">×</button></div>';
   }).join('');
 }
 function renderRules(rules){
   const box = $('#rule-list');
   box.innerHTML = rules.map(r =>
     '<div class="cfg-row">' +
-    '<input class="text" data-r="match" data-id="' + r.id + '" value="' + esc(r.match) + '" placeholder="*.example.com" style="width:190px">' +
-    '<select class="q-sel" data-r="action" data-id="' + r.id + '">' + ['group','forceIp','block','allow'].map(a => '<option value="' + a + '"' + (r.action === a ? ' selected' : '') + '>' + ACTION_LABEL[a] + '</option>').join('') + '</select>' +
-    (r.action === 'group' ? '<select class="q-sel" data-r="group" data-id="' + r.id + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (r.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' : '') +
-    (r.action === 'forceIp' ? '<input class="text" data-r="ip" data-id="' + r.id + '" value="' + esc(r.ip || '') + '" placeholder="1.2.3.4">' : '') +
-    '<input class="num" data-r="ttl_min" data-id="' + r.id + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_min != null && r.ttl_min !== '' ? r.ttl_min : '') + '" placeholder="TTL↓" title="规则级 TTL 下限(秒), 覆盖全局下发 TTL 下限; 留空继承全局" style="width:62px">' +
-    '<input class="num" data-r="ttl_max" data-id="' + r.id + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_max != null && r.ttl_max !== '' ? r.ttl_max : '') + '" placeholder="TTL↑" title="规则级 TTL 上限(秒), 覆盖全局下发 TTL 上限; 留空继承全局" style="width:62px">' +
-    '<button class="del" data-delrule="' + r.id + '" style="margin-left:auto">×</button></div>'
+    '<input class="text" data-r="match" data-id="' + esc(r.id) + '" value="' + esc(r.match) + '" placeholder="*.example.com" style="width:190px">' +
+    '<select class="q-sel" data-r="action" data-id="' + esc(r.id) + '">' + ['group','forceIp','block','allow'].map(a => '<option value="' + a + '"' + (r.action === a ? ' selected' : '') + '>' + ACTION_LABEL[a] + '</option>').join('') + '</select>' +
+    (r.action === 'group' ? '<select class="q-sel" data-r="group" data-id="' + esc(r.id) + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (r.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' : '') +
+    (r.action === 'forceIp' ? '<input class="text" data-r="ip" data-id="' + esc(r.id) + '" value="' + esc(r.ip || '') + '" placeholder="1.2.3.4">' : '') +
+    '<input class="num" data-r="ttl_min" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_min != null && r.ttl_min !== '' ? r.ttl_min : '') + '" placeholder="TTL↓" title="规则级 TTL 下限(秒), 覆盖全局下发 TTL 下限; 留空继承全局" style="width:62px">' +
+    '<input class="num" data-r="ttl_max" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_max != null && r.ttl_max !== '' ? r.ttl_max : '') + '" placeholder="TTL↑" title="规则级 TTL 上限(秒), 覆盖全局下发 TTL 上限; 留空继承全局" style="width:62px">' +
+    '<button class="del" data-delrule="' + esc(r.id) + '" style="margin-left:auto">×</button></div>'
   ).join('');
   bindRuleEvents();
 }
@@ -1731,7 +1774,7 @@ function renderRuleSubs(subs){
     '<span class="su" title="' + esc(s.url) + '">' + esc(s.url) + '</span>' +
     '<span class="sm"><b>' + (s.count != null ? s.count : 0) + '</b> 条</span>' +
     '<span class="sm">' + esc(s.updated_at || '-') + '</span>' +
-    '<span class="sm">' + (ACTION_LABEL[s.action] || s.action) + '</span>' +
+    '<span class="sm">' + (ACTION_LABEL[s.action] || esc(s.action || '')) + '</span>' +
     '<button class="btn" data-subupdate="' + esc(s.url) + '">更新</button>' +
     '<button class="del" data-subdel="' + esc(s.url) + '">×</button></div>'
   ).join('');
@@ -2058,7 +2101,7 @@ function bindConfigEvents(){
           try {
             const r = await API.post('/api/reload', {});
             if (r && r.ok === false) note('缓存策略热重载失败: ' + (r.error || '未知错误'), 'var(--red)');
-            else note('缓存策略已切换为 ' + (real.config.cache_policy === 'tinylfu' ? 'W-TinyLFU' : 'LRU 分区') + ', 缓存容器已重建', 'var(--green)');
+            else note('缓存策略已切换为 ' + (real.config.cache_policy === 'tinylfu' ? 'W-TinyLFU' : (real.config.cache_policy === 'partitioned' ? '分区 LRU' : 'LRU 分区')) + ', 缓存容器已重建', 'var(--green)');
           } catch(e){ note('缓存策略热重载失败: ' + e.message, 'var(--red)'); }
         }
       } catch(e){ note('保存失败: ' + e.message, 'var(--red)'); }
@@ -2154,15 +2197,25 @@ async function pollStatus(){
 }
 async function pollSnapshot(){
   try {
-    real.snapshot = await API.get('/api/snapshot');
-    refreshTelemetryUI();
-    if (route === 'telemetry') refreshCharts();
-    // H-3: 过滤掉「清空」按钮点击之前的历史记录, 防止 pollSnapshot 回填
-    const _hist = (real.snapshot.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
-    renderHistory(_hist);
+    real.snapshot = await API.get('/api/snapshot');   // 数据保持新鲜, 不门控
+    // 重 DOM 重建只在对应路由执行: telemetry 路由重建 up-health/TopN/map,
+    // query 路由刷新手动查询历史; 其余路由 fetch 保留保新鲜但不重建隐藏 DOM。
+    if (route === 'telemetry'){
+      refreshTelemetryUI();
+      refreshCharts();
+    }
+    if (route === 'query'){
+      // H-3: 过滤掉「清空」按钮点击之前的历史记录, 防止 pollSnapshot 回填
+      const _hist = (real.snapshot.manual_history || []).filter(e => !(real.hiddenHistoryBefore && e && e.ts && String(e.ts) < real.hiddenHistoryBefore));
+      renderHistory(_hist);
+    }
   } catch(e){}
 }
 async function pollLogs(){
+  // 路由门控: 日志控制台 #console-body 仅在 pipeline 路由可见; 其余路由跳过,
+  // 避免非 pipeline 页面每 5s 空拉日志并写隐藏 DOM。游标 real.logSeq 不动,
+  // 回到 pipeline 路由时下一轮 since=logSeq 增量补齐, 无丢数据。
+  if (route !== 'pipeline') return;
   try {
     const r = await API.get('/api/logs?since=' + real.logSeq);
     if (r.events && r.events.length){
@@ -2232,7 +2285,8 @@ function bindEvents(){
       try {
         const r = await API.get('/api/logs?since=' + real.logSeq);
         real.logSeq = (r && r.next_seq != null) ? r.next_seq : real.logSeq;
-      } catch(e){ real.logSeq = 0; }
+      } catch(e){ /* GET 失败时保留旧游标, 不置 0——否则下一周期 pollLogs(since=0)
+                   会把后端 deque 全部旧日志拉回, 用户刚点的"清空"被回退 */ }
     } else simReset();
   });
   $$('#load-seg button').forEach(b => b.addEventListener('click', () => {
@@ -2267,7 +2321,11 @@ async function boot(){
     try { s = await API.get('/api/status'); } catch(e){}
     if (s && s.app === 'ebpdns') MODE = 'real';
     if (MODE === 'real'){
-      try { real.config = await API.get('/api/config'); real.configPath = (s && s.config_path) || '/etc/ebpdns/config.json'; } catch(e){}
+      // configPath 取自已成功的 /api/status(s), 独立于 /api/config 拉取——
+      // 若 boot 时 /api/config reject 被 catch 吞掉, configPath 仍有值, 否则
+      // 进配置页保存时提示会显示 "配置已保存到后端 undefined"。
+      real.configPath = (s && s.config_path) || '/etc/ebpdns/config.json';
+      try { real.config = await API.get('/api/config'); } catch(e){}
       appendLogLine({ ts: nowTs(), level: 'sys', msg: 'ebpdns ' + ((s && s.version) ? s.version : APP_VERSION) + ' 已连接后端 daemon · REAL 模式' });
       renderPipeline(); bindEvents(); setRoute(initialRoute); initCharts();
       startRealPolls();

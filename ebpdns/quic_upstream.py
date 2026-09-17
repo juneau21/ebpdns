@@ -195,7 +195,18 @@ class _QuicUpstream:
                 # 启用默认证书校验(不覆盖 verify_mode); server_name 由下方设置
                 if self.host:
                     conf.server_name = self.host
-                async with connect(self.host, self.port, configuration=conf,
+                # 复用 bootstrap 预解析的 IP 直连(与 DoH/DoT 同源), 彻底摆脱
+                # 系统 getaddrinfo 依赖; conf.server_name 仍为原始 hostname,
+                # SNI 与证书名校验不受影响。
+                connect_host = self.host
+                try:
+                    from .upstream import _bootstrap_ip
+                    bip = _bootstrap_ip(self.host)
+                    if bip and bip != self.host:
+                        connect_host = bip
+                except Exception:
+                    pass
+                async with connect(connect_host, self.port, configuration=conf,
                                    create_protocol=_H3Client if self.proto == "doh3" else _DoQClient) as proto:
                     self._conn_start = time.monotonic()
                     fail_seq = 0

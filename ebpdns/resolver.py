@@ -1011,7 +1011,7 @@ class Resolver:
         """上游有效延迟: 优先实测平均延迟, 无实测时回退配置静态延迟。
         失败率>50%的上游惩罚性排后(加 500ms), 避免频繁选到故障上游。"""
         try:
-            st = self.tel.per_upstream.get(u.get("id", ""))
+            st = self.tel.upstream_eff_lat_read(u.get("id", ""))
             if st and st.get("ok", 0) > 0:
                 avg = st["lat_sum"] / st["ok"]
                 total = st["ok"] + st.get("fail", 0)
@@ -1062,8 +1062,11 @@ class Resolver:
             return _cb_snapshot.get(u.get("id", ""), False)
 
         def _is_slow_up(u):
+            # 与 _upstream_eff_lat 对齐: 走锁内快照 upstream_eff_lat_read(),
+            # 不再锁外直接读 _tel.per_upstream.get()——并发 upstream_ok 在两次
+            # 读取(ok / lat_sum)之间可能半更新, 导致慢上游判定读到中间态。
             try:
-                st = _tel.per_upstream.get(u.get("id"))
+                st = _tel.upstream_eff_lat_read(u.get("id"))
             except Exception:
                 return False
             if not st or st.get("ok", 0) < 10:  # 采样不足不判定, 避免单次抖动误杀
@@ -1295,7 +1298,10 @@ class Resolver:
                 a["measured"] = a.get("lat", 999)
                 with self._ip_speed_lock:
                     if hit is None:
-                        self._ip_speed_cache[ip] = (a["measured"], now)  # 初值兜底
+                        # setdefault 原子初值写入: 两线程并发初值写入时, 后到者不再用
+                        # 粗略延迟估计覆盖先到者(或 _probe_candidate_ip 已写入的实测
+                        # EWMA)。仅在槽位真空时写入, 消除两次持锁之间的 TOCTOU。
+                        self._ip_speed_cache.setdefault(ip, (a["measured"], now))
                         if len(self._ip_speed_cache) > 65536:
                             _items = sorted(self._ip_speed_cache.items(), key=lambda kv: kv[1][1])
                             for _k, _v in _items[: max(1, len(_items) // 4)]:
@@ -1748,53 +1754,73 @@ class Resolver:
         独立文件明细(rules_sub.json), 然后重建规则索引。
 
         与手动 /api/rules/subscribe/update 共用同一数据模型(独立文件为准),
-        更新失败仅告警不中断(下个周期重试)。"""
+        更新失败仅告警不中断(下个周期重试)。
+
+        并发范式(与 API 订阅 CRUD 一致, 修 M1): 网络下载在锁外完成(20s HTTP
+        不持锁, 避免阻塞 DNS 查询与其他写操作), 按 url 收集结果; "读 subs→应用
+        结果→剔除已删→落盘→rebuild"的读改写段进 app._lock, 进锁后重新取最新 cfg
+        与 urls, 防止后台用旧快照写回导致并发 DELETE/PUT 的订阅被静默恢复。"""
         cfg = self.cfg
         meta = cfg.get("rule_subscriptions") or []
         urls = [m.get("url") for m in meta if m.get("url")]
         if not urls:
             return
-        path = cfg.get("rule_sub_file") or ""
-        try:
-            with open(path, encoding="utf-8") as f:
-                subs = json.load(f).get("subscriptions", [])
-        except Exception:
-            subs = []
-        n_ok = 0
-        for s in subs:
-            url = s.get("url") or ""
-            if url not in urls:
-                continue
+        # 网络下载在锁外, 按 url 收集解析结果(不触碰共享文件/锁)
+        fetched = {}
+        for url in urls:
             try:
                 text = self._fetch_sub_text(url)
                 items = [{"match": ("*." + d if not d.startswith("*.") else d)}
                          for d in self._parse_domain_list(text)]
+                if items:
+                    fetched[url] = items
+            except Exception as e:
+                log.warning("订阅自动更新失败 %s: %r", url, e)
+        app_ctx = getattr(self, "_app_ctx", None)
+        if app_ctx is None:
+            return
+        # 读改写段进 app._lock: 与 API 订阅 CRUD / reload 串行化
+        with app_ctx._lock:
+            cfg = app_ctx.cfg   # 重新取最新引用(reload/PUT 可能已替换 self.cfg)
+            meta = cfg.get("rule_subscriptions") or []
+            urls = [m.get("url") for m in meta if m.get("url")]
+            path = cfg.get("rule_sub_file") or ""
+            try:
+                with open(path, encoding="utf-8") as f:
+                    subs = json.load(f).get("subscriptions", [])
+            except Exception:
+                subs = []
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            n_ok = 0
+            for s in subs:
+                url = s.get("url") or ""
+                if url not in urls:
+                    continue
+                items = fetched.get(url)
                 if not items:
                     continue
                 s["rules"] = items
-                s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                s["updated_at"] = now_str
                 n_ok += 1
-            except Exception as e:
-                log.warning("订阅自动更新失败 %s: %r", url, e)
-        # 配置已删除的订阅从独立文件剔除(防残留规则继续生效, 与 config 保持同步)
-        before = len(subs)
-        subs = [s for s in subs if (s.get("url") or "") in urls]
-        if len(subs) != before:
-            log.info("订阅自动更新: 剔除 %d 个已删除订阅", before - len(subs))
-        if (n_ok or len(subs) != before) and path:
-            try:
-                import os as _os
-                _os.makedirs(_os.path.dirname(_os.path.abspath(path)) or ".", exist_ok=True)
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump({"subscriptions": subs}, f, ensure_ascii=False)
-                    f.flush()
-                    _os.fsync(f.fileno())
-                _os.replace(tmp, path)
-                self.rebuild_rule_index()
-                log.info("规则订阅自动更新: %d 个订阅已刷新", n_ok)
-            except Exception as e:
-                log.error("规则订阅自动更新落盘失败: %r", e)
+            # 配置已删除的订阅从独立文件剔除(防残留规则继续生效, 与 config 保持同步)
+            before = len(subs)
+            subs = [s for s in subs if (s.get("url") or "") in urls]
+            if len(subs) != before:
+                log.info("订阅自动更新: 剔除 %d 个已删除订阅", before - len(subs))
+            if (n_ok or len(subs) != before) and path:
+                try:
+                    import os as _os
+                    _os.makedirs(_os.path.dirname(_os.path.abspath(path)) or ".", exist_ok=True)
+                    tmp = path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump({"subscriptions": subs}, f, ensure_ascii=False)
+                        f.flush()
+                        _os.fsync(f.fileno())
+                    _os.replace(tmp, path)
+                    self.rebuild_rule_index()
+                    log.info("规则订阅自动更新: %d 个订阅已刷新", n_ok)
+                except Exception as e:
+                    log.error("规则订阅自动更新落盘失败: %r", e)
 
     @staticmethod
     def _parse_domain_list(text):
@@ -1829,6 +1855,11 @@ class Resolver:
         suffix_wild = {}   # 中缀/前缀通配(*ac*.com / *foo.net): 按固定后缀分组索引
         rules = self._load_local_rules() + self._load_sub_rules()
         for r in rules:
+            if not isinstance(r, dict):
+                # 畸形规则文件含非 dict 条目(如手工写成 [123, "foo"]): 跳过而非
+                # 让 r.get() 抛 AttributeError 把整个启动搞崩。
+                logging.warning("规则索引跳过非 dict 条目: %r", type(r).__name__)
+                continue
             self._normalize_rule(r)   # P0-1: 兼容配置文件 pattern/value 旧字段名
             m = (r.get("match") or "").strip().lower()
             if not m:

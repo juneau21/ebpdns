@@ -111,6 +111,15 @@ class Telemetry:
         with self._lock:
             return self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
 
+    def upstream_eff_lat_read(self, up_id):
+        """加锁读取单上游统计快照(只读, 不 setdefault), 供 resolver 延迟排序用。
+        避免锁外 .get() 读到并发 upstream_ok/upstream_fail 的半更新状态。"""
+        with self._lock:
+            st = self.per_upstream.get(up_id)
+            if st is None:
+                return None
+            return dict(st)
+
     def upstream_ok(self, up_id, lat_ms):
         with self._lock:
             st = self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
@@ -177,6 +186,27 @@ class Telemetry:
             return out
 
     # ---- H-1/H-3: 共享容器的线程安全快照 ----
+    def counters_snapshot(self):
+        """counters/rule_hits + 派生比率的一次锁内快照。
+
+        返回 (counters, rule_hits, hit_rate, qps, avg_latency_ms)。
+        reset() 在锁内整体替换 counters/rule_hits 并清空 qps/latency 窗口;
+        同一次持锁拷贝保证单条响应内计数与派生指标自洽——不再出现
+        counters.total=100(旧值) 而 hit_rate=0(reset 后 live 值) 的混合态。
+        /metrics 与 /api/status 统一走此方法, 派生指标不再锁外读 live 引用。"""
+        with self._lock:
+            counters = dict(self.counters)
+            rule_hits = dict(self.rule_hits)
+            total = counters["total"]
+            hit_rate = (counters["hit"] / total * 100) if total else 0.0
+            now = time.time()
+            while self.qps_window and now - self.qps_window[0] > 1.0:
+                self.qps_window.popleft()
+            qps = len(self.qps_window)
+            alen = len(self.latency_window)
+            avg_lat = (sum(self.latency_window) / alen) if alen else None
+            return counters, rule_hits, hit_rate, qps, avg_lat
+
     def upstreams_snapshot(self):
         """per_upstream.items() 的加锁拷贝。直接在锁外 .items() 迭代时, 并发
         upstream_ok() 的 setdefault 新增 key 会抛 RuntimeError: dictionary

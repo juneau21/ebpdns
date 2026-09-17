@@ -179,6 +179,10 @@ def build_app(cfg, config_path=None):
         endpoints = dns_server.endpoints()
 
     app_ctx = AppContext(resolver, telemetry, cfg, config_path=config_path, dns_server=dns_server)
+    # 反向注入 app_ctx 给 resolver: 后台周期订阅更新(_update_rule_subs_once)需在
+    # app._lock 内做读改写, 与 API 订阅 CRUD/reload 串行化(修 M1)。reload 只替换
+    # resolver.cfg 引用不重建 resolver 对象, 故注入一次即跨 reload 存活。
+    resolver._app_ctx = app_ctx
     return app_ctx, endpoints
 
 
@@ -219,36 +223,40 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                     if not domains:
                         continue
                     items = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
-                    subs = []
+                    # 读改写 rules_sub.json + rebuild_rule_index 全程持 app_ctx._lock,
+                    # 与 API 订阅 CRUD/reload 串行化(同 _update_rule_subs_once 修法);
+                    # 网络下载已在锁外完成(见上方 fetch_subscription_text)。
                     try:
-                        with open(sub_path, encoding="utf-8") as f:
-                            subs = json.load(f).get("subscriptions", [])
-                    except Exception:
-                        subs = []
-                    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                    for s in subs:
-                        if s.get("url") == url:
-                            s["rules"] = items
-                            s["count"] = len(items)
-                            s["updated_at"] = stamp
-                            break
-                    else:
-                        subs.append({"url": url,
-                                     "action": m.get("action", "block"),
-                                     "group": m.get("group", "global"),
-                                     "ip": m.get("ip") or "1.2.3.4",
-                                     "count": len(items),
-                                     "updated_at": stamp,
-                                     "rules": items})
-                    os.makedirs(os.path.dirname(os.path.abspath(sub_path)) or ".", exist_ok=True)
-                    tmp = sub_path + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump({"subscriptions": subs}, f, ensure_ascii=False)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, sub_path)
-                    try:
-                        app_ctx.resolver.rebuild_rule_index()
+                        with app_ctx._lock:
+                            subs = []
+                            try:
+                                with open(sub_path, encoding="utf-8") as f:
+                                    subs = json.load(f).get("subscriptions", [])
+                            except Exception:
+                                subs = []
+                            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                            for s in subs:
+                                if s.get("url") == url:
+                                    s["rules"] = items
+                                    s["count"] = len(items)
+                                    s["updated_at"] = stamp
+                                    break
+                            else:
+                                subs.append({"url": url,
+                                             "action": m.get("action", "block"),
+                                             "group": m.get("group", "global"),
+                                             "ip": m.get("ip") or "1.2.3.4",
+                                             "count": len(items),
+                                             "updated_at": stamp,
+                                             "rules": items})
+                            os.makedirs(os.path.dirname(os.path.abspath(sub_path)) or ".", exist_ok=True)
+                            tmp = sub_path + ".tmp"
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                json.dump({"subscriptions": subs}, f, ensure_ascii=False)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(tmp, sub_path)
+                            app_ctx.resolver.rebuild_rule_index()
                     except Exception:
                         log.exception("订阅补下载后规则索引重建失败")
                     log.info("订阅冷启动补下载: %s → %d 条", url, len(items))
@@ -346,8 +354,10 @@ def run(cfg, config_path=None):
 
     api_server.start_thread()
 
-    # 首次启动: 对未实测过的上游自动实测延迟并写回(后台, 不阻塞)
-    start_first_probe(cfg, config_path)
+    # 首次启动: 对未实测过的上游自动实测延迟并写回(后台, 不阻塞)。
+    # 透传 app_ctx(M1 修复): 落盘进 app._lock 按 id 合并, 避免启动旧 cfg 整体
+    # 落盘覆盖 API 已启动后并发 PUT /api/config 的新变更。
+    start_first_probe(cfg, config_path, app_ctx)
 
     stop = threading.Event()
 

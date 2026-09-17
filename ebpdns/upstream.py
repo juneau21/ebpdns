@@ -30,8 +30,10 @@ _DOH_HEADERS = {
 
 # ---------------- Bootstrap 解析器（摆脱系统 DNS 依赖） ----------------
 # 启动时用 UDP 上游预解析 DoH/DoT hostname，缓存 IP；连接时用 IP + SNI
+# 缓存条目格式: host -> (ip, monotonic_ts); 超 _BOOTSTRAP_TTL 视为陈旧重解析
 _bootstrap_cache = {}
 _bootstrap_lock = threading.Lock()
+_BOOTSTRAP_TTL = 600.0  # 运行期补写的 bootstrap 缓存 TTL(秒), 防应用层陈旧 IP 无限钉住
 
 # UDP 热路径上游 hostname 解析缓存: host -> (ip_set, expire_monotonic)
 # miss 热路径每次 getaddrinfo 是阻塞的系统 DNS 解析, 必须带 TTL 缓存(300s)
@@ -100,8 +102,10 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
     if not _is_hostname(host):
         return host  # 已经是 IP
     with _bootstrap_lock:
-        if host in _bootstrap_cache:
-            return _bootstrap_cache[host]
+        hit = _bootstrap_cache.get(host)
+        if hit is not None:
+            ip_cached = hit[0] if isinstance(hit, tuple) else hit
+            return ip_cached
     try:
         bp_host, _, bp_port = bootstrap_dns.partition(":")
         bp_port = int(bp_port) if bp_port else 53
@@ -117,24 +121,40 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
             s.close()
         # 解析响应中的 A 记录
         pos = 12
-        while data[pos]:
-            pos += data[pos] + 1
-        pos += 5  # 跳过 qname 结尾 + qtype+qclass
+        # 跳过 question 区 qname: 与 answer 段一致地处理压缩指针(0xC0 首字节),
+        # 否则某些转发器回压缩指针时 pos 会跳到包内随机位置, 后续解析错位静默失败。
+        # 压缩指针占 2 字节; 字面量走到 null 终止符, else 内 pos+=1 已吃掉该 null。
+        # 因此块结束后只需再跳 qtype(2)+qclass(2)=4 字节(原 while+pos+=5 等价)。
+        if data[pos] & 0xC0:
+            pos += 2
+        else:
+            while data[pos]:
+                pos += data[pos] + 1
+            pos += 1
+        pos += 4  # 跳过 qtype + qclass
         ancount = struct.unpack(">H", data[6:8])[0]
         for _ in range(ancount):
+            # 逐条越界断言: 畸形/截断响应在访问字段前先确认剩余长度,
+            # 避免 data[pos] 越界抛 IndexError(虽被外层兜住, 但显式失败更稳)。
+            if pos + 10 > len(data):
+                break
             # 跳过 name（可能是压缩指针）
             if data[pos] & 0xC0:
                 pos += 2
             else:
-                while data[pos]:
+                while pos < len(data) and data[pos]:
                     pos += data[pos] + 1
                 pos += 1
+            if pos + 10 > len(data):
+                break
             rtype = struct.unpack(">H", data[pos:pos+2])[0]
             rdlength = struct.unpack(">H", data[pos+8:pos+10])[0]
+            if pos + 10 + rdlength > len(data):
+                break
             if rtype == 1 and rdlength == 4:
                 ip = socket.inet_ntoa(data[pos+10:pos+14])
                 with _bootstrap_lock:
-                    _bootstrap_cache[host] = ip
+                    _bootstrap_cache[host] = (ip, time.monotonic())
                 return ip
             pos += 10 + rdlength
     except Exception as e:
@@ -174,11 +194,63 @@ def bootstrap_resolve_all(upstreams, bootstrap_dns="223.5.5.5:53", total_timeout
 
 
 def _bootstrap_ip(host):
-    """获取 hostname 的 bootstrap 缓存 IP，无缓存返回 None。"""
+    """获取 hostname 的 bootstrap 缓存 IP，无缓存或过期返回 None。
+
+    缓存条目为 (ip, monotonic_ts); 超 _BOOTSTRAP_TTL 视为陈旧, 返回 None
+    触发重新解析(防应用层陈旧 IP 如 HTTP 421/CDN 迁 vhost 被无限钉住)。"""
     if not _is_hostname(host):
         return host
+    now = time.monotonic()
     with _bootstrap_lock:
-        return _bootstrap_cache.get(host)
+        hit = _bootstrap_cache.get(host)
+        if hit is None:
+            return None
+        ip_cached = hit[0] if isinstance(hit, tuple) else hit
+        if isinstance(hit, tuple) and (now - hit[1]) > _BOOTSTRAP_TTL:
+            return None
+        return ip_cached
+
+
+def _bootstrap_invalidate(host):
+    """连接失败时失效 bootstrap 缓存条目。
+
+    DoH/DoT 上游域名 IP 变更(CDN 调度/运营商切换)后, 旧缓存 IP 会持续
+    create_connection 失败。清除该条目后, 下次建连 _bootstrap_ip 返回 None,
+    回退系统 getaddrinfo 重新解析, 不必等熔断或重启。仅对 hostname 生效。"""
+    if not host or not _is_hostname(host):
+        return
+    with _bootstrap_lock:
+        _bootstrap_cache.pop(host, None)
+
+
+def _bootstrap_set(host, ip):
+    """连接成功(含 fallback 系统解析)后把 IP 写回 bootstrap 缓存。
+
+    bootstrap 失效只清坏 IP; 正常解析出的新 IP 必须重建缓存, 否则该上游后续
+    每次 DoH/DoT 建连都要再走一次阻塞 getaddrinfo(v1.9.66 引入的残余退化)。
+    仅对 hostname 生效, 幂等覆盖旧值。缓存条目为 (ip, monotonic_ts),
+    供 _bootstrap_ip 做 TTL 过期判断。"""
+    if not host or not ip or host == ip or not _is_hostname(host):
+        return
+    with _bootstrap_lock:
+        _bootstrap_cache[host] = (ip, time.monotonic())
+
+
+def _resolve_host_once(host):
+    """系统 getaddrinfo 解析 hostname, 返回首个 IPv4 地址或 None。
+
+    用于 bootstrap 缓存失效后的一次性重建回写(非热路径, 允许短暂阻塞);
+    结果由调用方经 _bootstrap_set 写回, 后续建连直接复用缓存 IP。"""
+    if not host or not _is_hostname(host):
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for _fam, _stype, _proto, _canon, sa in infos:
+        if sa and sa[0]:
+            return sa[0]
+    return None
 
 
 def _host_port(up):
@@ -304,12 +376,44 @@ def _doh_conn(host, port, timeout):
 
     若 hostname 已通过 bootstrap 预解析为 IP，用 IP 连接 + SNI=hostname，
     彻底摆脱系统 DNS 依赖；否则回退到 hostname 直连（系统 getaddrinfo）。
+
+    注意: http.client.HTTPSConnection 不接受 server_hostname= 关键字(它固定用
+    self.host 做 SNI), 直接传该 kwarg 会在构造期抛 TypeError。正确做法是
+    手工建 TCP socket 连到 bootstrap IP, 再用 ssl.create_default_context()
+    .wrap_socket(sock, server_hostname=host) 做 TLS 握手(证书仍按 hostname 校验,
+    不能关成 CERT_NONE), 然后把 ssock 挂到 host=hostname 的 HTTPSConnection 上——
+    这样 Host 头/SNI/证书校验全部按 hostname, 实际 TCP 走 bootstrap IP。
     """
     ip = _bootstrap_ip(host)
     if ip and ip != host:
-        # 用 IP 连接，SNI 设为原始 hostname（TLS 证书校验需要）
-        return http.client.HTTPSConnection(ip, port, timeout=timeout, server_hostname=host)
-    return http.client.HTTPSConnection(host, port, timeout=timeout)
+        try:
+            raw = socket.create_connection((ip, port), timeout=timeout)
+        except OSError:
+            # bootstrap IP 已失效(CDN 调度/IP 变更) → 失效缓存, 下次回退系统解析
+            _bootstrap_invalidate(host)
+            raise
+        try:
+            ctx = ssl.create_default_context()
+            ssock = ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
+            _bootstrap_invalidate(host)
+            raise
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        conn.sock = ssock  # 复用已建 TLS 连接, 不再二次 connect
+        return conn
+    # fallback: 无可用 bootstrap 缓存 → 系统 getaddrinfo 解析一次。
+    # 本次连接仍交还给 http.client(host) 自行建连(保持多 A 记录容错), 但新解析
+    # 出的 IP 暂存为 pending, 待首次 exchange 成功后才写回缓存(首个 A 记录不可达
+    # 时不缓存坏 IP)。
+    resolved = _resolve_host_once(host)
+    conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    if resolved:
+        conn._ebpdns_pending_bootstrap = resolved
+    return conn
 
 
 def _doh_query(up, query_bytes, timeout_ms):
@@ -365,6 +469,11 @@ def _doh_query(up, query_bytes, timeout_ms):
                 _pool.release(key, None)
                 return False, None
             _pool.release(key, conn)  # 复用成功，写回池
+            # 首次 exchange 成功后才写回 fallback 解析出的 IP(防首条坏 A 记录入缓存)
+            pb = getattr(conn, '_ebpdns_pending_bootstrap', None)
+            if pb:
+                _bootstrap_set(host, pb)
+                conn._ebpdns_pending_bootstrap = None
             return True, body
         except (OSError, http.client.HTTPException):
             # 连接失效 → 关闭并一次性重试（新建连接），仅用剩余预算
@@ -389,6 +498,10 @@ def _doh_query(up, query_bytes, timeout_ms):
                     _pool.release(key, None)
                     return False, None
                 _pool.release(key, conn)
+                pb = getattr(conn, '_ebpdns_pending_bootstrap', None)
+                if pb:
+                    _bootstrap_set(host, pb)
+                    conn._ebpdns_pending_bootstrap = None
                 return True, body
             except (OSError, http.client.HTTPException):
                 # 重试连接也失败: 该 conn 已损坏, 关闭后再归还槽位, 防 TLS socket 泄漏
@@ -398,8 +511,12 @@ def _doh_query(up, query_bytes, timeout_ms):
                     pass
                 _pool.release(key, None)
                 return False, None
-    except Exception:
-        # 兜底: 任何异常路径都不泄漏连接槽; 若 conn 已建但未成功回池, 关闭防泄漏
+    except Exception as e:
+        # 兜底: 任何异常路径都不泄漏连接槽; 若 conn 已建但未成功回池, 关闭防泄漏。
+        # 必须记录异常类型与上游身份, 否则连接构造/请求期的非 OSError/HTTPException
+        # 异常(如历史上的 server_hostname= TypeError)会被无声吞成 "query failed"。
+        log.warning("DoH query unexpected error up=%s(%s proto=doh host=%s:%s): %s: %s",
+                    up.get("id"), up.get("name"), host, port, type(e).__name__, e)
         try:
             try:
                 if conn is not None:
@@ -419,20 +536,44 @@ def _dot_conn(host, port, timeout):
     彻底摆脱系统 DNS 依赖；否则回退到 hostname 直连（系统 getaddrinfo）。
     """
     ip = _bootstrap_ip(host)
+    pending_resolved = None
+    if not ip or ip == host:
+        # bootstrap 缓存已失效/为空: 系统解析一次, 暂存 pending;
+        # 待首次 exchange 成功后才写回(同 DoH fallback, 防首条坏 A 记录入缓存)。
+        pending_resolved = _resolve_host_once(host)
     connect_host = ip if ip else host
-    sock = socket.create_connection((connect_host, port), timeout=timeout)
+    try:
+        sock = socket.create_connection((connect_host, port), timeout=timeout)
+    except OSError:
+        # 经 bootstrap IP 直连失败 → 失效缓存, 下次回退系统 getaddrinfo 重解析
+        if ip and ip != host:
+            _bootstrap_invalidate(host)
+        raise
     # 使用 ssl.create_default_context() 默认校验(含 CA 校验 + 主机名校验)。
-    # IP 直连场景通过 server_hostname=host 传 SNI, 证书校验仍按主机名进行。
+    # hostname 上游: server_hostname=host 做 SNI, 证书按主机名校验。
+    # 字面 IP 直连: 不能传 server_hostname=None 又保留默认 check_hostname=True
+    # (会抛 ValueError: check_hostname requires server_hostname, 该异常非 OSError
+    # 不会被内层 except OSError 接住, 落到外层裸 except 被静默吞)。改为: 仍
+    # 校验证书链(CERT_REQUIRED 保持), 仅关闭主机名/SNI 校验(check_hostname=False)。
     # wrap_socket 抛异常时必须关闭原始 TCP socket, 否则 fd 泄漏。
     try:
         ctx = ssl.create_default_context()
-        sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+        if _is_hostname(host):
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        else:
+            ctx.check_hostname = False
+            sock = ctx.wrap_socket(sock, server_hostname=None)
     except Exception:
         try:
             sock.close()
         except Exception:
             pass
+        if ip and ip != host:
+            _bootstrap_invalidate(host)
         raise
+    # TLS 握手成功后暂存 pending bootstrap IP, 待首次 exchange 成功才写回缓存
+    if pending_resolved:
+        sock._ebpdns_pending_bootstrap = pending_resolved
     return sock
 
 
@@ -486,6 +627,10 @@ def _dot_query(up, query_bytes, timeout_ms):
             msg = _exchange(sock)
             if msg is not None:
                 _pool.release(key, sock)  # 复用成功，写回池
+                pb = getattr(sock, '_ebpdns_pending_bootstrap', None)
+                if pb:
+                    _bootstrap_set(host, pb)
+                    sock._ebpdns_pending_bootstrap = None
                 return True, msg
             # _exchange 返回 None(对端 EOF/超时/缓冲超限): 连接不可再用, 必须关闭
             # 再归还槽位, 否则该 TLS socket 既不回池也不 close, fd 泄漏。
@@ -510,6 +655,10 @@ def _dot_query(up, query_bytes, timeout_ms):
                 msg = _exchange(sock)
                 if msg is not None:
                     _pool.release(key, sock)
+                    pb = getattr(sock, '_ebpdns_pending_bootstrap', None)
+                    if pb:
+                        _bootstrap_set(host, pb)
+                        sock._ebpdns_pending_bootstrap = None
                     return True, msg
                 # 重试连接也不可用: 关闭后再归还槽位
                 try:
@@ -521,8 +670,18 @@ def _dot_query(up, query_bytes, timeout_ms):
             except OSError:
                 _pool.release(key, None)
                 return False, None
-    except Exception:
+    except Exception as e:
+        # 兜底: 任何非 OSError 异常(如 IP 直连 TLS 的 ValueError 等)也不能无声吞掉,
+        # 对齐 DoH 外层日志(upstream.py _doh_query), 否则连接/握手失败在日志无线索。
+        # L1 修复: 对齐 DoH 外层, 关 socket 后再释放连接槽, 防极端路径 fd 泄漏。
+        log.warning("DoT query unexpected error up=%s(%s proto=dot host=%s:%s): %s: %s",
+                    up.get("id"), up.get("name"), host, port, type(e).__name__, e)
         try:
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
             _pool.release(key, None)
         except Exception:
             pass
@@ -594,9 +753,15 @@ def _tcp_query(up, query_bytes, timeout_ms, use_tls=False):
         return False, None
     try:
         if use_tls:
-            # 默认证书校验: 不关闭 check_hostname/verify_mode
+            # 与 _dot_conn 同型: hostname 上游 SNI=host 按主机名校验; 字面 IP 直连
+            # 不能传 server_hostname=None 又开 check_hostname(必抛 ValueError)。
+            # 当前两处调用方均传 use_tls=False(死代码), 此处仅消除潜伏陷阱。
             ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(sock, server_hostname=host if _is_hostname(host) else None)
+            if _is_hostname(host):
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            else:
+                ctx.check_hostname = False
+                sock = ctx.wrap_socket(sock, server_hostname=None)
         sock.settimeout(timeout_ms / 1000.0)
         sock.sendall(tcp_frame(query_bytes))
         buf = bytearray()
