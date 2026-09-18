@@ -178,6 +178,7 @@ def parse_upstream_addr(raw, proto_sel=None):
         return None
     proto, rest, url = None, s, ""
     m = None
+    _http_plain = False   # http:// 明文 DoH: 端口默认 80 (区别于 https:// 的 443)
     for i, ch in enumerate(s):
         if ch == ":":
             m = (s[:i], s[i + 1:])
@@ -189,6 +190,7 @@ def parse_upstream_addr(raw, proto_sel=None):
             proto, url = "doh", "/dns-query"
         elif scheme == "http":
             proto, url = "doh", "/dns-query"
+            _http_plain = True
         elif scheme == "quic":
             proto, url = "doq", "/dns-query"
         elif scheme == "doq":
@@ -215,6 +217,8 @@ def parse_upstream_addr(raw, proto_sel=None):
         proto = "udp"
     host = rest
     port = UP_PORT_DEFAULT.get(proto, 53)
+    if _http_plain:
+        port = 80   # 明文 http:// DoH 走 80, 不沿用 doh 的 443 默认
     slash = host.find("/")
     if slash >= 0:
         p = host[slash:]
@@ -291,7 +295,7 @@ _ENUM_VALUES = {
 _BOOL_KEYS = {
     "prefetch", "serve_stale", "kernel_direct", "speed_test", "fallback",
     "ipv4_first", "ipv6", "edns", "padding", "rebind_protection",
-    "ip_speed_check", "dnssec_0x20",
+    "ip_speed_check", "dnssec_0x20", "prefer_ipv4",
 }
 
 
@@ -386,20 +390,20 @@ def save_config(cfg, path=None):
     # 规则/上游数量大时用 compact 格式: indent=2 会让 10 万规则的 config 达 15MB+,
     # 每次全量保存都很慢。compact(分隔符无空格) 体积约减半, 序列化/写盘快约 2.5x。
     big = len(cfg.get("rules", [])) > 5000 or len(cfg.get("upstreams", [])) > 100
-    _dumps = lambda: (json.dumps(cfg, ensure_ascii=False, separators=(",", ":")) if big
-                      else json.dumps(cfg, ensure_ascii=False, indent=2))
+    payload = (json.dumps(cfg, ensure_ascii=False, separators=(",", ":")) if big
+               else json.dumps(cfg, ensure_ascii=False, indent=2))
     try:
         # 原子写入：临时文件 + rename，避免崩溃留下半截 JSON
         tmp = target + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(_dumps())
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, target)
     except OSError:
         # tmp 写失败(受限文件系统/磁盘满)时降级直接写目标文件, 避免配置保存失败中断 API
         with open(target, "w", encoding="utf-8") as f:
-            f.write(_dumps())
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
     return target

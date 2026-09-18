@@ -8,6 +8,7 @@ query_upstream() 返回 (ok, response_bytes, latency_ms, err_str)。
 import collections
 import http.client
 import logging
+import os
 import socket
 import ssl
 import struct
@@ -41,6 +42,19 @@ _addr_cache = {}
 _addr_cache_lock = threading.Lock()
 _ADDR_CACHE_TTL = 300.0
 _ADDR_CACHE_MAX = 256   # 安全上限: 上游 hostname 数量有限, 超限淘汰最旧项
+
+# v1.9.76 2.3: 0x20 投毒防护按上游自适应降级。部分上游(或其 Anycast 后端)会把
+# 查询名规范化为小写后回显, 导致 check_0x20 逐位失配 → 响应被误当投毒丢弃,
+# 该上游所有查询超时。按上游统计连续失配次数, 连续 3 次后对该上游关闭 0x20
+# 校验(直接接受 qid/源校验通过的响应), 并打日志。
+_0x20_misses = {}       # up_id -> 连续失配次数
+_0x20_disabled = set()  # up_id 已降级关闭 0x20 校验
+_0x20_DISABLED_SINCE = {}  # v1.9.77 R5: up_id -> 降级时间戳(time.monotonic()), 用于 600s 自恢复
+_0x20_FAIL_LIMIT = 3
+_0x20_RECOVER_S = 600.0  # v1.9.77 R5: 降级后 10 分钟自动重新启用 0x20 校验
+# v1.9.77 R4: _0x20_misses / _0x20_disabled 被多线程 _udp_query 并发读写, 裸 dict/set
+# 读-改-写存在竞态(连续 +1 可能丢失), 统一用一把模块级锁保护。
+_0x20_lock = threading.Lock()
 
 
 def _cached_udp_addrs(host):
@@ -93,6 +107,15 @@ def _is_hostname(s):
     return bool(s) and not s.startswith("[")
 
 
+def _is_v6(s):
+    """v1.9.76 2.8: 判断字符串是否为 IPv6 地址(用于探测 socket 地址族选择)。"""
+    try:
+        socket.inet_pton(socket.AF_INET6, s)
+        return True
+    except OSError:
+        return False
+
+
 def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
     """用 UDP bootstrap DNS 解析 hostname，返回 IP 字符串或 None。
 
@@ -111,7 +134,9 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
         bp_port = int(bp_port) if bp_port else 53
         # 构造 A 查询
         labels = b"".join(bytes([len(p)]) + p.encode() for p in host.split("."))
-        q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
+        # v1.9.81: qid 随机化, 防盲打投毒(旧固定 0x1234 只需猜端口)
+        qid = int.from_bytes(os.urandom(2), "big")
+        q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.settimeout(timeout)
@@ -119,6 +144,15 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
             data, _ = s.recvfrom(65535)
         finally:
             s.close()
+        # v1.9.80: 校验 qid 与 rcode, 防伪造响应污染 bootstrap 缓存。
+        if len(data) < 12:
+            return None
+        qid_resp = struct.unpack(">H", data[0:2])[0]
+        if qid_resp != qid:
+            return None
+        rcode = data[3] & 0x0F
+        if rcode != 0:
+            return None
         # 解析响应中的 A 记录
         pos = 12
         # 跳过 question 区 qname: 与 answer 段一致地处理压缩指针(0xC0 首字节),
@@ -180,16 +214,21 @@ def bootstrap_resolve_all(upstreams, bootstrap_dns="223.5.5.5:53", total_timeout
     if not hosts:
         return 0
     # 并发解析: 每个线程独立 socket, 单查询超时 2s, 总等待上限 total_timeout
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FutTimeout
     resolved = 0
     with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as ex:
         futures = {ex.submit(bootstrap_resolve, h, bootstrap_dns, 2.0): h for h in hosts}
-        for fut in as_completed(futures, timeout=total_timeout):
-            try:
-                if fut.result():
-                    resolved += 1
-            except Exception:
-                pass
+        try:
+            for fut in as_completed(futures, timeout=total_timeout):
+                try:
+                    if fut.result():
+                        resolved += 1
+                except Exception:
+                    pass
+        except _FutTimeout:
+            # v1.9.81: 超时未完成的任务取消, 避免 shutdown(wait=True) 阻塞
+            for fut in futures:
+                fut.cancel()
     return resolved
 
 
@@ -207,6 +246,7 @@ def _bootstrap_ip(host):
             return None
         ip_cached = hit[0] if isinstance(hit, tuple) else hit
         if isinstance(hit, tuple) and (now - hit[1]) > _BOOTSTRAP_TTL:
+            _bootstrap_cache.pop(host, None)
             return None
         return ip_cached
 
@@ -216,11 +256,15 @@ def _bootstrap_invalidate(host):
 
     DoH/DoT 上游域名 IP 变更(CDN 调度/运营商切换)后, 旧缓存 IP 会持续
     create_connection 失败。清除该条目后, 下次建连 _bootstrap_ip 返回 None,
-    回退系统 getaddrinfo 重新解析, 不必等熔断或重启。仅对 hostname 生效。"""
+    回退系统 getaddrinfo 重新解析, 不必等熔断或重启。仅对 hostname 生效。
+    v1.9.76: 同时清 _addr_cache(UDP 热路径 hostname 解析缓存), 否则 UDP 上游
+    仍钉在旧 A 记录上继续失败。"""
     if not host or not _is_hostname(host):
         return
     with _bootstrap_lock:
         _bootstrap_cache.pop(host, None)
+    with _addr_cache_lock:
+        _addr_cache.pop(host, None)
 
 
 def _bootstrap_set(host, ip):
@@ -255,7 +299,9 @@ def _resolve_host_once(host):
 
 def _host_port(up):
     addr = up.get("addr", "")
-    port = int(up.get("port", 53))
+    # #4 port=None 时 int(None) 崩; up.get("port", 53) 仅在 key 缺失时回退,
+    # 显式 port=null 会落到 int(None)。用 `or 53` 同时兜住 None 与缺失。
+    port = int(up.get("port") or 53)
     if addr.startswith("["):
         # [v6]:port
         idx = addr.find("]")
@@ -297,38 +343,39 @@ class _ConnPool:
             return True
 
     def acquire(self, key, timeout):
-        """拿一个连接槽。返回 "NEW" 表示可新建连接; None 表示超时(池满)。
+        """拿一个连接槽。返回 (conn_or_"NEW", entry); (None, None) 表示超时(池满)。
         惰性回收: 空闲超龄连接在取出时关闭丢弃(不归还池), 防连接泄漏。"""
         e = self.entry(key)
         if not e["sem"].acquire(timeout=timeout):
-            return None
+            return None, None
         try:
             with self._lock:
                 now = time.monotonic()
                 while e["conns"]:
                     c = e["conns"].popleft()
                     if self._idle_ok(c, now):
-                        return c
-                    # 超龄: 关闭并继续取下一个
+                        return c, e
                     try:
                         c.close()
                     except Exception:
                         pass
-                return "NEW"
+                return "NEW", e
         except Exception:
             e["sem"].release()
-            return None
+            return None, None
 
-    def release(self, key, conn):
-        e = self._entries.get(key)
-        if e is None:
-            # 上游已被 discard: 连接无法回池(整个 key 已删除), 必须显式关闭,
-            # 否则 in-flight 查询归还时连接对象被丢弃而 fd 迟迟不释放。
+    def release(self, entry, conn):
+        """按 entry 对象身份归还, 避免 discard 后同 key 新建 entry 导致 semaphore 错乱。"""
+        if entry is None:
             if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                try: conn.close()
+                except Exception: pass
+            return
+        # entry 已被 discard: 连接关闭, 不归还(旧 semaphore 已随 entry 丢弃)
+        if entry.get("_discarded"):
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
             return
         if conn is not None:
             with self._lock:
@@ -336,14 +383,16 @@ class _ConnPool:
                     conn._ebpdns_last_use = time.monotonic()
                 except Exception:
                     pass
-                e["conns"].append(conn)
-        e["sem"].release()
+                entry["conns"].append(conn)
+        entry["sem"].release()
 
     def discard(self, key):
         """删除上游时回收该 key 的连接组(释放连接对象与信号量)。
         连接对象由 GC 回收(TCP/TLS 连接无显式 close 时由 socket 析构关闭)。"""
         with self._lock:
             e = self._entries.pop(key, None)
+            if e is not None:
+                e["_discarded"] = True
         if e is not None:
             try:
                 for c in list(e.get("conns") or []):
@@ -360,11 +409,27 @@ _pool = _ConnPool()
 
 def discard_upstream_conns(up):
     """删除上游时回收 DoH/DoT 连接池条目(按 proto/host/port/path key),
-    防止 _pool 残留已删除上游的连接对象造成内存泄漏。"""
+    防止 _pool 残留已删除上游的连接对象造成内存泄漏。
+
+    v1.9.78 S1-1: 同时清理 _0x20 校验状态(_0x20_disabled/_0x20_misses/
+    _0x20_DISABLED_SINCE) 与 _addr_cache(hostname 解析缓存)。此清理与 proto
+    无关——UDP 上游的 _udp_query 同样按 up_id 写 _0x20_*, _addr_cache 同样按
+    host 缓存解析结果; 若只在 doh/dot 分支清理, UDP/TCP 上游删除后这些状态会
+    永久残留(内存泄漏 + 已删 up_id 永远不再参与 0x20 自恢复判据)。
+    """
+    up_id = up.get("id", "")
+    if up_id:
+        with _0x20_lock:
+            _0x20_disabled.discard(up_id)
+            _0x20_misses.pop(up_id, None)
+            _0x20_DISABLED_SINCE.pop(up_id, None)
+    host, port = _host_port(up)
+    with _addr_cache_lock:
+        _addr_cache.pop(host, None)
+
     proto = str(up.get("proto", "")).lower()
     if proto not in ("doh", "dot"):
         return
-    host, port = _host_port(up)
     path = "" if proto == "dot" else str(up.get("url") or DOH_DEFAULT_PATH)
     if path and not path.startswith("/"):
         path = "/" + path
@@ -441,7 +506,7 @@ def _doh_query(up, query_bytes, timeout_ms):
         return deadline - time.monotonic()
 
     # 连接槽获取带超时: 池满(4 连接都在忙)时等待, 不无限阻塞
-    got = _pool.acquire(key, timeout)
+    got, entry = _pool.acquire(key, timeout)
     if got is None:
         return False, None
     try:
@@ -450,25 +515,35 @@ def _doh_query(up, query_bytes, timeout_ms):
         if conn is None or getattr(conn, "sock", None) is None:
             rt = _remaining()
             if rt <= 0:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
             try:
                 conn = _doh_conn(host, port, rt)
             except OSError:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
         try:
             conn.request("POST", path, body=query_bytes, headers=headers)
             resp = conn.getresponse()
-            body = resp.read()
-            if resp.status != 200 or not body:
+            # v1.9.74 P2-2: 读上限 65536 并校验 <=65535, 与 DoT/QUIC 对齐,
+            # 防上游异常返回超大 body 撑爆内存。
+            body = resp.read(65536)
+            if resp.status != 200 or not body or len(body) > 65535:
                 try:
                     conn.close()
                 except Exception:
                     pass
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
-            _pool.release(key, conn)  # 复用成功，写回池
+            # v1.9.80: 上游要求 close 时不复用, 关闭后放回 None(下次新建)
+            if getattr(resp, "will_close", False):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _pool.release(entry, None)
+            else:
+                _pool.release(entry, conn)  # 复用成功，写回池
             # 首次 exchange 成功后才写回 fallback 解析出的 IP(防首条坏 A 记录入缓存)
             pb = getattr(conn, '_ebpdns_pending_bootstrap', None)
             if pb:
@@ -479,7 +554,7 @@ def _doh_query(up, query_bytes, timeout_ms):
             # 连接失效 → 关闭并一次性重试（新建连接），仅用剩余预算
             rt = _remaining()
             if rt <= 0:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
             try:
                 conn.close()
@@ -489,15 +564,23 @@ def _doh_query(up, query_bytes, timeout_ms):
                 conn = _doh_conn(host, port, rt)
                 conn.request("POST", path, body=query_bytes, headers=headers)
                 resp = conn.getresponse()
-                body = resp.read()
-                if resp.status != 200 or not body:
+                body = resp.read(65536)  # P2-2: 同上读上限+长度校验
+                if resp.status != 200 or not body or len(body) > 65535:
                     try:
                         conn.close()
                     except Exception:
                         pass
-                    _pool.release(key, None)
+                    _pool.release(entry, None)
                     return False, None
-                _pool.release(key, conn)
+                # v1.9.80: 同上, will_close 时不复用
+                if getattr(resp, "will_close", False):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _pool.release(entry, None)
+                else:
+                    _pool.release(entry, conn)
                 pb = getattr(conn, '_ebpdns_pending_bootstrap', None)
                 if pb:
                     _bootstrap_set(host, pb)
@@ -509,7 +592,7 @@ def _doh_query(up, query_bytes, timeout_ms):
                     conn.close()
                 except Exception:
                     pass
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
     except Exception as e:
         # 兜底: 任何异常路径都不泄漏连接槽; 若 conn 已建但未成功回池, 关闭防泄漏。
@@ -523,7 +606,7 @@ def _doh_query(up, query_bytes, timeout_ms):
                     conn.close()
             except Exception:
                 pass
-            _pool.release(key, None)
+            _pool.release(entry, None)
         except Exception:
             pass
         return False, None
@@ -608,7 +691,7 @@ def _dot_query(up, query_bytes, timeout_ms):
             except Exception:
                 continue
 
-    got = _pool.acquire(key, timeout)
+    got, entry = _pool.acquire(key, timeout)
     if got is None:
         return False, None
     try:
@@ -616,35 +699,32 @@ def _dot_query(up, query_bytes, timeout_ms):
         if sock is None:
             rt = deadline - time.monotonic()
             if rt <= 0:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
             try:
                 sock = _dot_conn(host, port, rt)
             except OSError:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
         try:
             msg = _exchange(sock)
             if msg is not None:
-                _pool.release(key, sock)  # 复用成功，写回池
+                _pool.release(entry, sock)  # 复用成功，写回池
                 pb = getattr(sock, '_ebpdns_pending_bootstrap', None)
                 if pb:
                     _bootstrap_set(host, pb)
                     sock._ebpdns_pending_bootstrap = None
                 return True, msg
-            # _exchange 返回 None(对端 EOF/超时/缓冲超限): 连接不可再用, 必须关闭
-            # 再归还槽位, 否则该 TLS socket 既不回池也不 close, fd 泄漏。
             try:
                 sock.close()
             except Exception:
                 pass
-            _pool.release(key, None)
+            _pool.release(entry, None)
             return False, None
         except OSError:
-            # 连接失效 → 关闭重试一次, 仅用剩余预算
             rt = deadline - time.monotonic()
             if rt <= 0:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
             try:
                 sock.close()
@@ -654,26 +734,22 @@ def _dot_query(up, query_bytes, timeout_ms):
                 sock = _dot_conn(host, port, rt)
                 msg = _exchange(sock)
                 if msg is not None:
-                    _pool.release(key, sock)
+                    _pool.release(entry, sock)
                     pb = getattr(sock, '_ebpdns_pending_bootstrap', None)
                     if pb:
                         _bootstrap_set(host, pb)
                         sock._ebpdns_pending_bootstrap = None
                     return True, msg
-                # 重试连接也不可用: 关闭后再归还槽位
                 try:
                     sock.close()
                 except Exception:
                     pass
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
             except OSError:
-                _pool.release(key, None)
+                _pool.release(entry, None)
                 return False, None
     except Exception as e:
-        # 兜底: 任何非 OSError 异常(如 IP 直连 TLS 的 ValueError 等)也不能无声吞掉,
-        # 对齐 DoH 外层日志(upstream.py _doh_query), 否则连接/握手失败在日志无线索。
-        # L1 修复: 对齐 DoH 外层, 关 socket 后再释放连接槽, 防极端路径 fd 泄漏。
         log.warning("DoT query unexpected error up=%s(%s proto=dot host=%s:%s): %s: %s",
                     up.get("id"), up.get("name"), host, port, type(e).__name__, e)
         try:
@@ -682,7 +758,7 @@ def _dot_query(up, query_bytes, timeout_ms):
                     sock.close()
             except Exception:
                 pass
-            _pool.release(key, None)
+            _pool.release(entry, None)
         except Exception:
             pass
         return False, None
@@ -691,7 +767,21 @@ def _dot_query(up, query_bytes, timeout_ms):
 # ---------------- UDP / TCP ---------------- #
 def _udp_query(up, query_bytes, timeout_ms):
     host, port = _host_port(up)
-    addr = (host, port)
+    up_id = up.get("id", "")
+    # v1.9.77 R5: 0x20 降级后永不恢复是缺陷——上游被临时规范化大小写的中间设备
+    # 误导后, 即使恢复正常也长期跳过 0x20 校验。这里在每次 UDP 查询开头检查:
+    # 若已降级且距降级时间 > 600s, 自动从 disabled 移除并清零 misses, 重新启用校验。
+    try:
+        with _0x20_lock:
+            _since = _0x20_DISABLED_SINCE.get(up_id)
+            if _since is not None and (time.monotonic() - _since) > _0x20_RECOVER_S:
+                _0x20_disabled.discard(up_id)
+                _0x20_misses.pop(up_id, None)
+                _0x20_DISABLED_SINCE.pop(up_id, None)
+                log.info("上游 %s(%s) 0x20 降级已达 %.0fs, 自动重新启用 0x20 校验",
+                         up.get("name"), up_id, _0x20_RECOVER_S)
+    except Exception:
+        pass
     try:
         qid = struct.unpack(">H", query_bytes[:2])[0]
     except Exception:
@@ -704,13 +794,20 @@ def _udp_query(up, query_bytes, timeout_ms):
     # 单值校验会误丢来自其他 IP 的响应); 解析失败则集合为空 → 不校验源,
     # 靠 qid(16bit 随机)兜底防投毒。
     expect_ips = set()
+    send_addr = (host, port)
     if not _is_hostname(host):
         expect_ips.add(host)
     else:
-        # 用带 TTL 的解析缓存, 避免 miss 热路径每次阻塞 getaddrinfo
-        expect_ips = _cached_udp_addrs(host)
+        # 用带 TTL 的解析缓存拿到 IP 集合, 避免 miss 热路径阻塞 getaddrinfo。
+        ips = _cached_udp_addrs(host)
+        expect_ips = set(ips)
+        if ips:
+            # v1.9.74 P1-3: 直接向已解析出的 IP sendto, 不再把 hostname 交给
+            # sendto(其会走系统解析/行为不确定)。多 IP 取集合首个(确定性, 不引入
+            # 额外状态); expect_ips 仍用于响应源 IP 校验。
+            send_addr = (next(iter(ips)), port)
     try:
-        sock.sendto(query_bytes, addr)
+        sock.sendto(query_bytes, send_addr)
         deadline = time.monotonic() + timeout_ms / 1000.0
         # H-5: 每轮 recvfrom 前按剩余时间重置超时。原实现 settimeout 只设一次,
         # 收到伪造/无关响应 continue 后, 下一轮 recvfrom 仍等完整 timeout, 总耗时
@@ -721,7 +818,10 @@ def _udp_query(up, query_bytes, timeout_ms):
                 return False, None
             sock.settimeout(remaining)
             try:
-                data, src = sock.recvfrom(4096)
+                # v1.9.76 2.6: recvfrom 65535。原 4096 上限在 UDP 大响应(DNSSEC/多 A
+                # 记录/EDNS 放大)时截断响应, parse_message 报 truncated 触发无谓 TCP 回退,
+                # 或直接解析失败被当投毒丢弃。EDNS UDP 可达上限即 65535。
+                data, src = sock.recvfrom(65535)
             except socket.timeout:
                 return False, None
             # 校验源地址（域名 host 用解析 IP 集合; 解析失败则不校验源, 靠 qid 兜底）
@@ -735,8 +835,25 @@ def _udp_query(up, query_bytes, timeout_ms):
                     continue  # 响应 ID 不匹配，继续等待（防乱序/投毒）
             # DNS 0x20 投毒防护: 响应 question qname 大小写必须与查询一致
             # (仅对明文 UDP 生效; 查询未做 0x20 时全小写 qname 也通过)
-            if not dnsmsg.check_0x20(query_bytes, data):
+            # v1.9.76 2.3: 已降级上游跳过校验; 失配按上游计数, 连续 3 次降级。
+            # v1.9.77 R4: _0x20_misses/_0x20_disabled 全部走 _0x20_lock 串行化, 消除
+            # 并发 read-modify-write 竞态。R5: 降级时记录时间戳供 600s 后自恢复。
+            with _0x20_lock:
+                x20_off = up_id in _0x20_disabled
+            if not x20_off and not dnsmsg.check_0x20(query_bytes, data):
+                with _0x20_lock:
+                    _0x20_misses[up_id] = _0x20_misses.get(up_id, 0) + 1
+                    if _0x20_misses[up_id] >= _0x20_FAIL_LIMIT and up_id not in _0x20_disabled:
+                        _0x20_disabled.add(up_id)
+                        _0x20_DISABLED_SINCE[up_id] = time.monotonic()
+                        log.warning("上游 %s(%s) 连续 %d 次 0x20 大小写失配, 自动关闭 0x20 校验"
+                                    "(疑似规范化大小写上游, %.0fs 后自动重试)",
+                                    up.get("name"), up_id,
+                                    _0x20_FAIL_LIMIT, _0x20_RECOVER_S)
                 continue  # 大小写失配 = 伪造应答嫌疑, 丢弃继续等
+            # 本查询收到 0x20 校验通过的响应 → 清零该上游连续失配计数
+            with _0x20_lock:
+                _0x20_misses[up_id] = 0
             return True, data
         return False, None
     except OSError:
@@ -842,8 +959,10 @@ def query_upstream(up, query_bytes, timeout_ms=1500):
 
 
 def probe_ip(ip, query_bytes, timeout_ms=800):
-    """对候选 IP 发起一次快速 UDP DNS 探测（用于测速择优）。返回 RTT ms 或 None。"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    """对候选 IP 发起一次快速 UDP DNS 探测（用于测速择优）。返回 RTT ms 或 None。
+    v1.9.76 2.8: 按地址族选择 socket(原硬编码 AF_INET, IPv6 候选探测静默失败)。"""
+    fam = socket.AF_INET6 if _is_v6(ip) else socket.AF_INET
+    sock = socket.socket(fam, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_ms / 1000.0)
         t0 = time.monotonic()
@@ -860,8 +979,9 @@ def probe_tcp(ip, port=443, timeout_ms=800):
     """对候选 IP 发起 TCP connect 探测（SmartDNS speed-check 风格, tcp:443）。
 
     更贴近真实访问路径；非特权即可（ICMP 才需 root）。返回 RTT ms 或 None。
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    v1.9.76 2.8: 按地址族选择 socket(原硬编码 AF_INET, IPv6 候选探测静默失败)。"""
+    fam = socket.AF_INET6 if _is_v6(ip) else socket.AF_INET
+    sock = socket.socket(fam, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout_ms / 1000.0)
         t0 = time.monotonic()

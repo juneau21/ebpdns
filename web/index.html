@@ -743,6 +743,8 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
         <div class="card">
           <div class="cfg-actions">
             <span style="font-size:12px;color:var(--text3);align-self:center" id="cache-policy-label">缓存策略: –</span>
+            <!-- #6 UDP 池满丢弃计数(遥测页展示) -->
+            <span style="font-size:12px;color:var(--amber);align-self:center" id="udp-dropped-label" title="UDP miss 队列满时丢弃的包数(客户端会重试)">UDP丢弃: 0</span>
             <select class="q-sel" id="cfg-cache-policy" title="缓存策略热切换 · 保存后自动热重载生效">
               <option value="lru">LRU 分区</option>
               <option value="partitioned">分区 LRU (partitioned)</option>
@@ -938,7 +940,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.68";    // 前端兜底版本(后端 /api/status.version 优先)
+const APP_VERSION = "v1.9.82";    // 前端兜底版本(后端 /api/status.version 优先)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[], hiddenHistoryBefore:null };
 const API = {
   async req(method, path, body){
@@ -1179,7 +1181,10 @@ function simLog(domain, qtype, level, answer, lat){
   else if (level === 'rule') msg = short + ' ' + qtype + '  分流规则 → ' + answer + '  (' + lat.toFixed(2) + 'ms)';
   else if (level === 'err') msg = short + ' ' + qtype + '  ' + answer;
   else msg = short + ' ' + qtype + '  ' + answer + '  (' + (lat?lat.toFixed(1):'') + 'ms)';
-  const line = { ts: nowTs(), level, msg };
+  const line = { ts: nowTs(), level, msg,
+    domain: domain, qtype: qtype, client_ip: '127.0.0.1',
+    upstream: level==='hit' ? 'cache' : 'sim-upstream',
+    answer: answer, rule: '' };
   sim.events.push(line);
   if (sim.events.length > 300) sim.events.shift();
   appendLogLine(line);
@@ -1254,9 +1259,12 @@ function appendLogLine(line, skipFilter){
   $('#log-count').textContent = all.length + ' events · 显示 ' + consoleBody.children.length;
 }
 function renderLogBatch(events, triggerPacket){
-  events.forEach(line => {
+  // #12 日志动画限制: 批量事件中只对最后 3 条 spawnPacket 动画(高频日志下逐条
+  // spawn 会狂建 SVG 动画节点拖卡前端), 其余只 appendLogLine 追加文本。
+  const n = events.length;
+  events.forEach((line, idx) => {
     appendLogLine(line);
-    if (triggerPacket) spawnPacket(line.domain || (line.msg || '').split(' ')[0], line.level === 'hit', line.level === 'err', 0);
+    if (triggerPacket && idx >= n - 3) spawnPacket(line.domain || (line.msg || '').split(' ')[0], line.level === 'hit', line.level === 'err', 0);
   });
 }
 function clearLogUI(){ consoleBody.innerHTML = ''; $('#log-count').textContent = '0 events · 显示 0'; }
@@ -1271,7 +1279,7 @@ function clearLogFilters(){
 const ST = { client:{x:9,y:28}, xdp:{x:26,y:28}, cache:{x:44,y:28}, reply:{x:87,y:28}, engine:{x:44,y:75}, up:[{x:64,y:75},{x:77,y:75},{x:90,y:75}] };
 const HIT_WP = [ST.client, ST.xdp, ST.cache, ST.reply];
 const ERR_WP = [ST.client, ST.xdp, ST.cache, ST.engine];
-const HIT_SEGS = [70, 70, 130]; const ERR_SEGS = [60, 60, 85, 300];
+const HIT_SEGS = [70, 70, 130]; const ERR_SEGS = [60, 60, 85];
 const MISS_SEGS = [60, 60, 85, 240, 340, 210, 150];
 function missWp(upIdx){ return [ST.client, ST.xdp, ST.cache, ST.engine, ST.up[upIdx], ST.engine, ST.cache, ST.reply]; }
 const STN_ICONS = {
@@ -1474,10 +1482,12 @@ function refreshCharts(){
 function chartUpOpt(ups){
   const names=[], data=[];
   (ups||[]).forEach(u => {
-    // 只显示"有真实查询且实测延迟>0"的上游: 禁用/无流量上游的 0ms 静态值
-    // 对用户是误导("0ms 异常"), 过滤后图表与健康表口径一致。
-    if (!(u.queries > 0) || !(u.avg_latency > 0)) return;
     const avg = u.avg_latency != null ? u.avg_latency : (u.latency != null ? u.latency : 0);
+    // #1 [严重] sim 模式 ups 对象无 queries 字段(仅 name/latency/success_rate),
+    // 原 `!(u.queries > 0)` 恒真会把全部 sim 上游滤光 → 图表空表。
+    // 修: real 模式仍按 queries>0 + 延迟>0 过滤; sim 分支只看延迟>0。
+    if (MODE === 'real' && !(u.queries > 0)) return;
+    if (!(avg > 0)) return;
     const sr = u.success_rate != null ? u.success_rate : 100;
     const color = sr < 60 ? '#ff6b5e' : (sr < 85 ? '#ffb454' : '#2ee6c8');
     const label = (u.addr || u.name || '–') + (u.port ? ':' + u.port : '');
@@ -1515,6 +1525,11 @@ function refreshKpiNums(){
   if (cfEl && MODE === 'real' && real.status && real.status.cache_file){
     cfEl.textContent = real.status.cache_file; cfEl.title = real.status.cache_file;
   } else if (cfEl && MODE === 'sim'){ cfEl.textContent = '（仿真模式不落盘）'; cfEl.title = ''; }
+  // #6 遥测页展示 UDP 丢弃计数
+  const udEl = $('#udp-dropped-label');
+  if (udEl && MODE === 'real' && real.status){
+    udEl.textContent = 'UDP丢弃: ' + (real.status.udp_dropped || 0);
+  }
 }
 function refreshTelemetryUI(){
   let ups;
@@ -1741,7 +1756,7 @@ function renderUpstreams(ups){
     '<input class="text" data-f="fulladdr" data-id="' + esc(u.id) + '" value="' + esc(full) + '" spellcheck="false" title="完整 DNS 地址, 可直接编辑(如 https://dns.alidns.com/dns-query / http3://dns.alidns.com/dns-query / quic://223.5.5.5 / udp://119.29.29.29; 支持 https/http/quic/doq/tls/dot/udp/tcp/doh/doh3/http3/h3 前缀)">' +
     '<select class="q-sel" data-f="port" data-id="' + esc(u.id) + '">' + portHtml + '</select>' +
     '<select class="q-sel" data-f="group" data-id="' + esc(u.id) + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
-    (u.latency != null
+    (u.latency > 0 || u.latency_measured
       ? '<input class="num" type="number" data-f="latency" data-id="' + esc(u.id) + '" min="1" max="500" value="' + u.latency + '" title="基础延迟(ms), 实时查询延迟以遥测为准">'
       : '<span class="lat-pending" title="应用配置后自动实测延迟">待测</span>') +
     connBadge(u) +
@@ -1843,7 +1858,12 @@ function bindConfigEvents(){
   $('#cfg-size-r').addEventListener('input', e => { if (MODE==='real') real.config.cache_size = +e.target.value; else config.cacheSize = +e.target.value; $('#cfg-size').value = e.target.value; });
   $('#cfg-ttl').addEventListener('change', e => { if (MODE==='real') real.config.ttl = clamp(+e.target.value,5,3600); else config.ttl = clamp(+e.target.value,5,3600); $('#cfg-ttl-r').value = e.target.value; });
   $('#cfg-ttl-r').addEventListener('input', e => { if (MODE==='real') real.config.ttl = +e.target.value; else config.ttl = +e.target.value; $('#cfg-ttl').value = e.target.value; });
-  const bindCfg = (id, key, conv) => { $(id).addEventListener('change', e => { if (MODE==='real') real.config[key] = conv(e); else config[key] = conv(e); }); };
+  const bindCfg = (id, key, conv) => { $(id).addEventListener('change', e => {
+    // S2(第六份review): real 模式下 real.config 尚未就绪(/api/config 失败/尚未返回)时,
+    // 改表单不能直接写 real.config[key](TypeError)。守卫提示并放弃本次变更。
+    if (MODE==='real' && !real.config) { note('配置未就绪, 请刷新','var(--red)'); return; }
+    if (MODE==='real') real.config[key] = conv(e); else config[key] = conv(e);
+  }); };
   bindCfg('#cfg-prefetch','prefetch', e => e.target.checked);
   bindCfg('#cfg-kdirect','kernel_direct', e => e.target.checked);
   bindCfg('#cfg-ttlmin','ttl_min', e => clamp(+e.target.value,0,86400));
@@ -1909,8 +1929,12 @@ function bindConfigEvents(){
     }
     else if (f === 'port') u.port = +el.value;
     else if (f === 'proto') {
+      // #7 协议切换仅在原端口等于旧协议默认端口时才联动新默认端口, 否则保留用户自定义端口
+      // (原代码无条件 u.port=新默认端口, 切协议会把自定义端口如 8443 覆盖成 443)
+      const oldProto = u.proto;
+      const oldDefault = {udp:53,tcp:53,doh:443,dot:853,doq:853,doh3:443}[oldProto] || 53;
       u.proto = el.value;
-      u.port = ({ udp:53, tcp:53, doh:443, dot:853, doq:853, doh3:443 }[el.value] || 53);  // 协议联动默认端口
+      if (u.port === oldDefault) u.port = {udp:53,tcp:53,doh:443,dot:853,doq:853,doh3:443}[el.value] || 53;
       const row = el.closest('.up-row');
       if (row){ const fa = row.querySelector('[data-f="fulladdr"]'); if (fa) fa.value = fullAddr(u); }
       if (MODE === 'sim') renderPipeline();
@@ -1934,12 +1958,13 @@ function bindConfigEvents(){
     const s = (raw || '').trim();
     if (!s) return null;
     let proto = null, rest = s, url = '';
+    let plainHttp = false;   // http:// 明文 DoH 标记: 默认端口应落 80 而非 443
     const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/);
     if (m){
       const scheme = m[1].toLowerCase();
       rest = m[2];
       if (scheme === 'https'){ proto = 'doh'; url = '/dns-query'; }
-      else if (scheme === 'http'){ proto = 'doh'; url = '/dns-query'; }   // 明文 DoH(端口 80)
+      else if (scheme === 'http'){ proto = 'doh'; url = '/dns-query'; plainHttp = true; }   // 明文 DoH(端口 80)
       else if (scheme === 'quic' || scheme === 'doq'){ proto = 'doq'; url = '/dns-query'; }
       else if (scheme === 'tls' || scheme === 'dot'){ proto = 'dot'; url = ''; }
       else if (scheme === 'udp'){ proto = 'udp'; url = ''; }
@@ -1955,7 +1980,8 @@ function bindConfigEvents(){
       proto = 'udp';      // 无前缀 + 自动 → 默认 UDP
     }
     // 拆分 host:port 与路径
-    let host = rest, port = UP_PORT_DEFAULT[proto];
+    // 明文 http:// DoH 默认端口 80(而非 doh 默认 443); 显式 host:port 仍会覆盖
+    let host = rest, port = plainHttp ? 80 : (UP_PORT_DEFAULT[proto] || 53);
     const slash = host.indexOf('/');
     if (slash >= 0){
       const p = host.slice(slash);
@@ -1964,10 +1990,17 @@ function bindConfigEvents(){
       }
       host = host.slice(0, slash);
     }
-    const colon = host.lastIndexOf(':');
-    if (colon > 0 && /^\d+$/.test(host.slice(colon + 1))){
-      port = parseInt(host.slice(colon + 1), 10);
-      host = host.slice(0, colon);
+    // 裸 IPv6 保护: host 含多个冒号且未用方括号包裹时, 不能把末段 ":1" 当端口切
+    // (2001:db8::1 会被误切 port=1)。多冒号非方括号形式整体当 host, 不切端口。
+    const _v6Multi = (host.match(/:/g) || []).length > 1;
+    if (!host.startsWith('[') && _v6Multi){
+      // 裸 IPv6 字面量, 跳过端口切分
+    } else {
+      const colon = host.lastIndexOf(':');
+      if (colon > 0 && /^\d+$/.test(host.slice(colon + 1))){
+        port = parseInt(host.slice(colon + 1), 10);
+        host = host.slice(0, colon);
+      }
     }
     if (!host || !/^[a-zA-Z0-9.\-_:\[\]]+$/.test(host)){
       return { error: '地址格式无法识别: ' + s };
@@ -2085,11 +2118,16 @@ function bindConfigEvents(){
           // 注意: latency_measured 是持久化配置字段(非遥测), 不能删除——
           // 删除后后端把所有上游视为"未测速", 每次保存都触发全量后台重测速。
         });
-        await API.put('/api/config', cfgCopy);
+        const putRes = await API.put('/api/config', cfgCopy);
+        // #5 后端返回 ignored_keys: 白名单外被丢弃的键, note() 提示用户哪些未生效
+        if (putRes && Array.isArray(putRes.ignored_keys) && putRes.ignored_keys.length) {
+          note('配置已保存; 忽略未保存的键: ' + putRes.ignored_keys.join(', '), 'var(--orange)');
+        } else {
+          note('配置已保存到后端 ' + real.configPath + ', 新增上游自动测速中…', 'var(--green)');
+        }
         // P1-3: 缓存策略(lru<->tinylfu)需重建缓存容器, 保存后自动热重载生效
         const needReload = _cachePolicyDirty;
         if (needReload) _cachePolicyDirty = false;
-        note('配置已保存到后端 ' + real.configPath + ', 新增上游自动测速中…', 'var(--green)');
         // 后端对新增上游异步实测延迟, 稍后拉取配置刷新显示真实延迟
         setTimeout(async () => {
           try {
@@ -2181,7 +2219,9 @@ async function pollStatus(){
     real.status = await API.get('/api/status');
     if (statusFail > 0){
       // 后端曾不可达(重启/崩溃恢复): 刷新配置与遥测数据, 避免界面停留在旧值
-      if (route === 'config') API.get('/api/config').then(c => { real.config = c; renderConfig(); }).catch(() => {});
+      // S2(第六份review): 恢复后无条件重拉 /api/config 保持 real.config 新鲜——
+      // 此前仅 route==='config' 才拉, 其他路由停留时后端恢复后配置仍为空/旧。
+      API.get('/api/config').then(c => { real.config = c; if (route === 'config') renderConfig(); }).catch(() => {});
       if (route === 'telemetry') refreshTelemetryUI();
       statusFail = 0;
     }
@@ -2325,7 +2365,16 @@ async function boot(){
       // 若 boot 时 /api/config reject 被 catch 吞掉, configPath 仍有值, 否则
       // 进配置页保存时提示会显示 "配置已保存到后端 undefined"。
       real.configPath = (s && s.config_path) || '/etc/ebpdns/config.json';
-      try { real.config = await API.get('/api/config'); } catch(e){}
+      try { real.config = await API.get('/api/config'); }
+      catch(e){
+        // S2(第六份review): /api/config 失败不能静默吞掉。否则 MODE 仍为 real 而
+        // real.config 为 undefined, 后续 renderConfig 访问 real.config.upstreams 直接
+        // 抛 TypeError, 界面白屏卡死。降级 SIM, 走下方 else 初始化。
+        real.config = null;
+        MODE = 'sim';
+      }
+    }
+    if (MODE === 'real'){
       appendLogLine({ ts: nowTs(), level: 'sys', msg: 'ebpdns ' + ((s && s.version) ? s.version : APP_VERSION) + ' 已连接后端 daemon · REAL 模式' });
       renderPipeline(); bindEvents(); setRoute(initialRoute); initCharts();
       startRealPolls();

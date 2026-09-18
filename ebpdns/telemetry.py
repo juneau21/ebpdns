@@ -2,6 +2,7 @@
 
 import threading
 import time
+import random
 from collections import Counter, deque
 
 
@@ -84,8 +85,12 @@ class Telemetry:
 
     def current_qps(self):
         now = time.time()
+        # v1.9.81: popleft 竞态防护(另一线程可能同时弹)
         while self.qps_window and now - self.qps_window[0] > 1.0:
-            self.qps_window.popleft()
+            try:
+                self.qps_window.popleft()
+            except IndexError:
+                break
         return len(self.qps_window)
 
     # ---- 延迟 ----
@@ -231,6 +236,14 @@ class Telemetry:
             if len(self.manual_history) > 20:
                 self.manual_history = self.manual_history[-20:]
     # ---- 缓存命中快路径（一次加锁完成所有遥测更新, 减少热路径锁竞争）----
+    @staticmethod
+    def _should_sample_event(level):
+        """v1.9.76: 真实流量(hit/miss)日志按 10% 采样进 events deque, 降低高 QPS
+        下锁内 append 开销; err/warn/rule/sys 等低频事件全量保留。"""
+        if level in ("hit", "miss"):
+            return random.random() < 0.1
+        return True
+
     def fast_hit(self, qtype, raw_len, resp_len, lat_ms, kernel_direct=False):
         with self._lock:
             self.counters["total"] += 1
@@ -255,20 +268,22 @@ class Telemetry:
             self.counters["bytes_in"] += raw_len
             self.counters["bytes_out"] += resp_len
             self.qtype_dist[self.qtype_cat(qtype)] += 1
-            self._ev_seq += 1
-            self.events.append({
-                "seq": self._ev_seq,
-                "ts": _now_ts(),
-                "domain": domain,
-                "qtype": qtype,
-                "level": level,
-                "msg": msg,
-                "lat": lat_ms,
-                "client_ip": None,
-                "upstream": upstream,
-                "answer": answer,
-                "rule": None,
-            })
+            # v1.9.76: 真实流量(hit)事件 10% 采样进 events, 计数器仍全量更新
+            if self._should_sample_event(level):
+                self._ev_seq += 1
+                self.events.append({
+                    "seq": self._ev_seq,
+                    "ts": _now_ts(),
+                    "domain": domain,
+                    "qtype": qtype,
+                    "level": level,
+                    "msg": msg,
+                    "lat": lat_ms,
+                    "client_ip": None,
+                    "upstream": upstream,
+                    "answer": answer,
+                    "rule": None,
+                })
         self.qps_window.append(time.time())
         self.latency_window.append(lat_ms)
 
@@ -280,8 +295,11 @@ class Telemetry:
         upstream:  实际应答来源(缓存直答/内核直答/serve-stale/分流规则/上游名列表)
         answer:    解析值 IP(应答的 chosen IP, 无答案如 NXDOMAIN 为 '')
         rule:      命中的分流规则 match(未命中为 None)
+        v1.9.76: 真实流量(hit/miss)事件 10% 采样, 其余全量。
         """
         with self._lock:
+            if not self._should_sample_event(level):
+                return
             self._ev_seq += 1
             self.events.append({
                 "seq": self._ev_seq,
@@ -357,17 +375,19 @@ class Telemetry:
 
 
 def _now_ts():
-    """带 1ms 缓存的时间戳格式化: time.localtime() 是系统调用,
-    每查询日志都调用在高 QPS 下是显著开销。同一秒内复用缓存结果。"""
+    """带秒级缓存的时间戳格式化: time.localtime() 是系统调用, 每查询日志都调用在
+    高 QPS 下是显著开销。同一秒内复用 localtime 结果; 毫秒位每次现算(v1.9.76:
+    原实现连毫秒一起按秒缓存, 同一秒内 ms 位冻结成首个调用值, 时间戳失真)。"""
     now = time.time()
     sec = int(now)
     cached = _now_ts._cache
     if cached is not None and cached[0] == sec:
-        return cached[1]
-    t = time.localtime(now)
+        hhmmss = cached[1]
+    else:
+        t = time.localtime(now)
+        hhmmss = "%02d:%02d:%02d" % (t.tm_hour, t.tm_min, t.tm_sec)
+        _now_ts._cache = (sec, hhmmss)
     ms = int(now * 1000) % 1000
-    s = "%02d:%02d:%02d.%03d" % (t.tm_hour, t.tm_min, t.tm_sec, ms)
-    _now_ts._cache = (sec, s)
-    return s
+    return "%s.%03d" % (hhmmss, ms)
 
 _now_ts._cache = None

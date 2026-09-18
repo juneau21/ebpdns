@@ -1,9 +1,11 @@
 """HTTP JSON API + 静态控制台服务（内置 http.server，零依赖）。"""
 
+import itertools
 import json
 import os
 import re
 import ssl
+import ipaddress
 import subprocess
 import sys
 import threading
@@ -21,17 +23,45 @@ from .probe import probe_upstream_latencies
 
 log = logging.getLogger("ebpdns.api")
 from . import upstream, quic_upstream, dnsmsg
+from .telemetry import _now_ts
 
 # 上游/规则 id 生成器: 毫秒时间戳 + 进程内自增后缀, 消除同一毫秒 POST 两个
 # 上游/规则拿到相同 id 的碰撞窗口(按 id next(...) 定位只会命中第一个)。
-_id_seq = iter(range(1, 1 << 30))
+_id_seq = itertools.count(1)
 _id_seq_lock = threading.Lock()
+# v1.9.74 P2-8: profile 全局单飞锁(cProfile 进程级单例, 同时只允许一个采样)
+_PROFILE_LOCK = threading.Lock()
 
 
 def _new_id(prefix):
     with _id_seq_lock:
         seq = next(_id_seq)
     return "%s%d%04x" % (prefix, int(time.time() * 1000), seq & 0xFFFF)
+
+
+# 域名列表导入里 "re:" 高级规则前缀判定, 模块级编译一次避免每次导入重编译。
+_PREFIX_RE = re.compile(r"^re:")
+
+
+def _pl_escape(s):
+    """#2 [严重]: Prometheus 标签值转义。标签值(规则名/上游 id)若含反斜杠、引号、
+    换行/回车, 未转义会破坏 exposition 文本格式(metric 行被截断/引号不闭合),
+    导致 Prometheus 抓取失败或指标解析错乱。按 Prometheus 文本格式规范转义。"""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+
+
+def _as_bool(v, default=True):
+    """宽松布尔解析。JSON/表单里字符串 "false"/"0"/"off"/"no" 必须判为 False,
+    不能用裸 bool("false") (恒 True)。None 走 default 缺省。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
 
 
 def _sub_url_blocked(url):
@@ -311,22 +341,21 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, OSError):
             pass  # 客户端已提前断开连接, 静默忽略
 
-    MAX_BODY = 64 * 1024 * 1024   # 64MB: 容纳数十万条分流规则的大配置
+    # v1.9.76 P1-2: 请求体上限分级。普通接口 4MB(足以应付绝大多数配置/规则增量);
+    # rules/import(粘贴海量域名)与 rules/subscribe 单独 16MB。超限直接 413 不 drain。
+    MAX_BODY = 4 * 1024 * 1024          # 普通接口默认上限 4MB
+    MAX_BODY_BIG = 16 * 1024 * 1024     # rules/import、rules/subscribe 上限 16MB
 
-    def _read_json(self, expect_dict=True):
+    def _read_json(self, expect_dict=True, limit=None):
         try:
+            if limit is None:
+                limit = getattr(self, "_body_limit", self.MAX_BODY)
             n = int(self.headers.get("Content-Length") or 0)
             if n <= 0:
                 return None
-            # 超限: 必须先消费(drain)body 再拒绝, 否则客户端仍在上行、
-            # 服务端提前回响应导致 TCP 半关闭 BrokenPipe
-            if n > self.MAX_BODY:
-                remaining = n
-                while remaining > 0:
-                    chunk = self.rfile.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
+            # 超限直接 413, 不 drain body(大请求体不预读, 拒绝后连接由 handler 关闭)
+            if n > limit:
+                self._send(413, {"error": "request body too large (limit %d bytes)" % limit})
                 return None
             obj = json.loads(self.rfile.read(n).decode("utf-8"))
             # 防御: 绝大多数端点期望 JSON 对象; 收到数组等非对象时返回 None,
@@ -334,7 +363,13 @@ class _Handler(BaseHTTPRequestHandler):
             if expect_dict and not isinstance(obj, dict):
                 return None
             return obj
-        except Exception:
+        except json.JSONDecodeError as e:
+            # v1.9.80: JSON 语法错误 → 调用方按空 dict 处理最终返回 400
+            log.debug("JSON decode error: %s", e)
+            return None
+        except Exception as e:
+            # 其他错误(IO/连接重置) → 500, 不静默吞
+            log.warning("read body error: %r", e)
             return None
 
     def _csrf_ok(self):
@@ -374,6 +409,13 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         method = self.command
+
+        # v1.9.76 P1-2: rules/import(粘贴海量域名)与 rules/subscribe 单独放宽到 16MB,
+        # 其余接口默认 4MB。_read_json 未显式传 limit 时读取此实例属性。
+        self._body_limit = (self.MAX_BODY_BIG
+                            if (path in ("/api/rules/import", "/api/rules/subscribe")
+                                and method == "POST")
+                            else self.MAX_BODY)
 
         # 静态资源
         if path in ("/", "/index.html"):
@@ -488,6 +530,8 @@ class _Handler(BaseHTTPRequestHandler):
                 key=lambda x: x[1], reverse=True)[:10],
             "config_path": app.config_path,
             "endpoints": app.dns_server.endpoints() if app.dns_server else None,
+            # #6 UDP 池满丢弃计数(udp4+udp6), 前端遥测页展示
+            "udp_dropped": app.dns_server.udp_dropped() if app.dns_server else 0,
         }
 
     def _snapshot(self):
@@ -548,30 +592,38 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "results": results})
 
     def _api_profile(self, query):
-        """性能剖析端点: GET/POST /api/profile?seconds=N (默认 5, 上限 30)。
+        """性能剖析端点: GET/POST /api/profile?seconds=N (默认 3, 上限 10)。
         对运行中流量采样 N 秒(cProfile 全局 hook), 返回按累计耗时排序的
-        Top 函数统计——定位热点用。注意: 采样期间有性能开销, 按需调用。"""
+        Top 函数统计——定位热点用。注意: 采样期间有性能开销, 按需调用。
+        v1.9.74 P2-8: 全局单飞(threading.Lock), 同时只允许一个采样——cProfile
+        是进程级单例, 并发两次采样会互相 enable/disable 污染统计; 第二个请求直接
+        409 拒绝, 不排队阻塞。"""
+        if not _PROFILE_LOCK.acquire(blocking=False):
+            return self._send(409, {"error": "已有 profile 采样进行中, 请稍后再试"})
         try:
-            seconds = min(30, max(1, int((query.get("seconds") or ["5"])[0])))
-        except Exception:
-            seconds = 5
-        import cProfile
-        import io as _io
-        import pstats
-        prof = cProfile.Profile()
-        log.info("性能剖析启动: 采样 %d 秒(期间有 cProfile 开销)", seconds)
-        prof.enable()
-        try:
-            time.sleep(seconds)
+            try:
+                seconds = min(10, max(1, int((query.get("seconds") or ["3"])[0])))
+            except Exception:
+                seconds = 3
+            import cProfile
+            import io as _io
+            import pstats
+            prof = cProfile.Profile()
+            log.info("性能剖析启动: 采样 %d 秒(期间有 cProfile 开销)", seconds)
+            prof.enable()
+            try:
+                time.sleep(seconds)
+            finally:
+                prof.disable()
+            buf = _io.StringIO()
+            try:
+                pstats.Stats(prof, stream=buf).sort_stats("cumulative").print_stats(25)
+            except Exception:
+                buf.write("(无采样数据, 采样期间可能无查询流量)")
+            return self._send(200, "ebpdns profile (%ds):\n" % seconds + buf.getvalue(),
+                              ctype="text/plain; charset=utf-8")
         finally:
-            prof.disable()
-        buf = _io.StringIO()
-        try:
-            pstats.Stats(prof, stream=buf).sort_stats("cumulative").print_stats(25)
-        except Exception:
-            buf.write("(无采样数据, 采样期间可能无查询流量)")
-        return self._send(200, "ebpdns profile (%ds):\n" % seconds + buf.getvalue(),
-                          ctype="text/plain; charset=utf-8")
+            _PROFILE_LOCK.release()
 
     def _api_restart(self):
         """重启 daemon：先返回响应，1 秒后由后台线程触发重启。"""
@@ -590,6 +642,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad config"})
         # 白名单: 只允许写配置主体中既有的顶层键(排除 listen/api/web_root)。
         # 防止 deep_merge 把攻击者注入的任意键(如伪装 listen/钩子字段)写回。
+        # #5 记录被白名单过滤掉的键, 回传 ignored_keys 供前端 note() 提示用户:
+        # 哪些提交的键未被保存(避免静默丢弃让用户误以为已生效)。
+        dropped = [k for k in data.keys() if k not in _CFG_WRITABLE_KEYS]
         data = {k: v for k, v in data.items() if k in _CFG_WRITABLE_KEYS}
         # 防御: cache_size 仅在请求中显式传入时校验; 未传则保留现有值。
         # 显式 null/非整数/越界均拒绝, 否则后续 int(None) 崩溃或容量被静默清空。
@@ -609,7 +664,6 @@ class _Handler(BaseHTTPRequestHandler):
         # H-2: old_cfg / old_ups / old_policy 必须在锁内读取, 否则与 reload() 竞争——
         # 锁外读 old_cfg=v1, reload 中途把 self.cfg 换成 v2, 进锁后 deep_merge(v1)
         # 会把 v2 的变更覆盖丢失。
-        old_by_id = {}
         old_policy = "lru"
         old_ups = []
         old_cfg = None
@@ -619,7 +673,6 @@ class _Handler(BaseHTTPRequestHandler):
             with self.app._lock:
                 old_cfg = self.app.cfg   # 回滚用: 合并失败时还原旧配置引用
                 old_ups = list(old_cfg.get("upstreams", []))
-                old_by_id = {u.get("id"): u for u in old_ups}
                 old_policy = str(old_cfg.get("cache_policy", "lru")).lower()
                 # 回滚用: cache.capacity 可能已在下方被改, cache 对象可能被
                 # switch_cache_policy 整体替换; 异常时必须一并还原, 否则缓存策略/容量
@@ -639,8 +692,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if new_policy != old_policy:
                     try:
                         self.app.resolver.switch_cache_policy(new_policy)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning("switch_cache_policy(%s) failed: %s", new_policy, e)
                 # 上游 diff: 删除的回收连接/统计; 保留但 proto/addr/port/url 变更的
                 # 旧连接池 key 已失效, 一并回收(与 AppContext.reload 路径行为一致)
                 new_ups = self.app.cfg.get("upstreams", [])
@@ -651,6 +704,10 @@ class _Handler(BaseHTTPRequestHandler):
                         # 整条删除
                         try:
                             self.app.telemetry.per_upstream.pop(uid, None)
+                        except Exception:
+                            pass
+                        try:
+                            self.app.resolver._cb.pop(uid, None)
                         except Exception:
                             pass
                         try:
@@ -722,7 +779,7 @@ class _Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_probe, daemon=True, name="newup-probe").start()
         except Exception:
             pass
-        return self._send(200, {"ok": True, "saved_to": saved})
+        return self._send(200, {"ok": True, "saved_to": saved, "ignored_keys": dropped})
 
     def _upstreams_with_health(self):
         cfg = self.app.cfg
@@ -802,7 +859,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "group": body.get("group") or "domestic",
                 "latency": 0,               # 0 = 未测速, 待后台实测写回真实延迟
                 "latency_measured": False,
-                "enabled": bool(body.get("enabled", True)),
+                "enabled": _as_bool(body.get("enabled", True)),
             }
             with self.app._lock:
                 cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
@@ -840,7 +897,7 @@ class _Handler(BaseHTTPRequestHandler):
             "group": body.get("group") or "domestic",
             "latency": 0,               # 0 = 未测速, 待后台实测写回真实延迟
             "latency_measured": False,
-            "enabled": bool(body.get("enabled", True)),
+            "enabled": _as_bool(body.get("enabled", True)),
         }
         with self.app._lock:
             cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
@@ -859,6 +916,13 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "upstream": u})
 
     def _api_upstream_op(self, up_id):
+        # #1 [严重]: body 读取(_read_json 阻塞读 socket/解析 JSON)必须移出 app._lock。
+        # 否则慢客户端上传 body 期间持全局锁, 阻塞所有 DNS 解析与其它 API。
+        # DELETE 不需要 body; 仅 PUT/PATCH 读 body, 读完再进锁做读改写。
+        if self.command in ("PUT", "PATCH"):
+            body = self._read_json() or {}
+        else:
+            body = {}
         with self.app._lock:
             cfg = self.app.cfg
             ups = cfg.get("upstreams", [])
@@ -876,6 +940,10 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
+                    self.app.resolver._cb.pop(up_id, None)
+                except Exception:
+                    pass
+                try:
                     upstream.discard_upstream_conns(removed)
                 except Exception:
                     pass
@@ -884,17 +952,29 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return self._send(200, {"ok": True})
-            body = self._read_json() or {}
+            # v1.9.74 P2-7: 字段白名单 + proto 枚举校验, 禁止改 id / 灌入任意字段
+            # (防误改内部字段如 latency_measured/健康检查状态, 或注入非法 proto)。
+            _UPSTREAM_WHITELIST = {"name", "proto", "addr", "url", "port",
+                                   "enabled", "latency", "group", "weight",
+                                   "allow_private_ip"}
+            _ALLOWED_PROTO = {"udp", "tcp", "doh", "dot", "doq", "doh3"}
             for k, v in body.items():
                 if k == "id":
-                    continue
+                    return self._send(400, {"error": "不允许修改上游 id"})
+                if k not in _UPSTREAM_WHITELIST:
+                    return self._send(400, {"error": "非法字段: %s (允许: %s)" % (
+                        k, ",".join(sorted(_UPSTREAM_WHITELIST)))})
                 if k == "port" or k == "latency":
                     try:
                         v = int(v)
                     except (TypeError, ValueError):
                         return self._send(400, {"error": "%s 必须是整数" % k})
                 if k == "enabled":
-                    v = bool(v)
+                    v = _as_bool(v, True)
+                if k == "allow_private_ip":
+                    v = _as_bool(v, False)
+                if k == "proto" and str(v).lower() not in _ALLOWED_PROTO:
+                    return self._send(400, {"error": "proto 必须是 %s 之一" % "/".join(sorted(_ALLOWED_PROTO))})
                 ups[idx][k] = v
             config_mod.save_config(cfg, self.app.config_path)
             return self._send(200, {"ok": True, "upstream": ups[idx]})
@@ -951,8 +1031,9 @@ class _Handler(BaseHTTPRequestHandler):
         action = body.get("action") or "block"
         group = body.get("group") or "global"
         ip = body.get("ip") or "1.2.3.4"
-        if not url.lower().startswith(("http://", "https://")):
-            return self._send(400, {"error": "仅支持 http/https 订阅链接"})
+        # v1.9.74 P2-10: 规则订阅只允许 https://(明文 http 可被中间人篡改规则注入)
+        if not url.lower().startswith("https://"):
+            return self._send(400, {"error": "仅支持 https:// 订阅链接(http:// 不安全, 已禁止)"})
         try:
             text = self._fetch_sub_text(url)
         except Exception as e:
@@ -960,7 +1041,8 @@ class _Handler(BaseHTTPRequestHandler):
         domains = _parse_domain_list(text)
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
-        items = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
+        # #3 订阅 re: 规则: 已带 *. 或已是 re: 正则的域名不加通配前缀(否则 re: 规则被破坏)
+        items = [{"match": ("*." + d if not d.startswith(("*.", "re:")) else d)} for d in domains]
         # 读改写全程持 app._lock(网络下载已在锁外完成), 与 _api_update_config/reload
         # 串行化, 防持旧 cfg 引用被并发整体替换后 save_config 静默覆盖丢配置。
         with self.app._lock:
@@ -1121,8 +1203,9 @@ class _Handler(BaseHTTPRequestHandler):
         下载域名列表 → 写入独立文件 rules_sub.json → 重建索引(不写入 config.json 明细)。"""
         body = self._read_json() or {}
         url = (body.get("url") or "").strip()
-        if not url or not url.lower().startswith(("http://", "https://")):
-            return self._send(400, {"error": "仅支持 http/https 订阅链接"})
+        # v1.9.74 P2-10: 规则订阅只允许 https://(明文 http 可被中间人篡改规则注入)
+        if not url or not url.lower().startswith("https://"):
+            return self._send(400, {"error": "仅支持 https:// 订阅链接(http:// 不安全, 已禁止)"})
         action = body.get("action") or "block"
         group = body.get("group") or "global"
         ip = body.get("ip") or "1.2.3.4"
@@ -1133,7 +1216,8 @@ class _Handler(BaseHTTPRequestHandler):
         domains = _parse_domain_list(text)
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
-        items = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
+        # #3 订阅 re: 规则: 已带 *. 或已是 re: 正则的域名不加通配前缀(否则 re: 规则被破坏)
+        items = [{"match": ("*." + d if not d.startswith(("*.", "re:")) else d)} for d in domains]
         # 读改写全程持 app._lock(下载在锁外), 与本地规则 CRUD/upstream CRUD 同型。
         with self.app._lock:
             cfg = self.app.cfg   # 进锁后重新取最新引用
@@ -1190,7 +1274,8 @@ class _Handler(BaseHTTPRequestHandler):
             target = next((s for s in subs if s.get("url") == url), None)
             if not target:
                 return self._send(404, {"error": "订阅不存在: %s" % url})
-            target["rules"] = [{"match": ("*." + d if not d.startswith("*.") else d)} for d in domains]
+            # #3 订阅刷新同样保护 re: 规则不被加通配前缀
+            target["rules"] = [{"match": ("*." + d if not d.startswith(("*.", "re:")) else d)} for d in domains]
             target["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             self._save_subs(subs)
             cfg = self.app.cfg
@@ -1231,6 +1316,12 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "url": url})
 
     def _api_rule_op(self, rid):
+        # #1 [严重]: 同样把 body 读取移出 app._lock, 避免持锁期间阻塞读 socket。
+        # DELETE 不需要 body; 仅 PUT/PATCH 读 body, 读完再进锁做读改写。
+        if self.command in ("PUT", "PATCH"):
+            body = self._read_json() or {}
+        else:
+            body = {}
         # 读改写全程持 app._lock: 与 add/import 串行化, 防并发改删规则基于陈旧快照
         # 互相覆盖(同上游 CRUD)。
         with self.app._lock:
@@ -1248,7 +1339,6 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return self._send(200, {"ok": True})
-            body = self._read_json() or {}
             for k, v in body.items():
                 if k == "id":
                     continue
@@ -1383,15 +1473,15 @@ class _Handler(BaseHTTPRequestHandler):
             "# TYPE ebpdns_rule_hits gauge",
         ]
         for k, v in rh.items():
-            lines.append('ebpdns_rule_hits{rule="%s"} %d' % (k, v))
+            lines.append('ebpdns_rule_hits{rule="%s"} %d' % (_pl_escape(k), v))
         lines.append("# HELP ebpdns_upstream_health 上游健康度(成功次数, 延迟ms)")
         lines.append("# TYPE ebpdns_upstream_health gauge")
         # H-1: 加锁快照, 避免并发 setdefault 触发 dict changed size
         for uid, st in tel.upstreams_snapshot():
             ok = st.get("ok", 0)
             avg = (st.get("lat_sum", 0) / ok) if ok else 0
-            lines.append('ebpdns_upstream_health{upstream="%s",result="ok"} %d' % (uid, ok))
-            lines.append('ebpdns_upstream_health{upstream="%s",result="avg_latency_ms"} %s' % (uid, round(avg, 2)))
+            lines.append('ebpdns_upstream_health{upstream="%s",result="ok"} %d' % (_pl_escape(uid), ok))
+            lines.append('ebpdns_upstream_health{upstream="%s",result="avg_latency_ms"} %s' % (_pl_escape(uid), round(avg, 2)))
         try:
             import resource
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -1405,8 +1495,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_static(self, name):
         root = os.path.abspath(self.app.cfg.get("web_root") or os.path.join(os.path.dirname(__file__), "..", "web"))
-        target = os.path.realpath(os.path.join(root, name))
-        if not target.startswith(os.path.realpath(root) + os.sep) and target != os.path.realpath(root):
+        root_real = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root_real, name))
+        if not (target == root_real or target.startswith(root_real + os.sep)):
             return self._send(403, {"error": "forbidden"})
         if not os.path.isfile(target):
             return self._send(404, {"error": "not found"})
@@ -1490,12 +1581,6 @@ class APIServer(ThreadingHTTPServer):
         return t
 
 
-def _now_ts():
-    t = time.localtime()
-    ms = int(time.time() * 1000) % 1000
-    return "%02d:%02d:%02d.%03d" % (t.tm_hour, t.tm_min, t.tm_sec, ms)
-
-
 def _parse_domain_list(text):
     """解析域名列表文本 -> 去重后的域名列表（含 *. 通配保留）。
 
@@ -1512,11 +1597,17 @@ def _parse_domain_list(text):
     out = []
     seen = set()
 
-    _PREFIX_RE = _re.compile(r"^re:")
     def _add(tok):
         tok = tok.strip().strip("[]()").strip(".").lower()
         if not tok:
             return
+        # #4 [严重]: 裸 IPv4/IPv6 不是域名, 识别为合法 IP 则跳过。
+        # (hosts 单行 "127.0.0.1" 过去会被域名正则误收为域名)
+        try:
+            ipaddress.ip_address(tok.strip("[]"))
+            return
+        except ValueError:
+            pass
         # 高级规则前缀(re:)原样保留 —— 不能被域名清洗切成前缀词。
         if _PREFIX_RE.match(tok):
             if tok not in seen:
@@ -1540,9 +1631,11 @@ def _parse_domain_list(text):
         # YAML 顶层键（payload:/rules: 等）非域名, 跳过
         if _re.match(r"^[a-z_]+\s*:\s*$", line):
             continue
-        m = _re.search(r"address\s*=\s*/([^/\s]+)", line)
+        # #3 [严重]: dnsmasq 一行 address=/a.com/b.com/ 可含多个域名。
+        # 正则捕获整条路径(到行尾空白前), 再按 "/" 切分, 不再只取第一个域名。
+        m = _re.search(r"address\s*=\s*/([^\s]+)", line)
         if m:
-            for seg in m.group(1).split("/"):
+            for seg in m.group(1).strip("/").split("/"):
                 _add(seg)
             continue
         m = _re.search(r"^address\s+/([^/\s]+)", line)

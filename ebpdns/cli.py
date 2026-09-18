@@ -8,7 +8,6 @@ import signal
 import sys
 import threading
 import time
-import urllib.request
 
 from . import __version__
 from . import config as config_mod
@@ -446,7 +445,7 @@ def main(argv=None):
     p_print.add_argument("-c", "--config", help="配置文件路径")
 
     args = parser.parse_args(argv)
-    config_path = getattr(args, "config", None) or args.config
+    config_path = args.config
     if not config_path:
         # 未显式指定时探测实际路径（含 EBPDNS_CONFIG 环境变量指向），
         # 以便缓存文件等派生路径落在配置同目录

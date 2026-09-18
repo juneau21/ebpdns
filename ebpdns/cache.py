@@ -19,16 +19,30 @@ class LRUCache:
 
     def __init__(self, capacity=1024):
         # cache_size=null/None 归一化: 配置显式设为 null 时 cfg.get 返回 None
-        # (key 存在), 直接 None//8 会 TypeError 崩溃。None 按默认容量, 0 由
-        # 下方 max(16,...) 钳到最小容量。
+        # (key 存在), 直接 None//8 会 TypeError 崩溃。None 按默认容量。
+        # 先 max(16,...) 钳到最小容量再 divmod: 否则容量<16 时各桶 _caps
+        # 之和(<16) 与 self._cap(=16) 不一致——容量分裂。
         if capacity is None:
             capacity = 1024
-        capacity = int(capacity)
-        self._caps = [max(16, capacity // self._SHARDS)] * self._SHARDS
+        capacity = max(16, int(capacity))
+        # #9 分桶余数同 setter: divmod 分摊余数, 总容量恰为 capacity
+        _base, _rem = divmod(capacity, self._SHARDS)
+        self._caps = [_base + (1 if i < _rem else 0) for i in range(self._SHARDS)]
         self._maps = [OrderedDict() for _ in range(self._SHARDS)]
         self._locks = [threading.Lock() for _ in range(self._SHARDS)]
-        self._cap = max(16, capacity)
+        self._cap = capacity
         self._puts = 0
+        # v1.9.74 P1-2: >0 时保留"过期但在 stale_window 内"的条目(serve-stale 兜底),
+        # 由 resolver 用 cfg stale_ttl 下发。0 = 旧行为(get/purge 见到过期即删)。
+        self._stale_window = 0
+
+    @property
+    def stale_window(self):
+        return self._stale_window
+
+    @stale_window.setter
+    def stale_window(self, v):
+        self._stale_window = int(v or 0)
 
     def _shard(self, key):
         return hash(key) & (self._SHARDS - 1)
@@ -42,11 +56,13 @@ class LRUCache:
         if n is None:
             n = 1024
         n = max(16, int(n))
-        per = n // self._SHARDS
         self._cap = n
+        # #9 LRU 分桶余数: divmod 把余数分摊到前 rem 个分桶, 使各桶容量之和恰为 n
+        # (原 n//SHARDS 丢弃余数, 总容量 = n - 余数, 与配置 cache_size 不一致)
+        base, rem = divmod(n, self._SHARDS)
         for i in range(self._SHARDS):
             with self._locks[i]:
-                self._caps[i] = per
+                self._caps[i] = base + (1 if i < rem else 0)
                 self._evict_locked(i)
 
     def get(self, key, now=None):
@@ -57,7 +73,8 @@ class LRUCache:
             if not entry:
                 return None
             if entry.get("expires_at", 0) <= now:
-                self._maps[i].pop(key, None)
+                # v1.9.74 P1-2: 过期不 pop。由 get_stale() 决定"窗口内保留/窗口外清除",
+                # 否则 serve-stale 条目在首次过期命中后即被删除, 上游故障期间只能兜底一次。
                 return None
             self._maps[i].move_to_end(key)
             return entry
@@ -91,6 +108,8 @@ class LRUCache:
             if now - exp > stale_window:
                 self._maps[i].pop(key, None)
                 return None
+            # v1.9.74 P1-2: 窗口内保留, 并移到队尾保护(防 LRU 淘汰立即清掉活跃 stale 条目)
+            self._maps[i].move_to_end(key)
             return entry
 
     def _evict_locked(self, i):
@@ -109,10 +128,16 @@ class LRUCache:
         # LRU 顺序下(OrderedDict: 队首=最久未访问), 过期条目集中在队首。
         # 只从队首向后扫描到首个未过期条目即停, 避免每 32 次 put 做全表扫描
         # (高容量下全表扫描在锁内执行会阻塞 get/put 热路径)。
+        # v1.9.74 P1-2: stale_window>0 时, 窗口内的过期条目保留(serve-stale 兜底用),
+        # 只清超窗口的死条目。
         cnt = 0
+        sw = self._stale_window
         while self._maps[i]:
             k, e = next(iter(self._maps[i].items()))
-            if e.get("expires_at", 0) > now:
+            exp = e.get("expires_at", 0)
+            if exp > now:
+                break
+            if sw and (now - exp) <= sw:
                 break
             self._maps[i].pop(k, None)
             cnt += 1
@@ -220,12 +245,58 @@ class PartitionedCache:
             capacity = 1024
         self._cap = max(16, int(capacity))
         self._parts = dict(_DEFAULT_PARTITIONS if partitions is None else partitions)
+        # M1(第六份review): 自定义 partitions 可能是原始权重(如 {a:2,b:3,c:5} 未归一),
+        # 不归一化则 self._cap * self._parts[g] 会溢出总容量。统一归一化到和为 1,
+        # __init__ 建分区与 capacity setter 共用此已归一化字典。
+        _total = sum(self._parts.values()) or 1.0
+        self._parts = {g: v / _total for g, v in self._parts.items()}
         self._groups = sorted(self._parts)
-        # 每分区至少 16 条, 剩余按比例分配
+        # v1.9.76 2.11: 小容量重分配。原 max(16, cap*ratio) 在 cap 很小时(如 cap=16)
+        # 每个分区都被抬到 16, 3 分区总容量膨胀到 48(远超配置)。改为: 先给每分区 16
+        # (仅当总容量足够), 剩余按比例分; 总容量不足 16*分区数时按比例直接分(每分区
+        # 至少 1), 不再强行抬到 16。
         self._caches = {}
-        for g in self._groups:
-            share = max(16, int(self._cap * self._parts[g]))
+        for g, share in self._allocate(self._cap).items():
             self._caches[g] = LRUCache(share)
+
+    def _allocate(self, cap):
+        """按归一化权重把总容量 cap 分配到各分区, 总和恰为 cap。
+        每分区下限 16 仅在总容量足够(>=16*分区数)时施加; 否则按比例直接分。"""
+        n = len(self._groups)
+        if n == 0:
+            return {}
+        out = {}
+        if cap >= 16 * n:
+            base = 16
+            rem = cap - 16 * n
+            # 剩余按权重分配, divmod 余数给前若干组, 总和恰为 cap
+            raw = {g: rem * self._parts[g] for g in self._groups}
+            floored = {g: int(raw[g]) for g in self._groups}
+            leftover = cap - 16 * n - sum(floored.values())
+            order = sorted(self._groups, key=lambda g: raw[g] - floored[g], reverse=True)
+            for i in range(leftover):
+                floored[order[i % n]] += 1
+            for g in self._groups:
+                out[g] = base + floored[g]
+        else:
+            # 总容量太小: 按比例分, 每分区至少 1, divmod 凑整
+            raw = {g: cap * self._parts[g] for g in self._groups}
+            floored = {g: max(1, int(raw[g])) for g in self._groups}
+            diff = cap - sum(floored.values())
+            order = sorted(self._groups, key=lambda g: raw[g] - floored[g], reverse=True)
+            i = 0
+            while diff > 0:
+                floored[order[i % n]] += 1
+                diff -= 1
+                i += 1
+            while diff < 0:
+                g = order[i % n]
+                if floored[g] > 1:
+                    floored[g] -= 1
+                    diff += 1
+                i += 1
+            out = floored
+        return out
 
     def _split(self, key):
         """key 3 元组 (group, domain, qtype); 兼容旧 2 元组(归 default)。"""
@@ -241,14 +312,24 @@ class PartitionedCache:
     def capacity(self):
         return self._cap
 
+    @property
+    def stale_window(self):
+        c = next(iter(self._caches.values()), None)
+        return getattr(c, "_stale_window", 0) if c else 0
+
+    @stale_window.setter
+    def stale_window(self, v):
+        for c in self._caches.values():
+            c._stale_window = int(v or 0)
+
     @capacity.setter
     def capacity(self, n):
         if n is None:
             n = 1024
         self._cap = max(16, int(n))
+        shares = self._allocate(self._cap)
         for g, c in self._caches.items():
-            share = max(16, int(self._cap * self._parts.get(g, 0.1)))
-            c.capacity = share
+            c.capacity = shares.get(g, 16)
 
     def get(self, key, now=None):
         g, k = self._split(key)
@@ -401,7 +482,9 @@ class TinyLFUCache:
         # cache_size=null/None 归一化(见 LRUCache.__init__ 说明): int(None) 会崩溃。
         if capacity is None:
             capacity = 1024
-        self._cap = max(64, int(capacity))
+        # v1.9.76 2.12: 容量下限统一 16(原 TinyLFU 64 与 LRU/Partitioned 16 不一致)。
+        # 内部 win/main/prob/prot 最小 16 的分段逻辑保持不变。
+        self._cap = max(16, int(capacity))
         self._win_cap = self._prob_cap = self._prot_cap = self._main_cap = 16
         self._window = OrderedDict()      # 新条目窗口区
         self._probation = OrderedDict()   # 晋升候选区
@@ -409,7 +492,16 @@ class TinyLFUCache:
         self._sketch = _CMSketch()
         self._lock = threading.Lock()
         self._puts = 0
+        self._stale_window = 0   # v1.9.74 P1-2: >0 保留过期窗口内条目(serve-stale)
         self._repartition_locked()
+
+    @property
+    def stale_window(self):
+        return self._stale_window
+
+    @stale_window.setter
+    def stale_window(self, v):
+        self._stale_window = int(v or 0)
 
     @property
     def capacity(self):
@@ -420,7 +512,7 @@ class TinyLFUCache:
         if n is None:
             n = 1024
         with self._lock:
-            self._cap = max(64, int(n))
+            self._cap = max(16, int(n))
             self._repartition_locked()
             self._evict_locked()
 
@@ -428,9 +520,19 @@ class TinyLFUCache:
         """按 Caffeine 比例重算三段容量: window 1% / probation 40% / protected 60%(main 内)。
         probation 从 20% 提到 40%: DNS 负载下新条目从 window 溢出后需要足够
         缓冲等待下一次命中晋升 protected, 20% 过窄导致刚进 probation 的条目
-        未及晋升就被后续溢出挤掉(实测 Zipf 命中率 93.9%→93.4%, 40% 恢复)。"""
-        win = max(16, self._cap // 100)
-        main = self._cap - win
+        未及晋升就被后续溢出挤掉(实测 Zipf 命中率 93.9%→93.4%, 40% 恢复)。
+        v1.9.76: 容量下限降到 16 后, 总容量很小(<48)时不再强行每段 16(会致
+        prot 为负), 改为按比例分且各段至少 1; 正常容量保持 min 16 逻辑。"""
+        cap = self._cap
+        if cap < 48:
+            win = max(1, cap // 100) or 1
+            main = cap - win
+            prob = max(1, main * 2 // 5)
+            prot = max(1, main - prob)
+            self._win_cap, self._prob_cap, self._prot_cap, self._main_cap = win, prob, prot, main
+            return
+        win = max(16, cap // 100)
+        main = cap - win
         prob = max(16, main * 2 // 5)
         prot = main - prob
         self._win_cap, self._prob_cap, self._prot_cap, self._main_cap = win, prob, prot, main
@@ -441,21 +543,22 @@ class TinyLFUCache:
             e = self._window.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    self._window.pop(key, None)
-                    return None
+                    return None  # P1-2: 过期不 pop, 由 get_stale/purge 决定
                 self._window.move_to_end(key)
                 self._sketch.inc(key)
                 return e
             e = self._probation.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    self._probation.pop(key, None)
-                    return None
+                    return None  # P1-2: 过期不 pop
                 # 命中即晋升 protected(受保护段), protected 满则挤队首回 probation
                 self._probation.pop(key)
                 if len(self._protected) >= self._prot_cap and self._protected:
                     pk, pv = self._protected.popitem(last=False)
                     self._probation[pk] = pv
+                    # #2 Caffeine 语义: protected 挤下的条目进 probation 队首
+                    # (最久未使用, 下次优先被挤走), 直接赋值默认落队尾与之相反
+                    self._probation.move_to_end(pk, last=False)
                 self._protected[key] = e
                 self._protected.move_to_end(key)
                 self._sketch.inc(key)
@@ -463,8 +566,7 @@ class TinyLFUCache:
             e = self._protected.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    self._protected.pop(key, None)
-                    return None
+                    return None  # P1-2: 过期不 pop
                 self._protected.move_to_end(key)
                 self._sketch.inc(key)
                 return e
@@ -505,7 +607,7 @@ class TinyLFUCache:
                 if now - exp > stale_window:
                     store.pop(key, None)
                     return None
-                return e
+                return e  # P1-2: 窗口内保留(serve-stale 兜底)
             return None
 
     def delete(self, key):
@@ -547,6 +649,8 @@ class TinyLFUCache:
         while len(self._protected) > self._prot_cap:
             pk, pv = self._protected.popitem(last=False)
             self._probation[pk] = pv
+            # #2 同晋升路径: 挤下的 protected 条目进 probation 队首(最久未使用)
+            self._probation.move_to_end(pk, last=False)
         # 3) probation 超容 → 丢队首(真正淘汰点)
         while len(self._probation) > self._prob_cap:
             self._probation.popitem(last=False)
@@ -556,13 +660,18 @@ class TinyLFUCache:
         # 从队首向后扫到首个未过期条目即停, 避免每 32 次 put 对三段全表做列表推导
         # (cap=4096 时每次 ~1.2 万次 dict 项遍历, 锁内阻塞 get/put 热路径, cProfile 实测
         # 占 TinyLFU put 累计时间 ~50%)。漏扫到的过期条目由 get 的惰性清理兜底, 不丢数据。
+        # v1.9.74 P1-2: stale_window>0 时窗口内过期条目保留, 只清超窗口死条目。
         cnt = 0
+        sw = self._stale_window
         for store in (self._window, self._probation, self._protected):
             if not store:
                 continue
             while store:
                 k, e = next(iter(store.items()))
-                if e.get("expires_at", 0) > now:
+                exp = e.get("expires_at", 0)
+                if exp > now:
+                    break
+                if sw and (now - exp) <= sw:
                     break
                 store.pop(k, None)
                 cnt += 1
@@ -621,12 +730,13 @@ class TinyLFUCache:
             for e in entries or []:
                 try:
                     k = tuple(e.get("key") or [])
-                    # 兼容 PartitionedCache 写出的 3 元组 [group, domain, qtype]:
-                    # 运行期 get/put 用 2 元组 (domain, qtype), restore 必须剥掉
-                    # group, 否则重启后全部 miss(对齐 LRUCache.restore)。
-                    if len(k) == 3:
-                        k = (k[1], k[2])
-                    if len(k) != 2 or "answers" not in e or "rcode" not in e:
+                    # S1(第六份review): TinyLFU 是顶层缓存, 不经 PartitionedCache._split,
+                    # 运行期 resolver._ckey 始终返回 3 元组 (group,domain,qtype), serialize
+                    # 也写 3 元组。restore 必须原样保留 3 元组, 否则重启后 key 错配全 miss。
+                    # 仅兼容历史 2 元组旧条目(无 group)。
+                    if len(k) != 3 and len(k) != 2:
+                        continue
+                    if "answers" not in e or "rcode" not in e:
                         continue
                     e = dict(e)
                     if pt > 0:

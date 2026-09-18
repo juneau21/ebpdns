@@ -14,9 +14,9 @@ v1.9.0 修复（长期运行 1.7G 内存泄漏 / 重连风暴）：
    消除流状态字典无限增长的内存泄漏。
 """
 import asyncio
+import concurrent.futures as _cf
 import logging
 import gc
-import ssl
 import struct
 import threading
 import time
@@ -125,12 +125,15 @@ class _QuicUpstream:
         self._thread = None
         self._protocol = None
         self._conn_ready = None
-        self._conn_gen = 0  # 连接代数，断开后自增触发重建
+        # 连接代数, 断开后自增触发重建。当前仅作诊断/观测字段保留(连接重建计数),
+        # 不在热路径读取 —— 保留以备后续按代数驱逐旧连接的诊断用途, 不删除。
+        self._conn_gen = 0
         self._lock = threading.Lock()
         self._started = False
         self._closing = False  # 优雅退出标志: 置位后 _maintain 不再重连
         self._reconnect_flag = False  # 请求重建标志(连接级失败)
         self._conn_start = 0.0   # 当前连接建立时刻(用于稳定度判定)
+        self._ever_connected = False  # v1.9.76: 是否曾成功建连(首次连接失败也参与退避递增)
         self.reconnects = 0      # 累计重连次数(诊断用)
         self.fail_seq = 0        # 连续查询失败计数(连接级)
     # ---- 线程与 loop ----
@@ -209,6 +212,7 @@ class _QuicUpstream:
                 async with connect(connect_host, self.port, configuration=conf,
                                    create_protocol=_H3Client if self.proto == "doh3" else _DoQClient) as proto:
                     self._conn_start = time.monotonic()
+                    self._ever_connected = True
                     fail_seq = 0
                     log.info("QUIC %s/%s 连接建立", self.proto, self.host)
                     self._protocol = proto
@@ -241,7 +245,10 @@ class _QuicUpstream:
             # 上游不稳定(连接建立后短时间即断开)时退避持续指数递增到 60s 封顶,
             # 从根本上遏制无脑重连风暴。
             alive = time.monotonic() - self._conn_start
-            if alive >= _STABLE_SEC:
+            # v1.9.76: 仅当曾成功建连且稳定存活 >=_STABLE_SEC 才复位退避。
+            # 首次连接失败(_ever_connected=False)时旧逻辑 alive≈进程 uptime 巨大,
+            # 误判"稳定"把 backoff 复位成 2s, 持续连接失败时 2s 一次无脑重连。
+            if self._ever_connected and alive >= _STABLE_SEC:
                 backoff = 2.0
             else:
                 backoff = min(backoff * 2, 60.0)
@@ -282,7 +289,7 @@ class _QuicUpstream:
             ok, data = fut.result(timeout_ms / 1000.0 + 0.5)
             lat = int((time.monotonic() - t0) * 1000)
             return ok, data, lat, (None if ok else "query failed")
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, _cf.TimeoutError):
             # 关键: 取消悬挂在 loop 上的协程——否则超时后协程仍持有旧连接
             # proto 引用, 重连多次后旧连接对象无法被 GC, 长期累积成内存泄漏
             try:
@@ -299,7 +306,7 @@ class _QuicUpstream:
         """
         try:
             await asyncio.wait_for(self._conn_ready.wait(), timeout)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, _cf.TimeoutError):
             return False, None
         proto = self._protocol
         if proto is None or proto._quic._close_event is not None:
@@ -332,7 +339,7 @@ class _QuicUpstream:
             proto.transmit()
             try:
                 await asyncio.wait_for(st["done"].wait(), timeout)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, _cf.TimeoutError):
                 return False, None
             if st["n"] < 0 or st["n"] > _MAX_MSG:
                 return False, None
@@ -358,7 +365,7 @@ class _QuicUpstream:
         try:
             try:
                 await asyncio.wait_for(st["done"].wait(), timeout)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, _cf.TimeoutError):
                 return False, None
             if st["status"] != 200 or not st["body"]:
                 return False, None

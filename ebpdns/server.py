@@ -85,6 +85,22 @@ class _UDPHandler:
         self._slots = threading.BoundedSemaphore(workers * 3)
         self.sock = None
         self._stop = threading.Event()
+        # #6 UDP 丢弃计数器: 池满(miss 处理队列满)时丢弃的 UDP 包数。
+        # 主线程写, /api/status 读, 用锁保护计数。
+        self._drop_lock = threading.Lock()
+        self._dropped = 0
+        # v1.9.76 P0-2: UDP recv 瞬时 OSError 计数(网卡抖动/ICMP port unreachable 等
+        # 偶发错误不应 break 整个收包线程)。连续错误达阈值才重建 socket(置 stop 退出
+        # serve_forever, 由上层重绑); 成功收包即清零。
+        self._recv_errs = 0
+
+    def _inc_dropped(self):
+        with self._drop_lock:
+            self._dropped += 1
+
+    def dropped(self):
+        with self._drop_lock:
+            return self._dropped
 
     def bind(self, spec):
         host, port = parse_bind(spec)
@@ -107,8 +123,28 @@ class _UDPHandler:
                 data, addr = self.sock.recvfrom(4096)
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except OSError as e:
+                # v1.9.76 P0-2: 偶发 OSError(ICMP port unreachable/网卡抖动)不应直接
+                # break 收包线程(那会永久停止该 UDP 监听)。计数+告警, 连续达阈值才
+                # 置 stop 重建 socket; 成功收包即清零。
+                self._recv_errs += 1
+                if self._recv_errs <= 3:
+                    log.warning("UDP recv error: %r", e)
+                # v1.9.77 R3: 阈值 10→20。偶发 ICMP port unreachable/网卡抖动在生产上
+                # 可能连续触发十几次, 10 次过激进导致正常流量被误判为线程故障、交给
+                # systemd 反复重启。保持 stop 让 systemd 拉起的行为不变, 只放宽阈值与
+                # 日志措辞。
+                if self._recv_errs >= 20:
+                    log.error("UDP 收包线程连续错误达阈值, 主动退出进程交 systemd 重启 (累计 %d 次)", self._recv_errs)
+                    # v1.9.80: 改为主动退出进程, 让 systemd Restart=on-failure 拉起新实例。
+                    # 缓存持久化每 60s 周期运行, 丢失最多一个周期的新条目, 可接受。
+                    try:
+                        self._stop.set()
+                    except Exception:
+                        pass
+                    os._exit(1)
+                continue
+            self._recv_errs = 0
             # 缓存命中快路径: 主线程直接查 LRU 回包, 避免线程池调度。
             # 报文只解析一次: miss 时把解析结果传给完整路径, 避免线程池重复解析。
             msg = None
@@ -132,7 +168,9 @@ class _UDPHandler:
                     self.pool.submit(self._handle, data, addr, msg)
                 except Exception:
                     self._slots.release()
-            # 池满: 丢弃本包, UDP 客户端会重试, 避免积压拖垮主循环
+            else:
+                # #6 池满: 丢弃本包, UDP 客户端会重试, 避免积压拖垮主循环; 计一次丢弃
+                self._inc_dropped()
 
     def _handle(self, data, addr, msg=None):
         try:
@@ -373,3 +411,10 @@ class DNSServer:
             "tcp": self._fmt(self.tcp_addr),
             "tcp6": self._fmt(self.tcp6_addr),
         }
+
+    def udp_dropped(self):
+        """#6 UDP 丢弃总数: udp4 + udp6 池满丢弃计数之和。"""
+        n = self.udp.dropped() if getattr(self, "udp", None) else 0
+        if getattr(self, "udp6", None):
+            n += self.udp6.dropped()
+        return n
