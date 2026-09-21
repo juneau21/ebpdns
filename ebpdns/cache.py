@@ -10,6 +10,31 @@ import time
 from collections import OrderedDict
 
 
+def _safe_int(v, default=0):
+    """R6/P3-2: 与 resolver._safe_int 同模式(本地副本, 避免循环 import)。
+    旧 stale_window setter 用 `int(v or 0)` falsy 模式——0 被改写、畸形串
+    直接 ValueError。现严格区分: None/无法解析→default, 可解析值(含 0)保留。
+    """
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v, default=0.0):
+    """R7/P2-4: 与 resolver._safe_float 同模式(本地副本, 避免循环 import)。
+    restore() 内裸 float(persist_ttl or 0) 对畸形串抛 ValueError 被 try/except
+    兜底成 pt=0——冗余且吞错。改 _safe_float: None/无法解析→default, 可解析值保留。"""
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 class LRUCache:
     """分桶 LRU 缓存：内部 _SHARDS 个独立分桶，每桶独立锁+OrderedDict。
     按 key hash 路由分桶——不同域名的查询可并行读写不同分桶，
@@ -20,18 +45,24 @@ class LRUCache:
     def __init__(self, capacity=1024):
         # cache_size=null/None 归一化: 配置显式设为 null 时 cfg.get 返回 None
         # (key 存在), 直接 None//8 会 TypeError 崩溃。None 按默认容量。
-        # 先 max(16,...) 钳到最小容量再 divmod: 否则容量<16 时各桶 _caps
-        # 之和(<16) 与 self._cap(=16) 不一致——容量分裂。
+        # 先 max(16,...) 钳到最小容量再 divmod: LRU 内部分 8 shard, 容量<8 时
+        # divmod 会让部分 shard 得 0 容量(put 后立即被 _evict_locked 淘汰), 这些
+        # shard 上的 key 永远缓存不住。min-16 保证每 shard 至少 2 条, 是 8-shard
+        # 设计的安全下限。PartitionedCache 的小容量分配份额经此钳制后生效(R48/P3-1)。
         if capacity is None:
             capacity = 1024
-        capacity = max(16, int(capacity))
+        # R6/P2-3 全量清扫: 原仅 None 归一化, 畸形串仍 int() 抛 ValueError。
+        # resolver 侧已 _safe_int 包裹, 缓存层自身也防御性兜底。
+        capacity = max(16, _safe_int(capacity, 1024))
         # #9 分桶余数同 setter: divmod 分摊余数, 总容量恰为 capacity
         _base, _rem = divmod(capacity, self._SHARDS)
         self._caps = [_base + (1 if i < _rem else 0) for i in range(self._SHARDS)]
         self._maps = [OrderedDict() for _ in range(self._SHARDS)]
         self._locks = [threading.Lock() for _ in range(self._SHARDS)]
         self._cap = capacity
-        self._puts = 0
+        # P3-7(第八轮): 全局 _puts 跨 shard 读-改-写存在 lost update。改为每分桶
+        # 独立计数器, 在各自 shard 锁内自增, 消除竞态。
+        self._put_counts = [0] * self._SHARDS
         # v1.9.74 P1-2: >0 时保留"过期但在 stale_window 内"的条目(serve-stale 兜底),
         # 由 resolver 用 cfg stale_ttl 下发。0 = 旧行为(get/purge 见到过期即删)。
         self._stale_window = 0
@@ -42,7 +73,10 @@ class LRUCache:
 
     @stale_window.setter
     def stale_window(self, v):
-        self._stale_window = int(v or 0)
+        # R6/P3-2: 旧 `int(v or 0)` 是 R5 已修掉的 falsy-0 模式——畸形串("abc")
+        # `or` 后仍是 "abc" → int() 抛 ValueError。改用本地 _safe_int(None/畸形→0,
+        # 0 保留), max(0,...) 钳负值。LRUCache 与 TinyLFUCache 两处 setter 同型。
+        self._stale_window = max(0, _safe_int(v, 0))
 
     def _shard(self, key):
         return hash(key) & (self._SHARDS - 1)
@@ -55,7 +89,7 @@ class LRUCache:
     def capacity(self, n):
         if n is None:
             n = 1024
-        n = max(16, int(n))
+        n = max(16, _safe_int(n, 1024))
         self._cap = n
         # #9 LRU 分桶余数: divmod 把余数分摊到前 rem 个分桶, 使各桶容量之和恰为 n
         # (原 n//SHARDS 丢弃余数, 总容量 = n - 余数, 与配置 cache_size 不一致)
@@ -66,17 +100,21 @@ class LRUCache:
                 self._evict_locked(i)
 
     def get(self, key, now=None):
-        now = now if now is not None else time.time()
+        if now is None:
+            now = time.time()
         i = self._shard(key)
         with self._locks[i]:
-            entry = self._maps[i].get(key)
-            if not entry:
+            m = self._maps[i]
+            entry = m.get(key)
+            if entry is None:
                 return None
-            if entry.get("expires_at", 0) <= now:
+            # 所有回填/恢复路径均保证 expires_at 字段存在, 直接索引比 .get() 省一次
+            # 默认值查找(热路径每 QPS 一次, dict.get 占 cProfile 显著比例)。
+            if entry["expires_at"] <= now:
                 # v1.9.74 P1-2: 过期不 pop。由 get_stale() 决定"窗口内保留/窗口外清除",
                 # 否则 serve-stale 条目在首次过期命中后即被删除, 上游故障期间只能兜底一次。
                 return None
-            self._maps[i].move_to_end(key)
+            m.move_to_end(key)
             return entry
 
     def put(self, key, value, now=None):
@@ -86,8 +124,8 @@ class LRUCache:
             self._maps[i][key] = value
             self._maps[i].move_to_end(key)
             self._evict_locked(i)
-            self._puts += 1
-            if (self._puts & 0x1F) == 0:
+            self._put_counts[i] += 1
+            if (self._put_counts[i] & 0x1F) == 0:
                 self._purge_expired_locked(i, now)
 
     def delete(self, key):
@@ -149,7 +187,14 @@ class LRUCache:
                 self._maps[i].clear()
 
     def __len__(self):
-        return sum(len(self._maps[i]) for i in range(self._SHARDS))
+        # P2-3: 原无锁读取 len(self._maps[i]) 与并发 put/delete 的 OrderedDict
+        # 操作竞争, 可能抛 RuntimeError(dict changed size during iteration)或读到
+        # 不一致长度。逐 shard 持锁读取后求和。
+        total = 0
+        for i in range(self._SHARDS):
+            with self._locks[i]:
+                total += len(self._maps[i])
+        return total
 
     def snapshot_keys(self):
         out = []
@@ -189,14 +234,15 @@ class LRUCache:
 
     def restore(self, entries, now=None, persist_ttl=0):
         now = now if now is not None else time.time()
-        pt = 0
-        try:
-            pt = max(0, float(persist_ttl or 0))
-        except Exception:
-            pt = 0
-        for i in range(self._SHARDS):
-            with self._locks[i]:
-                self._maps[i].clear()
+        # R7/P2-4: 原裸 float(persist_ttl or 0) + try/except 兜底成 pt=0——冗余吞错。
+        # 改用本地 _safe_float(None/畸形串→0.0), 再 max(0,...) 钳负值。
+        pt = max(0, _safe_float(persist_ttl, 0.0))
+        # C-01: 先在锁外为每个 shard 构建全新 OrderedDict, 再逐 shard 原子替换引用。
+        # 旧实现先逐 shard clear(每清完一个 shard 就释放锁), 另一个线程可能在
+        # shard0 已清而 shard1..N 未清时命中 shard0 的 get() → 对调用方表现为
+        # "缓存丢失"。改为: 新 maps 在锁外构造完毕后, 逐 shard 持锁替换引用,
+        # 读线程要么看到完整旧 map, 要么看到完整新 map, 不存在"半清"中间态。
+        new_maps = [OrderedDict() for _ in range(self._SHARDS)]
         for e in entries or []:
             try:
                 k = tuple(e.get("key") or [])
@@ -216,17 +262,19 @@ class LRUCache:
                 elif "remaining" in e:
                     if e["remaining"] <= 0:
                         continue
-                    e["expires_at"] = now + float(e["remaining"])
+                    e["expires_at"] = now + _safe_float(e.get("remaining", 0.0), 0.0)
                 elif e.get("expires_at", 0) <= now:
                     continue
                 e.pop("resp_body", None)
                 i = self._shard(k)
-                with self._locks[i]:
-                    self._maps[i][k] = e
+                new_maps[i][k] = e
             except Exception:
                 continue
+        # 逐 shard 持锁替换引用 + 按新容量淘汰。引用替换是原子的(单字节指针写),
+        # 读线程持锁后读到的要么是旧 map 要么是新 map, 二者都自洽。
         for i in range(self._SHARDS):
             with self._locks[i]:
+                self._maps[i] = new_maps[i]
                 self._evict_locked(i)
 
 # ============================================================================
@@ -243,25 +291,35 @@ class PartitionedCache:
         # cache_size=null/None 归一化(见 LRUCache.__init__ 说明): int(None) 会崩溃。
         if capacity is None:
             capacity = 1024
-        self._cap = max(16, int(capacity))
+        self._cap = max(16, _safe_int(capacity, 1024))
         self._parts = dict(_DEFAULT_PARTITIONS if partitions is None else partitions)
         # M1(第六份review): 自定义 partitions 可能是原始权重(如 {a:2,b:3,c:5} 未归一),
         # 不归一化则 self._cap * self._parts[g] 会溢出总容量。统一归一化到和为 1,
         # __init__ 建分区与 capacity setter 共用此已归一化字典。
+        # R7/P3-7: 负分区权重未校验。配置手误可能给出负权重, 归一化后负权重会使该分区
+        # 分到负容量(_allocate 内 max(16,...) 虽掩盖下限, 但比例失真、总容量分裂)。
+        # 先把每个权重钳到 >=0.0 再求和/归一化; 全 0/全负时 sum==0 → 回退 1.0 防除零。
+        self._parts = {g: max(0.0, _safe_float(v, 0.0)) for g, v in self._parts.items()}
         _total = sum(self._parts.values()) or 1.0
         self._parts = {g: v / _total for g, v in self._parts.items()}
         self._groups = sorted(self._parts)
         # v1.9.76 2.11: 小容量重分配。原 max(16, cap*ratio) 在 cap 很小时(如 cap=16)
         # 每个分区都被抬到 16, 3 分区总容量膨胀到 48(远超配置)。改为: 先给每分区 16
         # (仅当总容量足够), 剩余按比例分; 总容量不足 16*分区数时按比例直接分(每分区
-        # 至少 1), 不再强行抬到 16。
+        # 至少 1)。
+        # R48/P3-1: 小容量分支的份额(如 1/3/9)传入内层 LRUCache 后仍被其 min-16
+        # 下限钳到 16(见 LRUCache.__init__ 说明: 8 shard 设计要求每 shard≥2 条)。
+        # 故 cap<16*分区数 时实际各分区均为 16, 本分支只保证"按比例的相对大小"在
+        # 容量≥16*分区数 时生效; 小容量下的总容量膨胀是有意安全下限, 非 bug。
         self._caches = {}
         for g, share in self._allocate(self._cap).items():
             self._caches[g] = LRUCache(share)
 
     def _allocate(self, cap):
         """按归一化权重把总容量 cap 分配到各分区, 总和恰为 cap。
-        每分区下限 16 仅在总容量足够(>=16*分区数)时施加; 否则按比例直接分。"""
+        每分区下限 16 仅在总容量足够(>=16*分区数)时施加; 否则按比例直接分(每分区
+        至少 1)。R48/P3-1: 小份额(1/3/9)传入 LRUCache 后仍被其 min-16 下限钳制,
+        实际每分区至少 16 条——这是 LRUCache 8-shard 设计的安全下限, 有意保留。"""
         n = len(self._groups)
         if n == 0:
             return {}
@@ -290,11 +348,18 @@ class PartitionedCache:
                 diff -= 1
                 i += 1
             while diff < 0:
-                g = order[i % n]
-                if floored[g] > 1:
-                    floored[g] -= 1
-                    diff += 1
-                i += 1
+                found = False
+                for _ in range(n):
+                    g = order[i % n]
+                    if floored[g] > 1:
+                        floored[g] -= 1
+                        diff += 1
+                        found = True
+                        if diff >= 0:
+                            break
+                    i += 1
+                if not found:
+                    break
             out = floored
         return out
 
@@ -319,14 +384,16 @@ class PartitionedCache:
 
     @stale_window.setter
     def stale_window(self, v):
+        # P2-4: 原直接写 c._stale_window 绕过 LRUCache.stale_window setter
+        # (line 45-47), 绕过了 int(v or 0) 归一化逻辑。走 setter 保持一致。
         for c in self._caches.values():
-            c._stale_window = int(v or 0)
+            c.stale_window = v
 
     @capacity.setter
     def capacity(self, n):
         if n is None:
             n = 1024
-        self._cap = max(16, int(n))
+        self._cap = max(16, _safe_int(n, 1024))
         shares = self._allocate(self._cap)
         for g, c in self._caches.items():
             c.capacity = shares.get(g, 16)
@@ -422,10 +489,15 @@ class _CMSketch:
     """Count-Min Sketch: 4 行 x 1024 列, 8bit 饱和计数, 老化时减半。"""
     _D = 4
     _W = 1024
+    # P2-4: 老化触发间隔。原实现每 65536 次 inc 一次性减半 4 行(4096 cells)。
+    # 改为分片: 每 65536/_D 次 inc 只减半一行(1024 cells), 4 次触发凑齐全表。
+    # 每行仍按原节奏(累计 65536 ops)减半一次, 衰减语义不变, 单次持锁操作降为 1/4。
+    _AGE_INTERVAL = 65536 // _D
 
     def __init__(self):
         self._t = [[0] * self._W for _ in range(self._D)]
         self._ops = 0
+        self._age_row = 0   # P2-4: 下一个待减半的行号(循环 0..D-1)
 
     # 每行使用独立的乘同余常数(黄金比例衍生), 行间互不相关, 避免单一 hash(k)
     # 经移位/OR 派生导致的行间强相关与碰撞退化。
@@ -438,31 +510,47 @@ class _CMSketch:
 
     def inc(self, k, n=1):
         self._ops += n
-        if self._ops >= 65536:
-            self._age()
+        # P2-4: 达到阈值只分片老化一行, 不再在持锁时全表扫描 4096 cells。
+        if self._ops >= _CMSketch._AGE_INTERVAL:
+            self._ops = 0
+            self._age_one_row()
         h1 = hash(k) & 0xFFFFFFFFFFFFFFFF
-        for i in range(_CMSketch._D):
-            h = (h1 * self._ROW_MULTS[i]) & 0xFFFFFFFFFFFFFFFF
-            col = (h >> 32) % _CMSketch._W
-            nv = self._t[i][col] + n
-            self._t[i][col] = nv if nv < 255 else 255
+        # C-02: 局部绑定 _D 避免每次迭代类属性查找。
+        D = _CMSketch._D
+        rows = self._t
+        mults = self._ROW_MULTS
+        W = _CMSketch._W
+        for i in range(D):
+            h = (h1 * mults[i]) & 0xFFFFFFFFFFFFFFFF
+            col = (h >> 32) % W
+            nv = rows[i][col] + n
+            rows[i][col] = nv if nv < 255 else 255
 
     def freq(self, k):
         mn = 255
         h1 = hash(k) & 0xFFFFFFFFFFFFFFFF
-        for i in range(_CMSketch._D):
-            h = (h1 * self._ROW_MULTS[i]) & 0xFFFFFFFFFFFFFFFF
-            col = (h >> 32) % _CMSketch._W
-            v = self._t[i][col]
+        D = _CMSketch._D
+        rows = self._t
+        mults = self._ROW_MULTS
+        W = _CMSketch._W
+        for i in range(D):
+            h = (h1 * mults[i]) & 0xFFFFFFFFFFFFFFFF
+            col = (h >> 32) % W
+            v = rows[i][col]
             if v < mn:
                 mn = v
         return mn
 
-    def _age(self):
-        self._ops = 0
-        for row in self._t:
-            for i in range(_CMSketch._W):
-                row[i] >>= 1
+    def _age_one_row(self):
+        """P2-4: 每次只老化一行(1024 cells)并轮转行号。
+        原 _age() 在持有 TinyLFUCache._lock 时一次性减半 4×1024=4096 cells,
+        每 65536 次 inc 阻塞所有 get/put。分片后单次持锁最多 1024 cells, 且每行
+        仍按原节奏(每 65536 ops)减半一次, 衰减语义不变; 仅在行错位窗口内有可
+        自校正的微小频率估计抖动, 不影响 TinyLFU 准入正确性。"""
+        row = self._t[self._age_row]
+        for i in range(_CMSketch._W):
+            row[i] >>= 1
+        self._age_row = (self._age_row + 1) % _CMSketch._D
 
 
 class TinyLFUCache:
@@ -484,7 +572,7 @@ class TinyLFUCache:
             capacity = 1024
         # v1.9.76 2.12: 容量下限统一 16(原 TinyLFU 64 与 LRU/Partitioned 16 不一致)。
         # 内部 win/main/prob/prot 最小 16 的分段逻辑保持不变。
-        self._cap = max(16, int(capacity))
+        self._cap = max(16, _safe_int(capacity, 1024))
         self._win_cap = self._prob_cap = self._prot_cap = self._main_cap = 16
         self._window = OrderedDict()      # 新条目窗口区
         self._probation = OrderedDict()   # 晋升候选区
@@ -501,7 +589,10 @@ class TinyLFUCache:
 
     @stale_window.setter
     def stale_window(self, v):
-        self._stale_window = int(v or 0)
+        # R6/P3-2: 旧 `int(v or 0)` 是 R5 已修掉的 falsy-0 模式——畸形串("abc")
+        # `or` 后仍是 "abc" → int() 抛 ValueError。改用本地 _safe_int(None/畸形→0,
+        # 0 保留), max(0,...) 钳负值。LRUCache 与 TinyLFUCache 两处 setter 同型。
+        self._stale_window = max(0, _safe_int(v, 0))
 
     @property
     def capacity(self):
@@ -512,7 +603,7 @@ class TinyLFUCache:
         if n is None:
             n = 1024
         with self._lock:
-            self._cap = max(16, int(n))
+            self._cap = max(16, _safe_int(n, 1024))
             self._repartition_locked()
             self._evict_locked()
 
@@ -607,7 +698,9 @@ class TinyLFUCache:
                 if now - exp > stale_window:
                     store.pop(key, None)
                     return None
-                return e  # P1-2: 窗口内保留(serve-stale 兜底)
+                # C-05: 窗口内保留并 move_to_end 保护, 与 LRUCache.get_stale 行为一致。
+                store.move_to_end(key)
+                return e
             return None
 
     def delete(self, key):
@@ -627,8 +720,9 @@ class TinyLFUCache:
         # 1) window 超容 → 队首进入 main:
         #    a. probation 有空位 → 直进 probation(冷启动/低占用)
         #    b. probation 满但 main 总容量未满 → 直进 protected(回填, 防总条目流失:
-        #       准入比较会拒绝低频 candidate, window 少 1 且无回填 → 缓存永久缩水,
-        #       实测 300 容量缩到 129)
+        #       main 未满时无需准入比较——准入比较会拒绝低频 candidate, window 少 1
+        #       且无回填 → 缓存永久缩水, 实测 300 容量缩到 129。这是防缓存缩水的
+        #       设计选择: main 段有空闲槽位时直接吸收 window 溢出条目。)
         #    c. main 满 → 与 probation 队首(victim)频率准入: 高频 candidate 替换
         #       低频 victim; candidate 输则被淘汰(window 少 1, 下次 put 由 b 回填)
         while len(self._window) > self._win_cap:
@@ -706,27 +800,30 @@ class TinyLFUCache:
         now = now if now is not None else time.time()
         with self._lock:
             out = []
-            for k, e in (list(self._window.items()) + list(self._probation.items())
-                         + list(self._protected.items())):
-                if e.get("expires_at", 0) <= now:
-                    continue
-                d = dict(e)
-                d.pop("resp_body", None)
-                d["remaining"] = max(0, round(e.get("expires_at", 0) - now, 1))
-                out.append({"key": list(k), **d})
+            # C-03: 用生成器遍历避免三段 list 拼接产生大临时列表。
+            for store in (self._window, self._probation, self._protected):
+                for k, e in store.items():
+                    if e.get("expires_at", 0) <= now:
+                        continue
+                    d = dict(e)
+                    d.pop("resp_body", None)
+                    d["remaining"] = max(0, round(e.get("expires_at", 0) - now, 1))
+                    out.append({"key": list(k), **d})
             return out
 
     def restore(self, entries, now=None, persist_ttl=0):
         now = now if now is not None else time.time()
-        pt = 0
-        try:
-            pt = max(0, float(persist_ttl or 0))
-        except Exception:
-            pt = 0
+        # R7/P2-4: 原裸 float(persist_ttl or 0) + try/except 兜底成 pt=0——冗余吞错。
+        # 改用本地 _safe_float(None/畸形串→0.0), 再 max(0,...) 钳负值。
+        pt = max(0, _safe_float(persist_ttl, 0.0))
         with self._lock:
             self._window.clear()
             self._probation.clear()
             self._protected.clear()
+            # P1-3: restore() 清了三个 OrderedDict 但未重置 sketch, 旧频率计数残留
+            # 会影响新恢复条目的准入决策(已淘汰域名的频率仍偏高, 挤掉真实高频条目)。
+            # 与 clear() 方法保持一致, 重新初始化空 sketch。
+            self._sketch = _CMSketch()
             for e in entries or []:
                 try:
                     k = tuple(e.get("key") or [])
@@ -745,7 +842,7 @@ class TinyLFUCache:
                     elif "remaining" in e:
                         if e["remaining"] <= 0:
                             continue
-                        e["expires_at"] = now + float(e["remaining"])
+                        e["expires_at"] = now + _safe_float(e.get("remaining", 0.0), 0.0)
                     elif e.get("expires_at", 0) <= now:
                         continue
                     e.pop("resp_body", None)

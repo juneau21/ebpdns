@@ -120,10 +120,16 @@ class _UDPHandler:
     def serve_forever(self):
         while not self._stop.is_set():
             try:
-                data, addr = self.sock.recvfrom(4096)
+                # v1.9.84 SV-02: 65535 与上游接收路径对齐, 防带大 EDNS OPT 的查询被内核静默截断
+                data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError as e:
+                # P1-12: 优雅退出时 stop() 先置 _stop 再 close socket, 在途 recvfrom
+                # 会抛 EBADF(errno=9)。此时退出标志已置位, 该错误是预期的关闭信号,
+                # 静默 break 退出收包线程, 不再打 WARNING/累计错误计数。
+                if self._stop.is_set():
+                    break
                 # v1.9.76 P0-2: 偶发 OSError(ICMP port unreachable/网卡抖动)不应直接
                 # break 收包线程(那会永久停止该 UDP 监听)。计数+告警, 连续达阈值才
                 # 置 stop 重建 socket; 成功收包即清零。
@@ -205,13 +211,16 @@ class _TCPRequestHandler(socketserver.BaseRequestHandler):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        buf = b""
+        # v1.9.84 SV-03: 用 bytearray 累积, 避免 bytes += 每次 O(n) 拷贝
+        buf = bytearray()
+        # v1.9.84 SV-04: 总生命周期上限 30s, 防慢速客户端每 4s 发 1 字节占住线程槽
+        conn_deadline = time.monotonic() + 30.0
         try:
             while True:
                 chunk = sock.recv(4096)
                 if not chunk:
                     break
-                buf += chunk
+                buf.extend(chunk)
                 # 内存保护: 单连接缓冲上限 1MB, 超限断开(防恶意客户端无帧边界无限投喂)
                 if len(buf) > 1 << 20:
                     log.warning("TCP 客户端 %s 缓冲超限(%d B), 断开连接", self.client_address[0], len(buf))
@@ -222,20 +231,32 @@ class _TCPRequestHandler(socketserver.BaseRequestHandler):
                         msg, buf = dnsmsg.parse_tcp_frame(buf)
                     except Exception:
                         break  # 帧不完整，等待更多数据
+                    # v1.9.84 SV-03: parse_tcp_frame 对 bytearray 返回 bytearray slice,
+                    # 转 bytes 再传给上层(answer_raw 期望 bytes)
+                    msg_bytes = bytes(msg)
                     # 与 UDP _handle 对齐: answer_raw 异常时回 SERVFAIL, 避免连接裸崩
                     try:
-                        resp = self.server.resolver.answer_raw(msg, self.client_address)
+                        resp = self.server.resolver.answer_raw(msg_bytes, self.client_address)
                     except Exception:
                         try:
-                            resp = dnsmsg.build_error_response(msg, 2)
+                            resp = dnsmsg.build_error_response(msg_bytes, 2)
                         except Exception:
                             resp = None
                     if resp:
                         try:
                             sock.sendall(dnsmsg.tcp_frame(resp))
-                        except OSError:
+                        except OSError as e:
+                            # v1.9.84-r2: 连接已坏, 断开前记一笔(缓冲区内可能还有已收未处理帧,
+                            # 随连接关闭丢弃——管道化多查询时客户端会重试, 记录便于排查)。
+                            log.debug("TCP 响应发送失败(%s), 断开: %r",
+                                      self.client_address[0], e)
                             break
-        except (socket.timeout, OSError):
+                # v1.9.84 SV-04: 总生命周期检查, 超时断开
+                if time.monotonic() > conn_deadline:
+                    break
+        # R34 P3-4: socket.timeout 自 PEP 3151(Py3.3)起即为 OSError 子类, Py3.10 起是
+        # TimeoutError 别名(亦继承自 OSError)。显式列出冗余, 统一为 OSError 即可覆盖。
+        except OSError:
             pass
 
 
@@ -355,6 +376,9 @@ class DNSServer:
             t.start()
             self._threads.append(t)
         except OSError as e:
+            # v1.9.84 SV-01: bind 失败必须回收预创建的 ThreadPoolExecutor(最多 64 worker),
+            # 否则上层重试 start() 时线程会累积泄漏。
+            self.udp.stop()
             raise RuntimeError("UDP 监听失败 (%s): %s" % (udp_spec, e))
 
         # UDP6（可选：无 IPv6 栈时告警跳过）

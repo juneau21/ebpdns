@@ -29,7 +29,7 @@ class Telemetry:
         self.top_clients = Counter()
         self._top_max = 2048
         self._qtype_cat_map = {"A": "A", "AAAA": "AAAA"}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # 日志事件全局递增序号: 事件 deque 满 500 会弹出最旧条目, 前端若用
         # 位置索引轮询(since=N 直接切片)会在 deque 弹出后错位——新事件永远
         # 拉不到, 日志静默停更。改用 seq 过滤: 前端传上次收到的 seq, 后端
@@ -46,9 +46,6 @@ class Telemetry:
         with self._lock:
             self.rule_hits[cat] = self.rule_hits.get(cat, 0) + n
 
-    def inc_qtype(self, cat, n=1):
-        with self._lock:
-            self.qtype_dist[cat] += n
     def count_top(self, domain=None, client=None):
         """Top N 统计(域名/客户端): 命中与 miss 路径都调用。
         有界: 超过 _top_max 时裁剪掉低频一半(保留高频), 防随机域名压测
@@ -74,39 +71,49 @@ class Telemetry:
             self.qtype_dist[cat] += 1
         self.qps_window.append(time.time())
 
-    def set_counters(self, counters, qtype_dist):
-        with self._lock:
-            self.counters = dict(counters)
-            self.qtype_dist = dict(qtype_dist)
-
     # ---- QPS ----
-    def add_qps(self, t=None):
-        self.qps_window.append(t if t is not None else time.time())
-
     def current_qps(self):
+        # R44 P3-2: 持 _lock 保护 popleft。锁为 RLock(可重入), 内部调用方
+        # (sample/snapshot)均已持锁, 重入无死锁; 外部直接调用时与 counters_snapshot()
+        # 的持锁 popleft 互斥, 消除两端"抢"条目导致 QPS 偏低的竞态。
         now = time.time()
-        # v1.9.81: popleft 竞态防护(另一线程可能同时弹)
-        while self.qps_window and now - self.qps_window[0] > 1.0:
-            try:
-                self.qps_window.popleft()
-            except IndexError:
-                break
-        return len(self.qps_window)
+        with self._lock:
+            while self.qps_window and now - self.qps_window[0] > 1.0:
+                try:
+                    self.qps_window.popleft()
+                except IndexError:
+                    break
+            return len(self.qps_window)
 
     # ---- 延迟 ----
     def push_latency(self, ms):
-        self.latency_window.append(ms)
+        # P3-13: latency_window.append 移入锁内。deque.append 虽 GIL 原子,
+        # 但与 counters_snapshot()/reset() 内的 latency_window.clear()/迭代并发时,
+        # 无锁 append 与 clear 交错可能让快照读到正在变化的窗口。统一持 _lock。
+        with self._lock:
+            self.latency_window.append(ms)
 
     def avg_latency(self):
-        if not self.latency_window:
-            return None
-        return sum(self.latency_window) / len(self.latency_window)
+        # R2-P3: 加锁读取 latency_window, 与 reset()/counters_snapshot() 内的
+        # clear()/迭代并发一致。此前 avg_latency() 锁外读 deque, 虽内部调用点
+        # (sample/counters_snapshot/snapshot)均已持锁, 但作为公开方法被外部
+        # 直接调用时与 reset() 的 clear() 交错可能读到半清空窗口或 RuntimeError。
+        with self._lock:
+            if not self.latency_window:
+                return None
+            return sum(self.latency_window) / len(self.latency_window)
 
     # ---- 命中率 ----
     def hit_rate(self):
-        if not self.counters["total"]:
-            return 0.0
-        return self.counters["hit"] / self.counters["total"] * 100
+        # R34 P3-1: 持 _lock 单次读取 total/hit, 与 reset() 整体替换 counters dict 对齐。
+        # 此前锁外双读, 两次 self.counters[...] 之间若被 reset() 替换 dict 引用, 会读到
+        # total=旧值/hit=新值(0)的瞬时不自洽读数。内部调用方(sample/snapshot)均已持锁,
+        # 此处补齐公开方法加锁, 消除直接调用时的竞态。
+        with self._lock:
+            total = self.counters["total"]
+            if not total:
+                return 0.0
+            return self.counters["hit"] / total * 100
 
     def qtype_cat(self, qtype):
         return self._qtype_cat_map.get(qtype, "other")
@@ -160,10 +167,6 @@ class Telemetry:
     # ---- 连接维度健康度细化 (proto|addr|port|url) ----
     # 多 IP 上游/多协议同上游场景下, 按 ID 聚合会掩盖单连接劣化(如某 IP 故障
     # 拖低整上游均值)。按连接独立统计, 测速/健康判断可精确到具体端点。
-    def conn_stat(self, key):
-        with self._lock:
-            return self.conn_stats.setdefault(key, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
-
     def conn_ok(self, key, lat_ms):
         with self._lock:
             st = self.conn_stats.setdefault(key, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
@@ -189,6 +192,21 @@ class Telemetry:
                     "last_lat_ms": st.get("last"),
                 }
             return out
+
+    def drop_conn(self, key):
+        """v1.9.84 P2: 删除/改址上游时移除其连接维度健康度条目。
+        conn_stats 以 proto|addr|port|url 为 key, 此前删除上游只清 per_upstream 不清
+        conn_stats, 导致旧端点条目永久残留、随频繁编辑缓慢泄漏。持锁 pop 保证线程安全。"""
+        with self._lock:
+            self.conn_stats.pop(key, None)
+
+    def drop_upstream(self, up_id):
+        """v1.9.86: 删除整条上游时移除其上游级统计条目(per_upstream)。
+        与 drop_conn 对称的持锁删除——此前 API/reload 清理处直接裸 pop per_upstream,
+        未持本锁, 与写侧 upstream_ok/setdefault 的加锁纪律不一致(并发 setdefault 可
+        重建已删条目)。端点变更(同 id)调用方不得用本方法, 应只 drop_conn。"""
+        with self._lock:
+            self.per_upstream.pop(up_id, None)
 
     # ---- H-1/H-3: 共享容器的线程安全快照 ----
     def counters_snapshot(self):
@@ -229,6 +247,13 @@ class Telemetry:
         with self._lock:
             return self.top_clients.most_common(n)
 
+    def events_snapshot(self):
+        """P2-16: events deque 的加锁拷贝。API 层 _api_logs 不再直接访问私有
+        self._lock 并裸迭代 events, 改走本方法, 与 counters_snapshot 等同款收口。
+        锁内 list() 拷贝, 返回的是独立列表, 调用方可安全遍历/过滤。"""
+        with self._lock:
+            return list(self.events)
+
     def add_manual_entry(self, entry):
         """手动查询历史: append + 截断统一在锁内, 避免并发 append 丢记录。"""
         with self._lock:
@@ -253,8 +278,9 @@ class Telemetry:
             self.counters["bytes_in"] += raw_len
             self.counters["bytes_out"] += resp_len
             self.qtype_dist[self.qtype_cat(qtype)] += 1
+            # P3-13: latency_window.append 移入锁内(与 clear/快照并发一致)
+            self.latency_window.append(lat_ms)
         self.qps_window.append(time.time())
-        self.latency_window.append(lat_ms)
 
     def fast_hit_logged(self, qtype, raw_len, resp_len, lat_ms, domain, msg,
                         upstream, answer, kernel_direct=False, level="hit"):
@@ -284,8 +310,9 @@ class Telemetry:
                     "answer": answer,
                     "rule": None,
                 })
+            # P3-13: latency_window.append 移入锁内
+            self.latency_window.append(lat_ms)
         self.qps_window.append(time.time())
-        self.latency_window.append(lat_ms)
 
     # ---- 日志事件 ----
     def log(self, domain, qtype, level, msg, lat=None, client_ip=None, upstream=None, answer=None, rule=None):
@@ -317,23 +344,31 @@ class Telemetry:
 
     # ---- 每秒采样 ----
     def sample(self):
-        self.history.append({
-            "label": time.strftime("%H:%M:%S"),
-            "hit_rate": round(self.hit_rate(), 1),
-            "qps": self.current_qps(),
-            "lat": round(self.avg_latency(), 1) if self.avg_latency() is not None else 0,
-        })
-        if len(self.history) > 120:
-            self.history = self.history[-120:]
-        return self.history[-1]
+        # P2-6: 统计与 history 写入统一持 _lock, 与 snapshot() 一致。
+        # 此前 sampler 线程每秒调 current_qps() 无锁 popleft qps_window, 而
+        # counters_snapshot() 也在持锁 popleft —— 两端同时消费同一窗口, QPS 读数
+        # 互相"抢"数据导致偏低。R44 P3-2: current_qps() 已加 _lock(RLock 可重入);
+        # hit_rate() 已在 R34 加锁; avg_latency() 已加 RLock(R2-P3-2), 同线程重入安全无死锁。
+        with self._lock:
+            # P2-2(R3): avg_latency() 只调一次, 避免双重 RLock 获取 + 双重 sum/len 计算
+            _al = self.avg_latency()
+            self.history.append({
+                "label": time.strftime("%H:%M:%S"),
+                "hit_rate": round(self.hit_rate(), 1),
+                "qps": self.current_qps(),
+                "lat": round(_al, 1) if _al is not None else 0,
+            })
+            if len(self.history) > 120:
+                self.history = self.history[-120:]
+            return self.history[-1]
 
     # ---- 快照（API 用）----
     def snapshot(self):
         # 读路径统一持锁: counters/rule_hits/qtype_dist/per_upstream/conn_stats/events/
         # top_* 均由各写方法在锁内更新。snapshot 不加锁时, 并发 count_top() 整体
         # 替换 top_domains 或新域名自增会让 most_common() 迭代中 "dict changed
-        # size" 抛 RuntimeError; 锁内一次性拷贝保证读一致性。被调方法(hit_rate/
-        # current_qps/avg_latency)自身不再获取 _lock, 无重入死锁。
+        # size" 抛 RuntimeError; 锁内一次性拷贝保证读一致性。被调方法中 hit_rate(R34)/
+        # current_qps(R44)/avg_latency(R2-P3-2) 均已加 RLock, 同线程重入安全。
         with self._lock:
             al = self.avg_latency()
             return {
@@ -357,8 +392,9 @@ class Telemetry:
 
     def reset(self):
         # 所有清状态操作统一持锁, 避免与并发查询/快照交错读到半重置状态。
-        # 注意: 内联计数器重置而非调用 set_counters(它也会抢同一把非可重入锁,
-        # 在外层 with 内再 acquire 会死锁)。
+        # R34 P3-2: 本锁是 threading.RLock(可重入)。此处仍内联重置计数器而非抽成方法,
+        # 纯为省一次额外方法调用开销, 与可重入性无关(RLock 嵌套 acquire 不会死锁)。
+        # 原注释"非可重入锁/再 acquire 会死锁"系早期 Lock 实现遗留, 已过时。
         with self._lock:
             self.counters = {k: 0 for k in self.counters}
             self.qtype_dist = {"A": 0, "AAAA": 0, "other": 0}

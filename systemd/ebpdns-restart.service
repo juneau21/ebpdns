@@ -1,0 +1,8 @@
+[Unit]
+Description=ebpdns daily low-traffic restart (memory hygiene)
+Documentation=file:///opt/ebpdns/README.md
+
+[Service]
+Type=oneshot
+# 优雅重启: 先 reload 缓存到磁盘, 再重启。DNS 缓存可重建, 代价极小。
+ExecStart=/bin/systemctl restart ebpdns.service

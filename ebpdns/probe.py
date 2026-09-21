@@ -18,6 +18,22 @@ log = logging.getLogger("ebpdns")
 PROBE_DOMAIN = "www.baidu.com"
 
 
+def _safe_int(v, default=0):
+    """R3-P3-2: 安全 int() 转换, 畸形配置值(非数值字符串)不抛 ValueError。
+    避免手编 config 把 latency/timeout_ms 填成非数值时, 主循环 int() 崩溃
+    导致该上游及其后所有上游测量结果丢失。
+
+    R5 修正(对齐 resolver._safe_int): 旧 `int(v or default)` 把 falsy 的 0
+    也替换成 default。0 是合法值(如 latency=0/禁用), 不应被静默改写。
+    现仅 v is None 或无法解析时回退 default; 可解析值(含 0)原样返回。"""
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _needs_probe(cfg):
     return any(u.get("enabled", True) and not u.get("latency_measured", False)
                for u in cfg.get("upstreams", []))
@@ -43,11 +59,19 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
     if app_ctx is not None:
         try:
             with app_ctx._lock:
-                src = [dict(u) for u in app_ctx.cfg.get("upstreams", [])]
+                cur_cfg = app_ctx.cfg
+                src = [dict(u) for u in cur_cfg.get("upstreams", [])]
+                # v1.9.84 PR-01: timeout 也从最新 cfg 读取, 避免与快照不同步
+                timeout = _safe_int(cur_cfg.get("timeout_ms"), 1500)
         except Exception:
             src = []
+            timeout = _safe_int(cfg.get("timeout_ms"), 1500)
     else:
-        src = cfg.get("upstreams", [])
+        # P2-9: 无 app_ctx 路径也对 upstreams 做浅拷贝(列表 + 每个 dict),
+        # 避免后台探测线程原地修改 live cfg 的 upstream 条目。最终在 save 前
+        # 把测量结果回写 cfg。
+        src = [dict(u) for u in cfg.get("upstreams", [])]
+        timeout = _safe_int(cfg.get("timeout_ms"), 1500)
     if force:
         ups = list(src)  # 全部上游, 含禁用
     else:
@@ -56,20 +80,20 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
     if not ups:
         return []
     try:
+        # 探测仅测 RTT，无需 0x20 随机化和 EDNS
         q, _qid = dnsmsg.build_query(PROBE_DOMAIN, dnsmsg.type_code("A"), edns=False)
     except Exception:
         log.warning("%s: 构造探测查询失败, 跳过", tag)
         return []
-    timeout = int(cfg.get("timeout_ms", 1500))
     results = []
 
     def do(u):
         try:
             ok, _data, lat, _err = query_upstream(u, q, timeout)
-            return u, bool(ok), int(lat or 0)
-        except BaseException as e:
-            # 含 BaseException: 防止个别上游实现(如缺依赖的 QUIC 路径)抛
-            # 非 Exception 异常导致整个并发池中断、其余上游全部漏测。
+            return u, bool(ok), _safe_int(lat)
+        except Exception as e:
+            # v1.9.84 PR-02: 改为 Exception(不吞 SystemExit/KeyboardInterrupt)。
+            # query_upstream 953 行已兜底所有 Exception, 此处仅防御性捕获。
             log.warning("%s: 上游 %s(%s) 探测异常: %s: %s",
                         tag, u.get("name"), u.get("addr"), type(e).__name__, e)
             return u, False, 0
@@ -77,7 +101,7 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
     try:
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(ups)))) as pool:
             for u, ok, lat in pool.map(do, ups):
-                old = int(u.get("latency") or 0)   # latency 可为 null(未测/待测)
+                old = _safe_int(u.get("latency"))   # latency 可为 null(未测/待测); R3-P3-2 防畸形值
                 # 仅成功才标记 latency_measured=True; 失败的保持 False, 下次启动
                 # 自动复测(历史上 DoH 因 bug 全挂也被标 True, 修完代码后永不自动复测)。
                 u["latency_measured"] = bool(ok)
@@ -106,6 +130,7 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
         # 避免旧 cfg 整体落盘覆盖并发 PUT /api/config 的新变更。网络探测已在此前完成,
         # 持锁段只做内存合并+落盘, 耗时可忽略。
         try:
+            saved_ok = False
             with app_ctx._lock:
                 cur = app_ctx.cfg
                 cur_by_id = {u.get("id"): u for u in cur.get("upstreams", [])}
@@ -114,16 +139,37 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
                     if cu is None:
                         continue   # 该上游已被并发删除, 跳过
                     cu["latency_measured"] = bool(it["ok"])
-                    if it["ok"] and int(it.get("new") or 0) > 0:
-                        cu["latency"] = int(it["new"])
-                config_mod.save_config(cur, config_path)
-            log.info("%s完成(锁内合并): 已写入 %s (%d/%d 上游)", tag, config_path, ok_n, len(ups))
+                    if it["ok"] and _safe_int(it.get("new")) > 0:
+                        cu["latency"] = _safe_int(it.get("new"))
+                # P1-1(R3): 检查 save_config 返回值, 失败时打 warning(运行态已生效但重启后丢失)
+                # P3-1(R4): "已写入"成功日志必须随成功分支打印, 写盘失败时不能与上一行 WARNING 自相矛盾。
+                # P3-3(R31): save_config 成功返回实际写入路径字符串(失败返回 False)。config_path
+                # 可能为 None(调用方未指定), 此时 save_config 会自动探测默认路径落盘——日志必须
+                # 打印实际落盘路径(saved)而非入参 config_path, 否则会误报"已写入 None"。
+                saved = config_mod.save_config(cur, config_path)
+                # R42/P3-1: save_config 成功返回路径字符串, 失败返回 False; 原 `is not False`
+                # 把 None 也误判为成功(日志打"已写入 None")。同时排除 False 与 None 两个哨兵。
+                saved_ok = saved is not None and saved is not False
+                if not saved_ok:
+                    log.warning("%s: 配置写盘失败(运行态已生效, 重启后丢失)", tag)
+            if saved_ok:
+                log.info("%s完成(锁内合并): 已写入 %s (%d/%d 上游)", tag, saved, ok_n, len(ups))
         except Exception as e:
             log.warning("%s: 配置写回失败 %s", tag, e)
     elif config_path:
         try:
-            config_mod.save_config(cfg, config_path)
-            log.info("%s完成: 已写入 %s (%d/%d 上游)", tag, config_path, ok_n, len(ups))
+            # P2-9: src 是 upstreams 的浅拷贝(含测量结果), 回写 cfg 后落盘
+            cfg["upstreams"] = src
+            # P1-1(R3): 检查 save_config 返回值, 失败时打 warning(运行态已生效但重启后丢失)
+            # P3-1(R4): "已写入"成功日志只在写盘成功分支打印, 失败时不再无条件打"已写入"。
+            # P3-3(R31): 与上方 app_ctx 分支一致, 日志打印实际落盘路径(saved)而非入参 config_path。
+            saved = config_mod.save_config(cfg, config_path)
+            # R42/P3-1: 与上方 app_ctx 分支同型, 同时排除 False 与 None 哨兵。
+            saved_ok = saved is not None and saved is not False
+            if not saved_ok:
+                log.warning("%s: 配置写盘失败(运行态已生效, 重启后丢失)", tag)
+            else:
+                log.info("%s完成: 已写入 %s (%d/%d 上游)", tag, saved, ok_n, len(ups))
         except Exception as e:
             log.warning("%s: 配置写回失败 %s", tag, e)
     return results

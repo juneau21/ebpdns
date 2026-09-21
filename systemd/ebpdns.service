@@ -6,19 +6,97 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# v1.9.83: 内存优化环境变量组合(glibc 方案)
+#   PYTHONMALLOC=malloc     — Python 直接用系统 malloc(而非 pymalloc arena), free() 后内存可归还 OS
+#   MALLOC_ARENA_MAX=2      — 压住多线程 arena 分裂(123 Tasks 下关键), 验证对 QPS 无影响
+#   MALLOC_MMAP_THRESHOLD_  — 固定 mmap 阈值, 防止动态调整让 TRIM_THRESHOLD 失效
+#   MALLOC_TRIM_THRESHOLD_  — free 时自动收缩 top region, 减少对定时 trim 的依赖
+# 配合 cli.py 每 5min 相对阈值触发的 malloc_trim(0)(已去掉 gc.collect, 因 88ms STW 且回收 0 对象),
+# 长期运行 RSS 可降 30-50%。
+#
+# --- Plan B: jemalloc(若 glibc 方案下 trim 有尖刺或 sys CPU 升高) ---
+# 安装: apt install libjemalloc2
+# 切换: 注释掉上面 4 个 MALLOC_* 变量, 改用以下 3 行:
+#   Environment=LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+#   Environment=PYTHONMALLOC=malloc
+#   Environment=MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000
+# jemalloc 自动 decay 无需手动 trim, cli.py 的 _trim_loop 会通过 mallctl 探针自动跳过。
+Environment=PYTHONMALLOC=malloc
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+# 内存兜底: 超过 1G 触发回收压力, 超过 1.5G 被 OOM killer 选中(防止整机拖垮)
+MemoryHigh=1G
+MemoryMax=1.5G
 # 默认以 root 运行以监听 53 端口并读写 /etc/ebpdns。
 # 若改用专用用户(如 ebpdns), 可去掉 User=root 并保留 AmbientCapabilities。
 User=root
 ExecStart=/opt/ebpdns/bin/ebpdns run --config /etc/ebpdns/config.json
 Restart=on-failure
-RestartSec=3
-# 优雅退出约 3s(SIGTERM 停止预取/线程池后快速退出); 15s 内未退出则 systemd 强杀
-TimeoutStopSec=15
-# 允许非特权绑定低端口(53) 与原始套接字(可选的 XDP 加载)
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=no
+RestartSec=5
+# 优雅退出: SIGTERM 后 5s 内未退出则 SIGKILL(正常退出 <10ms, trim 线程 join 超时 2s)。
+# DNS 服务需秒退, 避免 systemd 重启时新实例长时间无法 bind 53 端口。
+KillSignal=SIGTERM
+TimeoutStopSec=5
+# v7 P2-3: 安全沙箱硬化。
+#   仅保留 CAP_NET_BIND_SERVICE(绑定 53 端口); 移除 CAP_NET_RAW——代码中无 SOCK_RAW/
+#   AF_PACKET/AF_XDP 实际使用(bpf/ 目录为独立 C 代码, 经 load.sh 单独加载, 不进
+#   Python 守护进程), 原始套接字能力纯属多余的攻击面。
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# v7 P2-3: 沙箱硬化
+NoNewPrivileges=yes
+# P3-7(第七轮审查): 由 full 收紧为 strict。/etc 整体只读, 仅 ReadWritePaths=/etc/ebpdns
+# 显式放行写配置; /var/log 由 journald 接管(stdout/stderr), /tmp 由 PrivateTmp 私有,
+# 无其它运行时写路径, 故可安全 strict(攻击面更小, 整个文件系统根只读)。
+ProtectSystem=strict
+# P3-4(第八轮): ProtectSystem=full 使 /etc 只读, 但 save_config 需写 /etc/ebpdns。
+# 显式放行该目录(保留 /etc 其余路径只读), 避免原子写 tmp+rename 失败后兜底直写也失败。
+ReadWritePaths=/etc/ebpdns
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0027
 LimitNOFILE=65536
+# P1-11(第九轮审查): 追加 7 项安全沙箱硬化。
+#   PrivateDevices: 私有 /dev, 隐藏物理块设备/字符设备, 防意外直写磁盘。
+#   ProtectKernelTunables: 屏蔽 /proc/sys 等内核可调参数(只读), 防运行时改 sysctl。
+#   ProtectControlGroups: 屏蔽 cgroup 树写入, 防服务篡改自身/兄弟进程 cgroup。
+#   RestrictAddressFamilies: 只允许 AF_INET(IPv4)/AF_INET6(IPv6)/AF_UNIX(本地 socket)。
+#     DNS 守护进程只需 UDP/TCP 监听与 DoH/DoQ 上游连接, 无需 AF_NETLINK/AF_PACKET。
+#     P2-3(R2 审查): 已 grep ebpdns/*.py 确认未调用 socket.getifaddrs() / AF_NETLINK /
+#     if_nameindex / AF_PACKET / SOCK_RAW(全部 socket.socket() 均按地址族选 AF_INET/AF_INET6,
+#     DoH/DoT 走 TLS wrap_socket)。因此不加 AF_NETLINK, 维持最小攻击面。
+#     若后续 bpf_loader 或自动枚举网卡功能加入, 启动报 EAFNOSUPPORT 时再补 AF_NETLINK。
+#   RestrictRealtime: 禁止 Realtime 调度策略(SCHED_FIFO/RR), 防 CPU 饥饿攻击面。
+#   RestrictSUIDSGID: 禁止 setuid/setgid 文件生效, 提权面收敛。
+#   LockPersonality: 锁定进程 personality(防止修改 Linux x86 执行域, 如 vm86 漏洞面)。
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# P3-4(R3 修复): 追加 3 项硬化。
+#   RestrictNamespaces: 禁止创建新 namespace(unshare/CLONE_NEW*), 收敛容器逃逸面。
+#     本服务为单进程 DNS 解析器, 不调用 unshare; 若未来引入需 namespace 的功能(如隔离子进程),
+#     启动报 EOPNOTSUPP/EPERM 时再放开。
+#   ProtectKernelModules: 禁止加载/卸载内核模块(init_module/finit_module/delete_module),
+#     eBPF loader 经独立 load.sh 单独加载, 不进本守护进程, 故可安全禁止。
+#   ProtectProc=invisible + ProcSubset=pid: 隐藏 /proc 下其他进程(仅见自身及 pid 子集),
+#     防其他进程信息泄露; /proc/self 仍可读(内存探针/trim 线程需要)。
+RestrictNamespaces=yes
+ProtectKernelModules=yes
+ProtectProc=invisible
+ProcSubset=pid
+# P2-1(第七轮审查): 禁止任何可写内存段同时可执行(W^X)。
+#   纯 CPython 无 JIT, ctypes/OpenSSL(aioquic/ssl)/aioquic 均用"先 mmap 写、再 mprotect
+#   改只读/可执行"的两段式落位(先 RW 再 RX), 不存在运行时 W+X 页, 不触发该拒绝。
+# P3-2(第八轮审查): 运行时冒烟记录。上述两段式 mprotect 路径已静态核对; 上线后建议首次
+#   拉起一次 DoH3/DoQ 上游(经 aioquic/openssl 的 quic TLS 握手)做运行时冒烟验证, 确认
+#   mprotect(..., PROT_EXEC) 在本内核/glibc 组合下不报 EPERM。若未来引入 JIT 组件(PyPy/
+#   Cython 运行时生成代码/扩展模块自改可执行页)需移除此行, 否则启动即 EPERM/段错误。
+MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=multi-user.target
