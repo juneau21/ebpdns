@@ -13,12 +13,11 @@ DEFAULTS = {
     "listen": {
         "udp": "0.0.0.0:53",
         "tcp": "0.0.0.0:53",
-        # P1-1: IPv6 默认不监听。此前默认值 [::]:53 会让磁盘未显式写 udp6/tcp6 的
-        # 配置(deep_merge 保留默认)在所有 IPv6 接口监听 53, 成为隐蔽的开放解析器。
-        # 改为 None: 仅当用户在配置中显式写出 udp6/tcp6 才绑定 IPv6(server.py 对
-        # None/空跳过绑定并仅告警)。
-        "udp6": None,   # IPv6 UDP 监听(可选; 需用户显式配置, 如 "[::1]:53")
-        "tcp6": None,   # IPv6 TCP 监听(可选; 需用户显式配置, 如 "[::1]:53")
+        # IPv6 默认监听 [::]:53（与 IPv4 双栈同时提供服务）。无 IPv6 栈的环境
+        # server.py 绑定失败仅告警跳过, 不影响 IPv4。仅需本机服务时可显式改为
+        # "[::1]:53"；不希望监听 IPv6 时显式置 null。
+        "udp6": "[::]:53",   # IPv6 UDP 监听(默认全部接口; 可改 "[::1]:53" 或 null)
+        "tcp6": "[::]:53",   # IPv6 TCP 监听(默认全部接口; 可改 "[::1]:53" 或 null)
     },
     "api": {
         "host": "127.0.0.1",   # API 监听地址, 默认仅本机回环(天然安全, 无需 token)
@@ -43,7 +42,7 @@ DEFAULTS = {
     "ttl_max": 0,                # 下发 TTL 上限(秒), 0=不限制; 内网客户端收到的应答 TTL 不高于此值
     "serve_stale": False,        # 过期缓存兜底: 缓存过期后在 stale 窗口内仍返回旧数据并后台刷新
     "stale_ttl": 3600,           # 过期兜底窗口(秒), 超过后过期条目视为失效进入正常 miss
-    "persist_ttl": 0,            # 持久化缓存恢复后的独立 TTL(秒), 0=按保存时剩余 TTL 原样恢复
+    "persist_ttl": 0,            # 持久化缓存恢复后的独立 TTL(秒), 0=按保存时剩余 TTL 原样恢复; 上限 31536000(一年)
     "prefetch": True,
     "kernel_direct": True,          # 缓存命中语义标记"内核直答"（真实 XDP 数据面时启用）
     "speed_test": True,             # 测速择优
@@ -58,6 +57,7 @@ DEFAULTS = {
     "prefer_ipv4": False,           # 双栈智能(替代全局 ipv6 开关): 有 A 记录的域名屏蔽 AAAA, 纯 IPv6 域名不误伤
     "edns": True,                   # 携带 EDNS0
     "edns_udp_size": 1232,          # 出站查询 EDNS0 UDP payload(字节): 1232=防分片安全值, 减少 UDP 分片丢失导致的超时
+    "edns_client_max_size": 1232,   # 客户端侧应答 EDNS0 UDP payload 上限(字节): 钳制客户端声明的 bufsize, 防开放解析器放大攻击; 超限应答置 TC 走 TCP
     "padding": False,               # 加密查询(DNS over TLS/HTTPS/QUIC)报文填充: 对齐 128B 块抹平长度指纹, 仅加密协议生效
     "rebind_protection": True,      # 响应 IP 合法性校验: 丢弃上游返回的私有/保留/环回地址(防 DNS 劫持/DNS rebinding), forceIp 规则豁免
     "edns_client_subnet": None,     # 如 "203.0.113.0/24"
@@ -71,28 +71,28 @@ DEFAULTS = {
     "log_level": "info",
     "web_root": None,               # None = 自动定位到包内 web/ 目录
     "upstreams": [
-        {"id": "ali-doh3", "name": "AliDNS DoH3", "proto": "doh3", "addr": "dns.alidns.com", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 30, "enabled": True, "latency_measured": False},
-        {"id": "dnspod-doh3", "name": "DNSPod DoH3", "proto": "doh3", "addr": "doh.pub", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 40, "enabled": True, "latency_measured": False},
-        {"id": "ali-doh", "name": "AliDNS DoH", "proto": "doh", "addr": "dns.alidns.com", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 30, "enabled": True, "latency_measured": False},
-        {"id": "dnspod-doh", "name": "DNSPod DoH", "proto": "doh", "addr": "doh.pub", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 40, "enabled": True, "latency_measured": False},
-        {"id": "ali-ip-doh", "name": "AliDNS IP DoH", "proto": "doh", "addr": "223.5.5.5", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 30, "enabled": True, "latency_measured": False},
-        {"id": "dnspod-ip-doh", "name": "DNSPod IP DoH", "proto": "doh", "addr": "120.53.53.53", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 40, "enabled": True, "latency_measured": False},
-        {"id": "ali-ip2-doh", "name": "AliDNS2 IP DoH", "proto": "doh", "addr": "223.6.6.6", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 30, "enabled": True, "latency_measured": False},
-        {"id": "cf-doh3", "name": "Cloudflare DoH3", "proto": "doh3", "addr": "cloudflare-dns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 150, "enabled": False, "latency_measured": False},
-        {"id": "google-doh3", "name": "Google DoH3", "proto": "doh3", "addr": "dns.google", "port": 443, "url": "/dns-query", "group": "global", "latency": 160, "enabled": False, "latency_measured": False},
-        {"id": "quad9-doh3", "name": "Quad9 DoH3", "proto": "doh3", "addr": "dns.quad9.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 180, "enabled": False, "latency_measured": False},
-        {"id": "cf-ip-doh", "name": "Cloudflare IP DoH", "proto": "doh", "addr": "1.1.1.1", "port": 443, "url": "/dns-query", "group": "global", "latency": 150, "enabled": False, "latency_measured": False},
-        {"id": "cf-doh", "name": "Cloudflare DoH", "proto": "doh", "addr": "cloudflare-dns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 150, "enabled": False, "latency_measured": False},
-        {"id": "google-doh", "name": "Google DoH", "proto": "doh", "addr": "dns.google", "port": 443, "url": "/dns-query", "group": "global", "latency": 160, "enabled": True, "latency_measured": False},
-        {"id": "google-ip-doh", "name": "Google IP DoH", "proto": "doh", "addr": "8.8.8.8", "port": 443, "url": "/dns-query", "group": "global", "latency": 160, "enabled": False, "latency_measured": False},
-        {"id": "quad9-doh", "name": "Quad9 DoH", "proto": "doh", "addr": "dns.quad9.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 180, "enabled": True, "latency_measured": False},
-        {"id": "nextdns-doh", "name": "NextDNS DoH", "proto": "doh", "addr": "dns.nextdns.io", "port": 443, "url": "/4d5525", "group": "global", "latency": 200, "enabled": False, "latency_measured": False},
-        {"id": "opendns-doh", "name": "OpenDNS DoH", "proto": "doh", "addr": "doh.opendns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 200, "enabled": True, "latency_measured": False},
-        {"id": "dnssb-doh", "name": "DNS.SB DoH", "proto": "doh", "addr": "doh.dns.sb", "port": 443, "url": "/dns-query", "group": "global", "latency": 220, "enabled": False, "latency_measured": False},
-        {"id": "adguard-doh", "name": "AdGuard DoH", "proto": "doh", "addr": "dns.adguard.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 220, "enabled": True, "latency_measured": False},
-        {"id": "hinet-doh", "name": "HiNet DoH", "proto": "doh", "addr": "dns.hinet.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 200, "enabled": False, "latency_measured": False},
-        {"id": "ali-udp", "name": "AliDNS UDP", "proto": "udp", "addr": "223.5.5.5", "port": 53, "url": "", "group": "domestic", "latency": 8, "enabled": True, "latency_measured": False},
-        {"id": "dnspod-udp", "name": "DNSPod UDP", "proto": "udp", "addr": "119.29.29.29", "port": 53, "url": "", "group": "domestic", "latency": 10, "enabled": True, "latency_measured": False},
+        {"id": "ali-doh3", "name": "AliDNS DoH3", "proto": "doh3", "addr": "dns.alidns.com", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "dnspod-doh3", "name": "DNSPod DoH3", "proto": "doh3", "addr": "doh.pub", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "ali-doh", "name": "AliDNS DoH", "proto": "doh", "addr": "dns.alidns.com", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "dnspod-doh", "name": "DNSPod DoH", "proto": "doh", "addr": "doh.pub", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "ali-ip-doh", "name": "AliDNS IP DoH", "proto": "doh", "addr": "223.5.5.5", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "dnspod-ip-doh", "name": "DNSPod IP DoH", "proto": "doh", "addr": "120.53.53.53", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "ali-ip2-doh", "name": "AliDNS2 IP DoH", "proto": "doh", "addr": "223.6.6.6", "port": 443, "url": "/dns-query", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "cf-doh3", "name": "Cloudflare DoH3", "proto": "doh3", "addr": "cloudflare-dns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "google-doh3", "name": "Google DoH3", "proto": "doh3", "addr": "dns.google", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "quad9-doh3", "name": "Quad9 DoH3", "proto": "doh3", "addr": "dns.quad9.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "cf-ip-doh", "name": "Cloudflare IP DoH", "proto": "doh", "addr": "1.1.1.1", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "cf-doh", "name": "Cloudflare DoH", "proto": "doh", "addr": "cloudflare-dns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "google-doh", "name": "Google DoH", "proto": "doh", "addr": "dns.google", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "google-ip-doh", "name": "Google IP DoH", "proto": "doh", "addr": "8.8.8.8", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "quad9-doh", "name": "Quad9 DoH", "proto": "doh", "addr": "dns.quad9.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "nextdns-doh", "name": "NextDNS DoH", "proto": "doh", "addr": "dns.nextdns.io", "port": 443, "url": "/4d5525", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "opendns-doh", "name": "OpenDNS DoH", "proto": "doh", "addr": "doh.opendns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "dnssb-doh", "name": "DNS.SB DoH", "proto": "doh", "addr": "doh.dns.sb", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "adguard-doh", "name": "AdGuard DoH", "proto": "doh", "addr": "dns.adguard.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "hinet-doh", "name": "HiNet DoH", "proto": "doh", "addr": "dns.hinet.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "ali-udp", "name": "AliDNS UDP", "proto": "udp", "addr": "223.5.5.5", "port": 53, "url": "", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
+        {"id": "dnspod-udp", "name": "DNSPod UDP", "proto": "udp", "addr": "119.29.29.29", "port": 53, "url": "", "group": "domestic", "latency": 5000, "enabled": True, "latency_measured": False},
     ],
     "rules": [
         {"id": "r1", "match": "*.baidu.com", "action": "group", "group": "domestic"},
@@ -337,10 +337,11 @@ _NUM_RANGES = {
     "health_check_interval": (0, None),
     "max_parallel_upstreams": (1, 16),
     "stale_ttl": (0, None),
-    "persist_ttl": (0, None),
+    "persist_ttl": (0, 31_536_000),
     "speed_interval_ms": (0, None),
     "speed_timeout_ms": (1, 60000),
-    # v1.9.84 P2: 补齐此前漏校验的用户可调数值键
+    # 客户端侧 EDNS bufsize 上限: 最小 512(经典 DNS), 最大 65535
+    "edns_client_max_size": (512, 65535),
     "edns_udp_size": (512, 9000),
     "health_probe_timeout_ms": (100, 60000),
     "rule_sub_interval": (0, None),

@@ -1,0 +1,1 @@
+{"version":1,"saved_at":1789853728.5655837,"count":2,"rules":[{"id":"r1","match":"*.baidu.com","action":"group","group":"domestic"},{"id":"r2","match":"*.google.com","action":"group","group":"global"}]}

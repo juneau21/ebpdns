@@ -989,7 +989,45 @@ class _Handler(BaseHTTPRequestHandler):
             if _is_loopback(configured_host) and not _is_loopback(req_host_part):
                 return False
             return True
-        return True
+        # 无 Origin 也无 Referer: 浏览器对跨站写请求必然带 Origin, 缺失说明
+        # 请求来自非浏览器客户端(curl/脚本)。仅在以下两种情形放行:
+        #   1) 已凭有效 API token 认证(token 即客户端持有凭据);
+        #   2) API 仅绑定环回地址(外部网络不可达, 无 CSRF 攻击面)。
+        # 无 token 且监听非环回地址时拒绝, 防止非浏览器客户端绕过 Origin 检查。
+        if self._token_authenticated():
+            return True
+        return self._bound_to_loopback()
+
+    def _token_authenticated(self):
+        """请求是否凭有效 token 通过认证。未配置 token 时返回 False(与
+        _check_api_token 的'未启用即放行'不同, 此处必须区分是否真的持凭据)。"""
+        api_cfg = self.app.cfg.get("api", {}) or {}
+        expected = str(api_cfg.get("token") or "").strip()
+        if not expected:
+            return False
+        presented = ""
+        auth = self.headers.get("Authorization", "") or ""
+        if auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+        if not presented:
+            presented = (self.headers.get("X-Api-Key", "") or "").strip()
+        if not presented:
+            return False
+        return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+
+    def _bound_to_loopback(self):
+        """API 是否仅绑定环回地址(以实际监听 socket 为准, 回退配置值)。"""
+        host = ""
+        try:
+            sa = self.server.server_address
+            host = str(sa[0]) if sa else ""
+        except Exception:
+            host = ""
+        if not host:
+            host = str((self.app.cfg.get("api") or {}).get("host") or "")
+        host = host.strip().lower()
+        return (host in ("localhost",) or host.startswith("127.")
+                or host in ("::1", "[::1]"))
 
     def _check_api_token(self):
         """P2-24: 可选 API token 认证。配置了 api.token(非空)时, 校验请求头

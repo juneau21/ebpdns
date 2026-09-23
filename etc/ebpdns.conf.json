@@ -1,7 +1,9 @@
 {
   "listen": {
     "udp": "127.0.0.1:53",
-    "tcp": "127.0.0.1:53"
+    "tcp": "127.0.0.1:53",
+    "udp6": "[::1]:53",
+    "tcp6": "[::1]:53"
   },
   "api": {
     "host": "127.0.0.1",
@@ -33,7 +35,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 30,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -45,7 +47,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 40,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -57,7 +59,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 30,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -69,7 +71,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 40,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -81,7 +83,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 30,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -93,7 +95,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 40,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -105,7 +107,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "domestic",
-      "latency": 30,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -117,7 +119,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 150,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -129,7 +131,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 160,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -141,7 +143,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 180,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -153,7 +155,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 150,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -165,7 +167,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 150,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -177,7 +179,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 160,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -189,7 +191,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 160,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -201,7 +203,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 180,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -213,7 +215,7 @@
       "port": 443,
       "url": "/4d5525",
       "group": "global",
-      "latency": 200,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -225,7 +227,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 200,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -237,7 +239,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 220,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -249,7 +251,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 220,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -261,7 +263,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "latency": 200,
+      "latency": 5000,
       "enabled": false,
       "latency_measured": false
     },
@@ -273,7 +275,7 @@
       "port": 53,
       "url": "",
       "group": "domestic",
-      "latency": 8,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     },
@@ -285,7 +287,7 @@
       "port": 53,
       "url": "",
       "group": "domestic",
-      "latency": 10,
+      "latency": 5000,
       "enabled": true,
       "latency_measured": false
     }

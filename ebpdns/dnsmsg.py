@@ -366,10 +366,18 @@ def _parse_rdata(data, pos, rtype, rdlen):
             p += ln
         return '"' + "".join(out) + '"'
     if rtype == TYPE_SOA:
-        # SOA: decode_name 内部有边界检查, p+20 检查防止越界
+        # SOA rdata = mname + rname + 5×uint32(20B)。校验两个名称 decode_name
+        # 实际消费的线格式字节不超过声明 rdlen(与 CNAME/NS/MX/SRV 同型), 且
+        # 名称后 20 字节定长字段恰好落在 rdlen 内。恶意上游声明 rdlen 偏小但
+        # 名称经标签/前向指针读到 rdata 之外时, 整条 RR 丢弃, 避免产出内容
+        # 不一致的转发应答。
         mname, p = decode_name(data, pos)
+        if p - pos > rdlen:
+            return None
         rname, p = decode_name(data, p)
-        if p + 20 <= pos + rdlen:
+        if p - pos > rdlen:
+            return None
+        if p + 20 == pos + rdlen:
             serial, refresh, retry, expire, minimum = struct.unpack(">IIIII", data[p:p + 20])
             return "%s %s %d %d %d %d %d" % (mname, rname, serial, refresh, retry, expire, minimum)
         return None
@@ -506,22 +514,17 @@ def encode_rdata(rtype, value):
         try:
             return socket.inet_aton(value)
         except OSError:
-            # R42/P3-2: 防御性兜底。_parse_rdata 入库时已拒绝 rdlen≠4 的畸形 A 记录,
-            # 缓存内 A 答案 value 恒为合法 IPv4, inet_aton 必成功, 本分支正常流程不可达。
-            # 仅当未来出现非 parse_message 来源的答案(如 forceIp 规则配了畸形 IP)时兜底:
-            # 仅在编码后恰为 4 字节时才使用, 否则不 return, 落入末尾通用 bytes.fromhex
-            # 兜底, 避免产出长度不匹配的畸形 rdata 被客户端按长度前缀错位解析。
-            b = value.encode()
-            if len(b) == 4:
-                return b
+            # 非法 IPv4(如 forceIp 规则误配 "abcd"/主机名)不再把任意 4 字节
+            # 字符串当 IP 编码(旧兜底会把 "abcd" 编为 97.98.99.100)。返回 None,
+            # build_response_body_answers 跳过该记录; 规则配置侧也会在创建时
+            # 校验 forceIp 的 IP 合法性。
+            return None
     if rtype == TYPE_AAAA:
         try:
             return socket.inet_pton(socket.AF_INET6, value)
         except OSError:
-            # R42/P3-2: 与 TYPE_A 同型, 仅在编码后恰为 16 字节(IPv6 长度)时兜底使用。
-            b = value.encode()
-            if len(b) == 16:
-                return b
+            # 与 TYPE_A 同型: 非法 IPv6 返回 None 跳过, 不做 16 字节字符串兜底。
+            return None
     if rtype in (TYPE_CNAME, TYPE_NS, TYPE_PTR):
         # R39/P3-1: 与 SOA/SRV 分支同型兜底。恶意上游在 wire label 发送非 ASCII
         # 字节时 decode_name 经 errors="replace" 产出 U+FFFD, 重建应答阶段
@@ -789,7 +792,8 @@ def _opt_rr_bytes(query_data):
 
 
 def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
-                       owner_name=None, fallback_type=0, _edns=None, _ttl_override=None):
+                       owner_name=None, fallback_type=0, _edns=None, _ttl_override=None,
+                       bufsize_cap=None):
     """UDP 响应公共拼接函数(v1.9.76 P0-1): 快路径与完整路径统一走这里做
     EDNS bufsize 截断 + 逐条丢弃 + 置 TC。
 
@@ -801,7 +805,9 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
       resp_body 缓存始终是完整 answers, 截断只在拼接时发生, 不改缓存。
     - _edns: 可选 (bufsize, opt_bytes) 预计算结果。快路径调用方已用
       _question_edns_info 一遍拿到 qbytes+bufsize+opt, 直接传入避免本函数
-      再遍历一次 question/additional 段。"""
+      再遍历一次 question/additional 段。
+    - bufsize_cap: 客户端侧 bufsize 上限(防开放解析器放大攻击); 非空时
+      钳制客户端声明的 bufsize, 超限应答置 TC 走 TCP。"""
     if len(raw_query) < 12:
         return None
     # P3-4: qbytes 防御性兜底(调用方 extract_question 失败可能传 None,
@@ -812,6 +818,9 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
         limit, opt = _edns
     else:
         _qb, limit, opt = _question_edns_info(raw_query)
+    # 客户端 bufsize 上限钳制(快路径已在调用方钳 _edns, 此处覆盖完整路径)
+    if bufsize_cap is not None:
+        limit = min(limit, int(bufsize_cap))
     opt_len = len(opt) if opt else 0
     # 先按 MAX_ANSWERS 截断答案数。abody 缓存的是完整(未按 MAX_ANSWERS 截断)的
     # 编码字节; 仅当传入答案数未超 MAX_ANSWERS 时才能直接复用 abody, 否则 abody
@@ -865,29 +874,27 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
     out = bytearray()
     enc_owner = encode_name(owner_name) if owner_name else b"\x00"
     _rr_hdr = _RR_HDR
+
+    def _append(a, ttl):
+        rtype = int(a.get("type", fallback_type) or fallback_type)
+        rdata = encode_rdata(rtype, a.get("value", a.get("rdata", "")))
+        # rdata 编码失败(如非法 A/AAAA)跳过整条 RR, 不产出畸形应答
+        if rdata is None:
+            return
+        name = a.get("name")
+        # 注意: 必须用 out.extend 方法调用, 不能写 out += —— 增广赋值会让
+        # Python 把 out 当作本内嵌函数的局部变量, 触发 UnboundLocalError。
+        out.extend(encode_name(name) if name else enc_owner)
+        out.extend(_rr_hdr.pack(rtype, CLASS_IN, ttl, len(rdata)))
+        out.extend(rdata)
+
     if _ttl_override is None:
         for a in answers:
-            rtype = int(a.get("type", fallback_type) or fallback_type)
-            rdata = encode_rdata(rtype, a.get("value", a.get("rdata", "")))
-            name = a.get("name")
-            if name:
-                out += encode_name(name)
-            else:
-                out += enc_owner
-            out += _rr_hdr.pack(rtype, CLASS_IN, _safe_int(a.get("ttl", 300), 300), len(rdata))
-            out += rdata
+            _append(a, _safe_int(a.get("ttl", 300), 300))
     else:
         ttl = _safe_int(_ttl_override, 300)
         for a in answers:
-            rtype = int(a.get("type", fallback_type) or fallback_type)
-            rdata = encode_rdata(rtype, a.get("value", a.get("rdata", "")))
-            name = a.get("name")
-            if name:
-                out += encode_name(name)
-            else:
-                out += enc_owner
-            out += _rr_hdr.pack(rtype, CLASS_IN, ttl, len(rdata))
-            out += rdata
+            _append(a, ttl)
     return bytes(out)
 
 
@@ -899,10 +906,11 @@ def build_response_body(domain, qtype, answers):
                                                  fallback_type=qtype)
 
 
-def build_response(query_data, domain, qtype, answers, rcode=0):
+def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None):
     """基于请求报文构造响应。answers: [{value, type, ttl, name?}]。
     v1.9.76 P0-1: 统一走 build_udp_response 做 EDNS bufsize 截断 + 逐条丢弃 + 置 TC,
-    并回显 OPT(保留 DO 位)。答案数仍限 MAX_ANSWERS。"""
+    并回显 OPT(保留 DO 位)。答案数仍限 MAX_ANSWERS。
+    bufsize_cap: 客户端侧 bufsize 上限(防放大), 透传 build_udp_response。"""
     if len(query_data) < 12:
         return None
     answers = (answers or [])[:MAX_ANSWERS]
@@ -910,7 +918,8 @@ def build_response(query_data, domain, qtype, answers, rcode=0):
     if qbytes is None:
         qbytes = encode_name(domain) + struct.pack(">HH", qtype, CLASS_IN)
     return build_udp_response(query_data, qbytes, answers, rcode,
-                              abody=None, owner_name=domain, fallback_type=qtype)
+                              abody=None, owner_name=domain, fallback_type=qtype,
+                              bufsize_cap=bufsize_cap)
 
 
 def build_error_response(query_data, rcode=2):

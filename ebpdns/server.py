@@ -93,6 +93,9 @@ class _UDPHandler:
         # 偶发错误不应 break 整个收包线程)。连续错误达阈值才重建 socket(置 stop 退出
         # serve_forever, 由上层重绑); 成功收包即清零。
         self._recv_errs = 0
+        # 致命回调: socket 连续接收失败判定网络栈不可用时, 由上层注入
+        # (回调内先持久化缓存再非零退出, systemd Restart=on-failure 重启)。
+        self.fatal_callback = None
 
     def _inc_dropped(self):
         with self._drop_lock:
@@ -141,14 +144,10 @@ class _UDPHandler:
                 # systemd 反复重启。保持 stop 让 systemd 拉起的行为不变, 只放宽阈值与
                 # 日志措辞。
                 if self._recv_errs >= 20:
-                    log.error("UDP 收包线程连续错误达阈值, 主动退出进程交 systemd 重启 (累计 %d 次)", self._recv_errs)
-                    # v1.9.80: 改为主动退出进程, 让 systemd Restart=on-failure 拉起新实例。
-                    # 缓存持久化每 60s 周期运行, 丢失最多一个周期的新条目, 可接受。
-                    try:
-                        self._stop.set()
-                    except Exception:
-                        pass
-                    os._exit(1)
+                    # socket 连续错误达阈值, 判定网络栈不可用: 走致命退出流程
+                    # (先持久化缓存再非零退出交 systemd 重启), 不再 os._exit
+                    # 硬退出丢失最多一个周期的缓存/预取状态。
+                    self._fatal_shutdown()
                 continue
             self._recv_errs = 0
             # 缓存命中快路径: 主线程直接查 LRU 回包, 避免线程池调度。
@@ -177,6 +176,30 @@ class _UDPHandler:
             else:
                 # #6 池满: 丢弃本包, UDP 客户端会重试, 避免积压拖垮主循环; 计一次丢弃
                 self._inc_dropped()
+
+    def _fatal_shutdown(self):
+        """socket 连续接收失败, 判定网络栈不可用: 置停止标志, 触发注入的致命
+        回调(回调内先持久化缓存再非零退出, systemd Restart=on-failure 自动
+        重启), 避免直接 os._exit 丢失缓存/预取状态。无回调时兜底硬退出。"""
+        try:
+            log.error("UDP recv 连续 %d 次错误, 触发致命退出(先持久化)",
+                      self._recv_errs)
+        except Exception:
+            pass
+        try:
+            self._stop.set()
+        except Exception:
+            pass
+        cb = self.fatal_callback
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                try:
+                    log.exception("fatal_callback 异常, 兜底硬退出")
+                except Exception:
+                    pass
+        os._exit(1)
 
     def _handle(self, data, addr, msg=None):
         try:
@@ -327,10 +350,13 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
 class DNSServer:
     """组合 UDP4/UDP6 + TCP4/TCP6 DNS 服务。IPv6 监听失败仅告警不阻断（无 IPv6 栈环境自动跳过）。"""
 
-    def __init__(self, resolver, cfg):
+    def __init__(self, resolver, cfg, fatal_callback=None):
         self.resolver = resolver
         self.cfg = cfg
+        # 致命回调下发给全部 UDP 处理器(udp4 + udp6)
+        self.fatal_callback = fatal_callback
         self.udp = _UDPHandler(resolver)
+        self.udp.fatal_callback = fatal_callback
         self.udp6 = None
         self.tcp = None
         self.tcp6 = None
@@ -342,6 +368,7 @@ class DNSServer:
 
     def _start_udp(self, spec, attr, name):
         handler = _UDPHandler(self.resolver)
+        handler.fatal_callback = self.fatal_callback
         try:
             addr = handler.bind(spec)
         except OSError:

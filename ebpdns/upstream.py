@@ -997,15 +997,15 @@ def _doh_query(up, query_bytes, timeout_ms):
     # H5: 进入函数即设总 deadline, 重试不再重发完整 timeout(原实现首败后
     # 重试用完整 timeout, 总耗时可达 2×timeout)。建连/收发均用剩余时间。
     deadline = time.monotonic() + timeout
-    # R8 P2-1/P3-4: 读取上游级 kill switch doh_strict_cert(默认 False 保持兼容),
-    # 与 dot_strict_cert 对等。True 时 IP 字面量证书 SAN 校验失败不降级(不做
-    # check_hostname=False 重试), 直接报错。配置示例:
+    # 上游级证书校验开关 doh_strict_cert: 默认 True(严格, 不降级)。
+    # IP 字面量上游证书 SAN 校验失败时直接报错, 不做 check_hostname=False 重试,
+    # 防止持有任意受信 CA 证书的 MITM 劫持 IP 直连 DoH。仅当确需兼容仅含 DNS SAN
+    # 的自托管证书时, 显式在上游配置 "doh_strict_cert": false 才允许旧的降级行为
+    # (降级连接即用即弃不入池, 证书链仍校验)。配置示例:
     #   - proto: doh
     #     addr: 1.2.3.4          # IP 字面量直连
-    #     doh_strict_cert: true   # 严格证书校验, 证书无匹配 IP SAN 即失败不降级
-    # 适用场景: 自托管 DoH 证书刚换成含 IP SAN 的正规证书后, 希望彻底关闭
-    # 降级兜底以防万一证书配置错误时静默放行弱校验连接。
-    strict_cert = bool(up.get("doh_strict_cert", False))
+    #     doh_strict_cert: false # 显式允许降级(默认 true, 不匹配即失败)
+    strict_cert = bool(up.get("doh_strict_cert", True))
     # R31 P3-1: 经 bootstrap-IP 直连时, 底层 socket 已直连到 bp_ip, 但所有
     # HTTPSConnection 构造点仍传入原始域名 host(非 IP), HTTPConnection 据此自动
     # 生成的 Host 头本来就是域名。此处显式再设一次 Host 头作为 defense-in-depth:
@@ -1317,17 +1317,15 @@ def _dot_query(up, query_bytes, timeout_ms):
     # 避免总耗时达 2×timeout。
     deadline = time.monotonic() + timeout
     frame = tcp_frame(query_bytes)
-    # R7 P2-2: 读取上游级 kill switch dot_strict_cert(默认 False 保持兼容)。
-    # R8 P3-4: 补充文档。dot_strict_cert 与 doh_strict_cert(DoH 对等项)为上游级布尔
-    # 配置, 用于关闭"IP 字面量 + 仅 DNS SAN 证书"的自动降级兜底。
-    # 配置示例:
+    # 上游级证书校验开关 dot_strict_cert: 默认 True(严格, 不降级), 与
+    # doh_strict_cert 对等。IP 字面量上游证书 SAN 校验失败时直接报错, 不做
+    # check_hostname=False 重试, 防止持有任意受信 CA 证书的 MITM 劫持 IP 直连 DoT。
+    # 仅当确需兼容仅含 DNS SAN 的自托管证书时, 显式配置 "dot_strict_cert": false
+    # 才允许旧的降级行为(证书链仍校验, 仅跳过主机名/SAN 匹配)。配置示例:
     #   - proto: dot
     #     addr: 1.2.3.4          # IP 字面量直连
-    #     dot_strict_cert: true   # 严格证书校验, 证书无匹配 IP SAN 即失败不降级
-    # 默认 False: 兼容自托管场景(仅 DNS SAN 证书)自动降级为 check_hostname=False
-    # (证书链仍校验, 仅跳过主机名/SAN 匹配)。设 true 后证书 SAN 不匹配直接报错,
-    # 适合证书已升级为含 IP SAN 正规证书后、希望彻底关闭弱校验降级的场景。
-    strict_cert = bool(up.get("dot_strict_cert", False))
+    #     dot_strict_cert: false # 显式允许降级(默认 true, 不匹配即失败)
+    strict_cert = bool(up.get("dot_strict_cert", True))
 
     def _exchange(sock):
         remaining = deadline - time.monotonic()
@@ -1387,6 +1385,15 @@ def _dot_query(up, query_bytes, timeout_ms):
                     buf = rest
                     if not buf:
                         # 空帧后无残余, 回 recv。
+                        break
+                    continue
+                # qid 校验: 复用连接帧错位/协议违规服务器多发帧时, 响应 qid 必须
+                # 与本次查询一致; 不一致的帧丢弃并继续读后续帧(与空帧处理同型),
+                # 防止把别的查询的应答误当作本次结果返回。合法 DoT 服务器严格一问
+                # 一答(RFC 7858), qid 恒匹配, 本检查为纵深防御。
+                if len(msg) >= 2 and bytes(msg[0:2]) != query_bytes[0:2]:
+                    buf = rest
+                    if not buf:
                         break
                     continue
                 # R31 P2-1: 有效帧 return 前直接丢弃 rest(协议违规服务器多发的

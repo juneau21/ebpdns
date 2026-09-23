@@ -414,6 +414,19 @@ def run(cfg, config_path=None):
     cfg["rule_sub_file"] = config_mod.sub_rules_path(config_path)  # 订阅规则独立文件
     cfg["rule_local_file"] = config_mod.local_rules_path(config_path)  # 逐条规则独立文件
     app_ctx, endpoints = build_app(cfg, config_path)
+    # 注入 UDP 致命回调: 网络栈连续接收失败时, 先持久化缓存再非零退出
+    # (systemd Restart=on-failure 自动重启), 不再硬退出丢失缓存状态。
+    def _fatal_exit():
+        try:
+            _save_cache(cfg, config_path, app_ctx.resolver.cache)
+        except Exception:
+            pass
+        os._exit(1)
+    if app_ctx.dns_server is not None:
+        app_ctx.dns_server.fatal_callback = _fatal_exit
+        app_ctx.dns_server.udp.fatal_callback = _fatal_exit
+        if app_ctx.dns_server.udp6:
+            app_ctx.dns_server.udp6.fatal_callback = _fatal_exit
     _sync_sub_meta(cfg, config_path)  # 订阅元信息与独立文件对齐(文件为准, 避免重启后界面空/规则仍生效)
     # 逐条规则独立文件(rules_local.json): 首次启动迁移 config.json 的 rules 到独立文件,
     # 之后 config.json 不再保存 rules(与订阅规则同样的"独立存放"模型)。

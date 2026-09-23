@@ -607,7 +607,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               <div class="cfg-row"><div class="lab">兜底窗口<small>seconds · 过期后最多可返回旧数据的时间(超过则正常 miss)</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-stalettl" min="0" max="86400" step="10"></div></div>
               <div class="cfg-row"><div class="lab">持久化 TTL<small>seconds · 0=按保存时剩余 TTL 原样恢复; >0 时重启恢复的缓存统一用此 TTL, 配合预取长期保持</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-persistttl" min="0" max="86400" step="60" placeholder="0"></div></div>
+                <div class="val"><input class="num" type="number" id="cfg-persistttl" min="0" max="31536000" step="60" placeholder="0"></div></div>
             </div>
           </div>
           <div class="card">
@@ -2232,7 +2232,7 @@ function bindConfigEvents(){
   bindCfg('#cfg-ttlmax','ttl_max', e => clamp(+e.target.value,0,86400));
   bindCfg('#cfg-stale','serve_stale', e => e.target.checked);
   bindCfg('#cfg-stalettl','stale_ttl', e => clamp(+e.target.value,0,86400));
-  bindCfg('#cfg-persistttl','persist_ttl', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-persistttl','persist_ttl', e => clamp(+e.target.value,0,31536000));
   bindCfg('#cfg-speed','speed_test', e => e.target.checked);
   bindCfg('#cfg-spint','speed_interval_ms', e => clamp(+e.target.value,0,60000));
   bindCfg('#cfg-fallback','fallback', e => e.target.checked);

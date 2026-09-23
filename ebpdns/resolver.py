@@ -224,15 +224,18 @@ def _detect_catastrophic_regex(pat):
     return False
 
 def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
-    """带超时的正则搜索, 防止 ReDoS。超时返回 None(视为不匹配)。
+    """带超时的正则搜索, 防止 ReDoS。三态返回:
+    - True  = 正则执行完成且命中
+    - False = 正则执行完成且不匹配
+    - None  = 结果不确定(池满/超时/执行异常)。调用方对屏蔽类规则必须
+      fail-closed(当作命中), 不得当"不匹配"放行。
     v1.9.76 2.9: 池满(_REGEX_SEM 耗尽)放弃本次匹配, 不排队。
 
-    R7/P3-5 fail-open 语义(有意为之, 文档化): 无论 fut.result(timeout) 超时、
-    池满 acquire 失败、还是 submit 异常, 本函数一律返回 None = "不匹配"。这意味着
-    当某个灾难性正则把 worker 占满/池耗尽时, 依赖正则命中的 block 规则会在该窗口内
-    短暂失效(被命中的域名按放行处理)。这是明确的可用性优先取舍——宁可让一条 block
-    规则短暂绕过, 也不能让 ReDoS 把整个 miss 主路径阻塞/拖死。超时后 worker 线程
-    仍在后台跑至自然结束(Python re 不可取消), 但信号量有界(6+8), blast radius 可控。"""
+    安全语义(已从 fail-open 改为 fail-closed): 灾难性正则把 worker 占满/池耗尽
+    时, 依赖正则命中的 block 规则不再按放行处理, 而是由 match_rule 对该规则
+    fail-closed 屏蔽对应查询, 防止 ReDoS 窗口内屏蔽规则被绕过。超时后 worker
+    线程仍在后台跑至自然结束(Python re 不可取消), 信号量有界(6+8), blast radius
+    可控。"""
     if not _REGEX_SEM.acquire(blocking=False):
         return None
     try:
@@ -242,16 +245,13 @@ def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
         return None
     fut.add_done_callback(lambda _f: _REGEX_SEM.release())
     try:
-        return fut.result(timeout=timeout)
+        return bool(fut.result(timeout=timeout))
     except Exception:
         return None
 
 def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
-    """带超时的正则匹配(match), 防止 ReDoS。超时返回 None(视为不匹配)。
-    v1.9.76 2.9: 池满放弃本次匹配, 不排队。
-
-    R7/P3-5: fail-open 语义与 _regex_search_safe 完全一致(超时/池满/异常均
-    返回 None=不匹配, block 规则短暂绕过, 可用性优先), 详见该函数 docstring。"""
+    """带超时的正则匹配(match), 防止 ReDoS。三态与 _regex_search_safe 完全一致
+    (True=命中 / False=不匹配 / None=不确定, 屏蔽规则 fail-closed)。"""
     if not _REGEX_SEM.acquire(blocking=False):
         return None
     try:
@@ -261,7 +261,7 @@ def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
         return None
     fut.add_done_callback(lambda _f: _REGEX_SEM.release())
     try:
-        return fut.result(timeout=timeout)
+        return bool(fut.result(timeout=timeout))
     except Exception:
         return None
 from .cache import PartitionedCache, TinyLFUCache
@@ -390,6 +390,9 @@ class Resolver:
         except Exception:
             pass
         self._speed_lock = threading.Lock()
+        # 客户端侧 EDNS bufsize 上限: 钳制客户端声明的 UDP payload, 防开放解析器
+        # 放大攻击(客户端可自声明 65535)。应答超限走 TC→TCP。
+        self._client_bufsize_cap = _safe_int(cfg.get("edns_client_max_size", 1232), 1232)
         # 候选 IP 测速结果缓存: ip -> (rtt_ms, ts)。命中直接复用, 避免重复探测。
         self._ip_speed_cache = {}
         self._ip_speed_lock = threading.Lock()
@@ -823,7 +826,13 @@ class Resolver:
         if not ok_results:
             # 全部无答案 → 区分 NXDOMAIN / NODATA / 真失败
             nx = [r for r in results if r.get("rcode") == 3]
-            if nx:
+            # 超时路径同样套用 NXDOMAIN 多数表决(与 _query_parallel 提前返回的
+            # quorum 语义一致): 仅当一致 NXDOMAIN 的上游数 >= quorum 才确认域名
+            # 不存在。quorum 钳到实际参与并发的上游数(len(results)), 单上游配置
+            # 恒为 1。此前全部等待结束后只要 1 个 NXDOMAIN、其余网络失败即缓存
+            # NXDOMAIN, 单个被劫持上游可在其他上游不可达时注入否定结果。
+            _nx_quorum = max(1, min(_safe_int(cfg.get("nxdomain_quorum", 2), 1), len(results)))
+            if nx and len(nx) >= _nx_quorum:
                 lat = (time.monotonic() - t0) * 1000
                 # v1.9.76 2.7: authority 段有 SOA 时优先用其 minimum(负缓存权威 TTL);
                 # 否则默认 [10,60] 秒。再经 _clamp_ttl 受 ttl_min/ttl_max 管控。
@@ -1098,6 +1107,8 @@ class Resolver:
         # v1.9.85: 一遍遍历同时拿到 qbytes + bufsize + opt(原 extract_question 一遍,
         # build_udp_response 内部 _edns_bufsize + _opt_rr_bytes 又两遍 question 段)。
         qbytes, _limit, opt = dnsmsg._question_edns_info(raw_query)
+        # 钳制客户端声明的 bufsize 上限(防放大攻击)
+        _limit = min(_limit, self._client_bufsize_cap)
         _edns = (_limit, opt)
         if qbytes is None:
             # R5/P3-2: 切片失败兜底(极罕见, 仅当 question 段畸形/截断时触发, 正常包
@@ -1194,7 +1205,8 @@ class Resolver:
         if res.get("error"):
             return dnsmsg.build_error_response(raw_query, 2 if rcode == 2 else rcode)
         answers = res.get("answers", [])
-        resp = dnsmsg.build_response(raw_query, domain, qtype, answers, rcode=rcode)
+        resp = dnsmsg.build_response(raw_query, domain, qtype, answers, rcode=rcode,
+                                     bufsize_cap=self._client_bufsize_cap)
         if resp:
             self.tel.inc("bytes_out", len(resp))
         return resp
@@ -2280,6 +2292,8 @@ class Resolver:
             self.cache.stale_window = _safe_int(new_cfg.get("stale_ttl", 3600), 3600) if new_cfg.get("serve_stale", False) else 0
         except Exception:
             pass
+        # 热重载同步客户端 bufsize 上限
+        self._client_bufsize_cap = _safe_int(new_cfg.get("edns_client_max_size", 1232), 1232)
         # 缓存策略切换(lru <-> tinylfu): 以实际缓存对象类型与目标策略比对重建,
         # 不依赖 cfg 新旧字符串(因 PUT 可能已先改 cfg)
         new_p = str(new_cfg.get("cache_policy", "lru")).lower()
@@ -2733,7 +2747,13 @@ class Resolver:
             group = suffix_wild.get(core)
             if group:
                 for c, rule in group:
-                    if _regex_match_safe(c, n):
+                    m = _regex_match_safe(c, n)
+                    if m is True:
+                        self._cache_rule(n, rule)
+                        return rule
+                    # 结果不确定(ReDoS/池满)且该规则为屏蔽规则 → fail-closed,
+                    # 按命中处理, 不把被屏蔽域名放行。
+                    if m is None and rule.get("action") == "block":
                         self._cache_rule(n, rule)
                         return rule
             idx = core.find(".")
@@ -2742,7 +2762,13 @@ class Resolver:
             core = core[idx + 1:]
         # 正则规则: 编译已缓存, 按配置顺序首个命中生效(带 ReDoS 超时保护)
         for c, rule in regex:
-            if _regex_search_safe(c, n):
+            m = _regex_search_safe(c, n)
+            if m is True:
+                self._cache_rule(n, rule)
+                return rule
+            # 结果不确定(ReDoS/池满)且该规则为屏蔽规则 → fail-closed 屏蔽,
+            # 防止 ReDoS 窗口内 re: block 规则被绕过。
+            if m is None and rule.get("action") == "block":
                 self._cache_rule(n, rule)
                 return rule
         self._cache_rule(n, None)
