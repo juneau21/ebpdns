@@ -301,6 +301,13 @@ input[type=range]{accent-color:var(--cyan); width:120px}
 .up-row input.text{width:100%; min-width:0}
 .up-row .del{background:none; border:none; color:var(--text3); cursor:pointer; font-family:var(--font-mono); font-size:13px; padding:4px}
 .up-row .del:hover{color:var(--red)}
+/* 上游高级选项单元格(P5/P6): 私网IP + DoH/DoT 严格证书, 纵向紧凑堆叠 */
+.up-row .up-opts{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;min-width:0}
+.up-row .up-opt{display:inline-flex;align-items:center;gap:3px;font-size:11px;line-height:1.35;color:var(--text2);white-space:nowrap;cursor:pointer}
+.up-row .up-opt input{margin:0;cursor:pointer;accent-color:var(--cyan)}
+/* weight 数字输入(非 checkbox): 紧凑宽度, 文本光标, 覆盖上面 checkbox 的 pointer/accent 样式 */
+.up-row .up-opt input.up-weight{width:58px;padding:1px 4px;font-size:11px;cursor:text;accent-color:auto;border:1px solid var(--line2);border-radius:3px;background:var(--bg)}
+.up-row .up-opt input:disabled{cursor:not-allowed;opacity:.35}
 .hint{font-family:var(--font-mono); font-size:11px; color:var(--text3); margin-top:10px; line-height:1.7}
 .cfg-actions{display:flex; gap:10px; align-items:center; padding:14px 16px; border-top:1px solid var(--line)}
 .cfg-actions .note{font-family:var(--font-mono); font-size:13px; color:var(--text2); margin-left:auto}
@@ -366,12 +373,12 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
 .mchip .k{font-size:13px}
 .mchip .v{font-size:18px}
 .tb-metrics{gap:14px}
-/* 上游行 9 列: 开关|名称|协议|完整地址|端口|分组|基础延迟|连接健康度|删除
+/* 上游行 10 列: 开关|名称|协议|完整地址|端口|分组|基础延迟|高级选项|连接健康度|删除
    首尾列固定宽度(auto 会因表头空span与行控件宽度不同导致表头整体错位) */
-.up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px}
+.up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(96px,auto) minmax(130px,1fr) 28px}
 /* 上游卡片跨满整行; 四栏布局: 缓存(1) | 测速(2) | 高级(3) | 分流(4), 上游另起一行跨满 */
 .cfg-grid .card.up-card{grid-column:1/-1}
-.cfg-grid .up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(130px,1fr) 28px !important}
+.cfg-grid .up-row{grid-template-columns:36px minmax(96px,260px) 74px minmax(200px,2fr) 62px 78px 88px minmax(96px,auto) minmax(130px,1fr) 28px !important}
 .cfg-grid .up-row input.text{width:100%; min-width:0}
 .cfg-grid .up-row select.q-sel{width:100%; min-width:0}
 .cfg-grid .up-row input.num{width:100%; min-width:0}
@@ -463,7 +470,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
     </nav>
     <div class="side-foot">
       <span class="dot"></span><span id="foot-mode">daemon 运行中</span>
-      <span class="uptime" id="foot-uptime">up 0m · v1.9.135</span>
+      <span class="uptime" id="foot-uptime">up 0m · v1.9.142</span>
     </div>
   </aside>
   <!-- ===================== 主区 ===================== -->
@@ -653,9 +660,9 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               <div class="cfg-row"><div class="lab">候选 IP 测速开关<small>对 A/AAAA 候选地址做 RTT 测速并择优返回</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-ipspeedcheck"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">健康检查周期<small>seconds · 0=关闭主动健康检查</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="3600" step="10" placeholder="0"></div></div>
+                <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="604800" step="10" placeholder="0"></div></div>
               <div class="cfg-row"><div class="lab">规则订阅更新周期<small>seconds · 0=不自动更新订阅</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="86400" step="60" placeholder="0"></div></div>
+                <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="604800" step="60" placeholder="0"></div></div>
               <div class="cfg-row"><div class="lab">Bootstrap DNS<small>引导解析 DoH/DoT 主机名用的普通 DNS 地址(仅支持单个, host:port 格式)</small></div>
                 <div class="val"><input class="text" type="text" id="cfg-bootstrapdns" placeholder="如 223.5.5.5:53" spellcheck="false" autocomplete="off"></div></div>
               <div class="cfg-row"><div class="lab">熔断失败阈值<small>连续失败次数后打开熔断(默认 3, 范围 1-100)</small></div>
@@ -682,6 +689,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                   <input class="text" id="sub-url-input" placeholder="订阅链接 https://.../list.txt (域名/Adblock/hosts 列表均可)" spellcheck="false" autocomplete="off" style="flex:2;min-width:0">
                   <select class="q-sel" id="sub-action">
                     <option value="block">屏蔽</option>
+                    <option value="allow">放行(白名单)</option>
                     <option value="group">使用分组</option>
                     <option value="forceIp">强制 IP</option>
                   </select>
@@ -726,7 +734,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
             <div class="card-bd flush">
               <div style="padding:4px 16px 0">
                 <div class="up-row" style="border-bottom:1px solid var(--line); padding-bottom:6px; font-family:var(--font-mono); font-size:13px; color:var(--text3); letter-spacing:.6px">
-                  <span></span><span>名称</span><span>协议</span><span>完整地址</span><span>端口</span><span>分组</span><span>基础延迟</span><span>连接健康度</span><span></span>
+                  <span></span><span>名称</span><span>协议</span><span>完整地址</span><span>端口</span><span>分组</span><span>基础延迟</span><span>高级</span><span>连接健康度</span><span></span>
                 </div>
                 <div id="up-list"></div>
               </div>
@@ -996,27 +1004,37 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.135";    // 前端兜底版本(REAL 模式由 /api/status.version 动态覆盖, 见 pollStatus/boot)
+const APP_VERSION = "v1.9.142";    // 前端兜底版本(REAL 模式由 /api/status.version 动态覆盖, 见 pollStatus/boot)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[], hiddenHistoryBefore:null, deletedIds:{} };
 const API = {
   // P1-1(R2 审查): 读取 localStorage 中的 API token(用户在「配置 → 连接设置」中保存)。
   // 后端 P2-24 启用 api.token 后, 除静态资源与 /api/health 外所有 /api/* 必须携带
   //   Authorization: Bearer <token>(后端同时兼容 X-Api-Key, 这里统一用 Bearer)。
   // token 为空串时不发该头(后端未启用认证时放行, 与现状一致)。
+  // 风险接受(低级别, 不改方案): 本控制台是本机/内网管理界面, 渲染层全部经过 esc()
+  //   转义(无 innerHTML 直插未转义用户数据), 实际 XSS 注入面极小; localStorage 是
+  //   本地管理台保存凭据的标准做法(sessionStorage 关闭即丢、需反复重输, 体验更差),
+  //   故保留 localStorage, 不上 httpOnly Cookie(管理台是浏览器直连, 无跨站场景)。
   getToken(){
     try { return localStorage.getItem('ebpdns_api_token') || ''; } catch(e){ return ''; }
   },
   setToken(t){
     try { if (t) localStorage.setItem('ebpdns_api_token', t); else localStorage.removeItem('ebpdns_api_token'); } catch(e){}
   },
-  async req(method, path, body){
+  // M1 修复: 超时默认 10000ms, 长耗时端点(reprobe/规则订阅/订阅更新/规则导入)
+  //   由调用方通过第 4 个参数传入更大值(如 30000), 避免后端仍在工作而前端先 abort,
+  //   出现"红色失败但实际已生效"的误导。
+  // M2 修复: body===undefined 时不发 Content-Type/请求体, 避免向后端 /api/reload
+  //   这类不消费 rfile body 的同步路由残留 "{}" 字节, 在 HTTP/1.1 keep-alive 下
+  //   污染下一请求行导致连接失步。
+  async req(method, path, body, timeout){
     const opt = { method, headers:{} };
     const _tok = API.getToken();
     if (_tok) opt.headers['Authorization'] = 'Bearer ' + _tok;   // P1-1: 携带认证头
     if (body !== undefined){ opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-    // 10s 超时: 避免后端 hang 住时前端 Promise 永远 pending
+    const _ms = (typeof timeout === 'number' && timeout > 0) ? timeout : 10000;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const timer = setTimeout(() => ctrl.abort(), _ms);
     opt.signal = ctrl.signal;
     let r;
     try {
@@ -1052,10 +1070,10 @@ const API = {
       throw new Error(path + ' -> HTTP ' + r.status + ': 响应不是合法 JSON (' + e.message + ')');
     }
   },
-  get(p){ return API.req('GET', p); },
-  post(p, b){ return API.req('POST', p, b); },
-  put(p, b){ return API.req('PUT', p, b); },
-  del(p){ return API.req('DELETE', p); }
+  get(p, t){ return API.req('GET', p, undefined, t); },
+  post(p, b, t){ return API.req('POST', p, b, t); },
+  put(p, b, t){ return API.req('PUT', p, b, t); },
+  del(p, t){ return API.req('DELETE', p, undefined, t); }
 };
 
 /* ---------------- 运行状态 (仿真) ---------------- */
@@ -1291,6 +1309,32 @@ function simLog(domain, qtype, level, answer, lat){
 }
 let logFilters = {};    // {栏: 筛选值}  ts/ip/dm/qt/up/an/la/rl
 let logGlobalQ = '';    // 全局搜索关键字(小写)
+// 低级别修复: 把筛选框已有条件随 since= 一起发给后端 /api/logs(后端支持
+// q/level/qtype/ip/domain/upstream/rule/min_lat), 高频日志下先在服务端收敛,
+// 减少跨网络传输量; 前端 lineMatchesFilters 仍是最终显示过滤, 双保险不变。
+// 仅映射后端有对应参数的栏; ts(时间列)/an(解析值列)后端无参数, 仍纯前端过滤。
+// 全部为空时返回空串 → URL 不带任何筛选参数, 与改造前行为完全一致。
+// qtype 后端是精确匹配(大写), 前端原是子串匹配; 用户通常按 "A"/"AAAA" 精确输入,
+// 非典型子串输入(如 "a")在前端仍能展示 AAAA, 只是后端不再回传无关事件, 显示结果不变。
+function logsServerQuery(){
+  const p = new URLSearchParams();
+  const ip = (logFilters.ip || '').trim();
+  const dm = (logFilters.dm || '').trim();
+  const qt = (logFilters.qt || '').trim().toUpperCase();
+  const up = (logFilters.up || '').trim();
+  const rl = (logFilters.rl || '').trim();
+  const la = (logFilters.la || '').trim();
+  const laNum = parseFloat(la);
+  if (logGlobalQ) p.set('q', logGlobalQ);
+  if (ip) p.set('ip', ip);
+  if (dm) p.set('domain', dm);
+  if (qt) p.set('qtype', qt);
+  if (up) p.set('upstream', up);
+  if (rl) p.set('rule', rl);
+  // la 非数字时后端 min_lat 无意义, 不传, 留前端子串文本匹配
+  if (la && !isNaN(laNum) && isFinite(laNum)) p.set('min_lat', String(laNum));
+  return p.toString();
+}
 function lineMatchesFilters(line){
   const cols = {
     ts: String(line.ts || ''),
@@ -1545,7 +1589,7 @@ function setRoute(r){
       // R13 P3: 先 renderConfig() 挂"配置加载中"横幅(real.config=null 时), fetch 成功后自动替换为真实配置;
       // 原实现仅 fire-and-forget, fetch 失败时横幅永不显示。
       renderConfig();
-      API.get('/api/config').then(c => { real.config = c; renderConfig(); }).catch(() => {});
+      API.get('/api/config').then(c => { if (real.config) mergeFreshConfigIntoLocal(c); else real.config = c; renderConfig(); }).catch(e => { if (e && e.isAuthError){ _onAuthLost(); return; } note('配置加载失败: ' + (e && e.message || '未知错误'), 'var(--red)'); });
     } else renderConfig();
   }
   if (r === 'pipeline'){
@@ -1568,7 +1612,12 @@ function updateTopbar(data){
   const m = data.map || { used:0, capacity:1024 };
   $('#m-map').textContent = m.used + '/' + m.capacity;
   const pill = $('#pill-run'), txt = $('#pill-txt');
-  pill.className = 'status-pill run'; txt.textContent = 'RUNNING';
+  if (MODE === 'sim'){
+    if (sim.running){ pill.className = 'status-pill run'; txt.textContent = 'RUNNING'; }
+    else { pill.className = 'status-pill pause'; txt.textContent = 'PAUSED'; }
+  } else {
+    pill.className = 'status-pill run'; txt.textContent = 'RUNNING';
+  }
 }
 function refreshMapUI(m){
   const pct = m && m.capacity ? Math.min(100, m.used / m.capacity * 100) : 0;
@@ -1952,6 +2001,27 @@ function renderUpstreams(ups){
       // P1-10(第九轮审查): u.port 来自后端/本地编辑, 未转义直接拼入 HTML 属性有注入风险。
       // 用 esc(String(...)) 与同函数其他字段(id/name/proto)的转义风格保持一致。
       (portOpts.indexOf(Number(u.port)) < 0 && u.port != null ? '<option value="' + esc(String(u.port)) + '" selected>' + esc(String(u.port)) + '</option>' : '');
+    // 上游高级选项(P5/P6): allow_private_ip(所有协议可用) + doh/dot_strict_cert(按协议启用)。
+    // 后端 doh_strict_cert/dot_strict_cert 缺省 True(upstream.py 默认严格证书校验),
+    // allow_private_ip 缺省 False。checkbox 按"有效值"回填(!== false 即勾选),
+    // 避免把默认严格误显示为未勾选——否则用户随手保存会把严格校验误关成宽松。
+    const protoL = String(u.proto||'udp').toLowerCase();
+    const dohLike = (protoL === 'doh' || protoL === 'doh3');
+    const dotLike = (protoL === 'dot');
+    const optsHtml =
+      '<span class="up-opts">' +
+      // weight(加权轮询权重, R2 审查新增闭环): 后端 resolver.py 已按 eff_lat/weight 做加权选择,
+      // 此前前端无入口, 用户无法在控制台配置。有效范围 1-1000(后端 max(1.0,w) 将 <1 钳到 1.0, 故下限取 1), 默认 1, 允许 float。
+      // 回填 u.weight != null ? u.weight : 1(缺省与后端 u.get("weight",1) 一致; 不能用 u.weight||1, 否则用户输入 0 重渲染会被短路成 1); data-f="weight" 走 change 处理器数值分支。
+      '<label class="up-opt up-weight-opt" title="权重(加权轮询权重, 范围 1-1000, 默认 1, 支持小数; 小于1无效果, 与1相同; 数值越大被选中概率越高, 与实时延迟 eff_lat 加权计算配合)">' +
+        '<input type="number" class="up-weight" data-f="weight" data-id="' + esc(u.id) + '" min="1" max="1000" step="0.1" value="' + esc(String(u.weight != null ? u.weight : 1)) + '">权重</label>' +
+      '<label class="up-opt" title="允许私网IP: 该上游可解析内网/私有地址(绕过 DNS rebind 防护; 所有协议可用, 后端缺省关闭)">' +
+        '<input type="checkbox" data-f="allow_private_ip" data-id="' + esc(u.id) + '"' + (u.allow_private_ip !== false && u.allow_private_ip != null ? ' checked' : '') + '>允许私网IP</label>' +
+      '<label class="up-opt" title="严格证书校验(DoH/DoH3, 后端缺省开启; 仅当协议为 DoH/DoH3 时生效)">' +
+        '<input type="checkbox" data-f="doh_strict_cert" data-id="' + esc(u.id) + '"' + ((u.doh_strict_cert !== false) ? ' checked' : '') + (dohLike ? '' : ' disabled') + '严格证书(DoH)</label>' +
+      '<label class="up-opt" title="严格证书校验(DoT, 后端缺省开启; 仅当协议为 DoT 时生效)">' +
+        '<input type="checkbox" data-f="dot_strict_cert" data-id="' + esc(u.id) + '"' + ((u.dot_strict_cert !== false) ? ' checked' : '') + (dotLike ? '' : ' disabled') + '严格证书(DoT)</label>' +
+      '</span>';
     return '<div class="up-row">' +
     '<label class="switch"><input type="checkbox" data-f="enabled" data-id="' + esc(u.id) + '"' + (u.enabled ? ' checked' : '') + '><span class="sl"></span></label>' +
     '<input class="text" data-f="name" data-id="' + esc(u.id) + '" value="' + esc(u.name) + '" title="上游名称">' +
@@ -1960,8 +2030,9 @@ function renderUpstreams(ups){
     '<select class="q-sel" data-f="port" data-id="' + esc(u.id) + '">' + portHtml + '</select>' +
     '<select class="q-sel" data-f="group" data-id="' + esc(u.id) + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (u.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' +
     (u.latency > 0 || u.latency_measured
-      ? '<input class="num" type="number" data-f="latency" data-id="' + esc(u.id) + '" min="1" max="500" value="' + esc(String(u.latency)) + '" title="基础延迟(ms), 实时查询延迟以遥测为准">'
+      ? '<input class="num" type="number" data-f="latency" data-id="' + esc(u.id) + '" min="1" max="3600000" value="' + esc(String(u.latency)) + '" title="基础延迟(ms), 实时查询延迟以遥测为准; 上限 3600000ms(1h, 与 JS clamp 一致)">'
       : '<span class="lat-pending" title="应用配置后自动实测延迟">待测</span>') +
+    optsHtml +
     connBadge(u) +
     '<button class="del" data-del="' + esc(u.id) + '">×</button></div>';
   }).join('');
@@ -2015,7 +2086,7 @@ function renderRuleSubs(subs){
       const url = el.dataset.subupdate;
       el.disabled = true; el.textContent = '更新中…';
       try {
-        const res = await API.post('/api/rules/subscribe/update', { url });
+        const res = await API.post('/api/rules/subscribe/update', { url }, 30000);
         note('订阅更新完成: ' + res.count + ' 条', 'var(--green)');
         await refreshConfigAfterChange();
       } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } note('订阅更新失败: ' + e.message, 'var(--red)'); }
@@ -2248,8 +2319,8 @@ function bindConfigEvents(){
   bindCfg('#cfg-edns','edns', e => e.target.checked);
   bindCfg('#cfg-dnssec0x20','dnssec_0x20', e => e.target.checked);
   bindCfg('#cfg-ipspeedcheck','ip_speed_check', e => e.target.checked);
-  bindCfg('#cfg-healthint','health_check_interval', e => clamp(+e.target.value,0,86400));
-  bindCfg('#cfg-rulesubint','rule_sub_interval', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-healthint','health_check_interval', e => clamp(+e.target.value,0,604800));
+  bindCfg('#cfg-rulesubint','rule_sub_interval', e => clamp(+e.target.value,0,604800));
   $('#cfg-bootstrapdns').addEventListener('change', e => { const v = (e.target.value || '').trim(); if (MODE==='real' && !real.config) { note('配置未就绪, 请刷新','var(--red)'); return; } if (MODE==='real') real.config.bootstrap_dns = v; else config.bootstrap_dns = v; });
   // 性能/高级补全: 测速探测超时 / IP 探测方式 / IP 测速缓存 / 熔断 / 健康探测 / 日志
   bindCfg('#cfg-speedtimeout','speed_timeout_ms', e => clamp(+e.target.value,1,60000));
@@ -2268,6 +2339,9 @@ function bindConfigEvents(){
     const ups = currentUpstreams();
     const u = ups.find(x => x.id === id); if (!u) return;
     if (f === 'enabled') u.enabled = el.checked;
+    else if (f === 'allow_private_ip') u.allow_private_ip = el.checked;
+    else if (f === 'doh_strict_cert') u.doh_strict_cert = el.checked;
+    else if (f === 'dot_strict_cert') u.dot_strict_cert = el.checked;
     else if (f === 'fulladdr') {
       // 完整地址(地址+URL路径合并, 端口独立列)编辑: 自动解析拆回分字段
       const parsed = parseUpstreamAddr(el.value, u.proto);
@@ -2281,6 +2355,10 @@ function bindConfigEvents(){
       const row = el.closest('.up-row');
       if (row){
         const ps = row.querySelector('[data-f="proto"]'); if (ps) ps.value = u.proto;
+        // P6: 地址解析改变协议后, 同步刷新 DoH/DoT 严格证书开关的可用状态
+        const _pl = String(u.proto||'').toLowerCase();
+        const _dh = row.querySelector('[data-f="doh_strict_cert"]'); if (_dh) _dh.disabled = !(_pl==='doh'||_pl==='doh3');
+        const _dt = row.querySelector('[data-f="dot_strict_cert"]'); if (_dt) _dt.disabled = !(_pl==='dot');
         const psel = row.querySelector('[data-f="port"]');
         if (psel){
           // P3-6(R2 审查): 清理上一次追加的自定义端口 option(标记 data-custom="1"),
@@ -2301,10 +2379,24 @@ function bindConfigEvents(){
       u.proto = el.value;
       if (u.port === oldDefault) u.port = {udp:53,tcp:53,doh:443,dot:853,doq:853,doh3:443}[el.value] || 53;
       const row = el.closest('.up-row');
-      if (row){ const fa = row.querySelector('[data-f="fulladdr"]'); if (fa) fa.value = fullAddr(u); }
+      if (row){
+        const fa = row.querySelector('[data-f="fulladdr"]'); if (fa) fa.value = fullAddr(u);
+        // P6: 协议切换后, 同步刷新 DoH/DoT 严格证书开关的可用状态
+        const _pl = String(u.proto||'').toLowerCase();
+        const _dh = row.querySelector('[data-f="doh_strict_cert"]'); if (_dh) _dh.disabled = !(_pl==='doh'||_pl==='doh3');
+        const _dt = row.querySelector('[data-f="dot_strict_cert"]'); if (_dt) _dt.disabled = !(_pl==='dot');
+      }
       if (MODE === 'sim') renderPipeline();
     }
     else if (f === 'latency') u.latency = clamp(+el.value, 0, 3600000);
+    else if (f === 'weight') {
+      // weight 必须存数值(float/int), 不能走默认 u[f]=el.value(字符串)。
+      // 后端 bulk 校验 _validate_upstream_dict 要求 isinstance(w,(int,float)) 且非 bool, 字符串会被拒 400。
+      // 空串/NaN 回退默认 1(与后端 u.get("weight",1) 一致)。
+      // 下限钳到 1: 后端 max(1.0,w) 将 <1 钳为 1.0, 前端 clamp 与 HTML min=1/后端口径三处一致, 避免用户输入 0.5 以为极小权重实则等同 1。
+      const w = parseFloat(el.value);
+      u.weight = (isNaN(w) ? 1 : Math.min(1000, Math.max(1, w)));
+    }
     else u[f] = el.value;
     if (f === 'enabled' && MODE === 'sim') renderPipeline();
   });
@@ -2427,7 +2519,7 @@ function bindConfigEvents(){
     btn.disabled = true;   // P2-2: 防重入, 避免重复点击并发 probe
     note('正在实测全部上游延迟…', 'var(--amber)');
     try {
-      const res = await API.post('/api/reprobe');
+      const res = await API.post('/api/reprobe', undefined, 30000);
       const rs = res.results || [];
       const okN = rs.filter(r => r.ok).length;
       const parts = rs.map(r => r.name + ' ' + r.old + '→' + (r.new != null ? (r.new + (r.ok ? 'ms' : '(保留)ms')) : '–'));
@@ -2464,7 +2556,7 @@ function bindConfigEvents(){
         payload.ip = ipVal || '1.2.3.4';
       }
       payload.content = input;
-      const res = await API.post('/api/rules/import', payload);
+      const res = await API.post('/api/rules/import', payload, 30000);
       note('逐条导入完成: 新增 ' + res.added + ' 条规则', 'var(--green)');
       $('#import-input').value = '';
       $('#import-input').focus();
@@ -2497,7 +2589,7 @@ function bindConfigEvents(){
     const btn = $('#btn-sub-rule');
     btn.disabled = true; btn.textContent = '订阅中…';
     try {
-      const res = await API.post('/api/rules/subscribe', payload);
+      const res = await API.post('/api/rules/subscribe', payload, 30000);
       note('订阅成功: ' + res.count + ' 条规则 (明细存 rules_sub.json)', 'var(--green)');
       $('#sub-url-input').value = '';
       const c = await API.get('/api/config');
@@ -2522,6 +2614,7 @@ function bindConfigEvents(){
             delete u.conn_avg_lat; delete u.conn_ok; delete u.conn_fail; delete u.conn_key;
             delete u.status; delete u.last_latency; delete u.queries; delete u.success_rate;
             delete u.avg_latency;
+            delete u.quic_connected; delete u.quic_reconnects; delete u.quic_fail_seq;
             // 注意: latency_measured 是持久化配置字段(非遥测), 不能删除——
             // 删除后后端把所有上游视为"未测速", 每次保存都触发全量后台重测速。
           });
@@ -2574,7 +2667,7 @@ function bindConfigEvents(){
           }, 1600);
           if (needReload){
             try {
-              const r = await API.post('/api/reload', {});
+              const r = await API.post('/api/reload');
               if (r && r.ok === false) note('缓存策略热重载失败: ' + (r.error || '未知错误'), 'var(--red)');
               else note('缓存策略已切换为 ' + (real.config.cache_policy === 'tinylfu' ? 'W-TinyLFU' : (real.config.cache_policy === 'partitioned' ? '分区 LRU' : 'LRU 分区')) + ', 缓存容器已重建', 'var(--green)');
             } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } note('缓存策略热重载失败: ' + e.message, 'var(--red)'); }
@@ -2599,7 +2692,7 @@ function bindConfigEvents(){
     if (!confirm('热重载将从配置文件重新加载并覆盖当前未保存的编辑, 确定继续吗?')) return;
     note('正在热重载配置…', 'var(--amber)');
     try {
-      const r = await API.post('/api/reload', {});
+      const r = await API.post('/api/reload');
       if (r && r.ok === false){ note('热重载失败: ' + (r.error || '未知错误'), 'var(--red)'); return; }
       const ch = (r && r.changed && r.changed.length) ? r.changed.join('; ') : '无实质变更';
       note('热重载完成: ' + ch, 'var(--green)');
@@ -2617,12 +2710,12 @@ function bindConfigEvents(){
       real.logs = []; real.logSeq = 0; clearLogUI();
       note('重启指令已下发, 服务重启中…', 'var(--amber)');
       // P3-24(第九轮审查): 句柄保存到 _restartPollTimer, beforeunload 时清理。
-      _restartPollTimer = setTimeout(() => { if (typeof pollStatus === 'function') pollStatus(); }, 3500);
+      _restartPollTimer = setTimeout(() => { if (typeof pollStatus === 'function') pollStatus(); }, 5500);
     } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } note('重启失败: ' + e.message, 'var(--red)'); }
   });
 }
 let _noteTimer = null;
-// P3-24(第九轮审查): 保存配置后 1.6s 延迟合并 / 重启服务后 3.5s pollStatus 的 setTimeout 句柄,
+// P3-24(第九轮审查): 保存配置后 1.6s 延迟合并 / 重启服务后 5.5s pollStatus 的 setTimeout 句柄,
 // beforeunload 时一并 clearTimeout, 避免页面卸载后定时器仍触发后台 API 请求。
 let _saveMergeTimer = null;
 let _restartPollTimer = null;
@@ -2641,6 +2734,7 @@ window.addEventListener('beforeunload', () => {
   _simTimers.forEach(clearInterval);
   if (streamTimer) clearInterval(streamTimer);
   if (typeof _pollTimers !== 'undefined' && _pollTimers) { _pollTimers.forEach(clearInterval); _pollTimers = []; }
+  if (typeof _statusTimer !== 'undefined' && _statusTimer) { clearTimeout(_statusTimer); _statusTimer = null; }
   if (_saveMergeTimer) clearTimeout(_saveMergeTimer);
   if (_restartPollTimer) clearTimeout(_restartPollTimer);
   if (_noteTimer) clearTimeout(_noteTimer);
@@ -2721,6 +2815,7 @@ function _onAuthLost(){
   // 保存 token 成功后 location.reload() 会重建定时器, 清空无副作用。
   _pollTimers.forEach(clearInterval);
   _pollTimers = [];
+  _stopStatusPoll();   // pollStatus 已是 setTimeout 自调度链, 必须单独停, 否则退避节奏下仍空打 401
   appendLogLine({ ts: nowTs(), level: 'err', msg: 'Token 已失效 (401), 请在「配置 → 连接设置」重新填入' });
 }
 async function pollStatus(){
@@ -2795,7 +2890,10 @@ async function pollLogs(){
   if (_logsInFlight) return;
   _logsInFlight = true;
   try {
-    const r = await API.get('/api/logs?since=' + real.logSeq);
+    // 筛选框条件随 since= 一起服务端过滤(logsServerQuery() 为空串时不带附加参数)。
+    // next_seq 取后端全量快照最大 seq, 与是否带过滤无关, 游标推进不受影响。
+    const _sq = logsServerQuery();
+    const r = await API.get('/api/logs?since=' + real.logSeq + (_sq ? '&' + _sq : ''));
     if (r.events && r.events.length){
       real.logs = real.logs.concat(r.events);
       if (real.logs.length > 400) real.logs = real.logs.slice(-400);
@@ -2823,34 +2921,61 @@ let _pollTimers = [];
 // P3-22(第九轮审查): 轮询间隔从魔法数字提取为常量, 便于统一调优与注释。
 // status: 2s 刷 KPI/顶栏; snapshot/logs/pipeline: 5s 重 DOM/日志/流水线。
 const POLL_INTERVAL = { status: 2000, snapshot: 5000, logs: 5000, pipeline: 5000 };
+// 低级别修复: pollStatus 由固定 setInterval(2s) 改为自调度 setTimeout 链, 支持连续
+// 失败指数退避——后端宕机/重启期间不再每 2s 空打请求占满 API 线程:
+//   连续失败 1 次 → 2s(基准, 与原来一致);
+//   连续失败 2 次 → 5s;
+//   连续失败 3 次 → 10s;
+//   连续失败 ≥4 次 → 30s 封顶。
+// pollStatus 成功路径会把 statusFail 归零, 下一轮自动回落到 2s。
+// snapshot/logs/pipeline 仍走固定 5s setInterval(_pollTimers), 它们已有独立 fail 计数
+// 与"遥测数据过期"提示, 且频次本身低, 暂不做退避。
+let _statusTimer = null;
+function _statusPollMs(){
+  if (statusFail <= 1) return POLL_INTERVAL.status;   // 2000
+  if (statusFail === 2) return 5000;
+  if (statusFail === 3) return 10000;
+  return 30000;                                       // ≥4 次封顶
+}
+function _scheduleStatusPoll(){
+  clearTimeout(_statusTimer);
+  _statusTimer = setTimeout(() => {
+    // finally 保证无论成功/失败都排下一轮(pollStatus 内部已 catch, 此处双保险)
+    pollStatus().finally(() => { _statusTimer = null; _scheduleStatusPoll(); });
+  }, _statusPollMs());
+}
+function _stopStatusPoll(){ clearTimeout(_statusTimer); _statusTimer = null; }
+function _onVisChange(){
+  if (document.hidden){
+    _pollTimers.forEach(t => clearInterval(t));
+    _pollTimers = [];
+    _stopStatusPoll();
+  } else if (!_pollTimers.length && !_authLostNotified){
+    pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
+    _pollTimers = [
+      setInterval(pollSnapshot, POLL_INTERVAL.snapshot),
+      setInterval(pollLogs, POLL_INTERVAL.logs),
+      setInterval(pollPipeline, POLL_INTERVAL.pipeline),
+    ];
+    _scheduleStatusPoll();
+  }
+}
 function startRealPolls(){
   pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
-  // 轮询频率优化: 状态/KPI 2s, 遥测图表 5s, 上游延迟/流水线(仅 pipeline 路由) 5s, 日志 5s。
+  // 轮询频率优化: 状态/KPI 2s(失败自动退避), 遥测图表 5s, 上游延迟/流水线(仅 pipeline 路由) 5s, 日志 5s。
   // 原 1s/1.5s 过于频繁, 在浏览器后台标签页与多客户端时无谓占用 API 线程与 CPU。
   _pollTimers = [
-    setInterval(pollStatus, POLL_INTERVAL.status),
     setInterval(pollSnapshot, POLL_INTERVAL.snapshot),
     setInterval(pollLogs, POLL_INTERVAL.logs),
     setInterval(pollPipeline, POLL_INTERVAL.pipeline),
   ];
+  _scheduleStatusPoll();
   // 后台标签页暂停全部 REAL 轮询(切回前台立即补一轮再继续), 省 CPU/网络/API 线程
   // R5 P1-1: 切回前台重启轮询前必须检查 _authLostNotified——认证失效后 _onAuthLost 已清空
   // _pollTimers 并停止轮询, 若此处因 !_pollTimers.length 为 true 而无条件重启, 会绕过闸门
   // 每 2-5s 空打 401(闸门已 true 不触发 UI 反馈), 完全违背停轮询的设计目的。认证未失效才重启。
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden){
-      _pollTimers.forEach(t => clearInterval(t));
-      _pollTimers = [];
-    } else if (!_pollTimers.length && !_authLostNotified){
-      pollStatus(); pollSnapshot(); pollLogs(); pollPipeline();
-      _pollTimers = [
-        setInterval(pollStatus, POLL_INTERVAL.status),
-        setInterval(pollSnapshot, POLL_INTERVAL.snapshot),
-        setInterval(pollLogs, POLL_INTERVAL.logs),
-        setInterval(pollPipeline, POLL_INTERVAL.pipeline),
-      ];
-    }
-  });
+  document.removeEventListener('visibilitychange', _onVisChange);
+  document.addEventListener('visibilitychange', _onVisChange);
   $('#btn-run').style.display = 'none';
   $('#load-seg').style.display = 'none';
   $('#foot-mode').textContent = 'daemon 运行中 · REAL';
@@ -2900,10 +3025,12 @@ function bindEvents(){
       // P2-4: 不能简单把 logSeq 置 0——后端 events deque 未被清空, 下次 pollLogs(since=0)
       // 会把旧事件全部拉回。改为: 触发后端 reset 后立即用当前游标再请求一次, 同步成后端新的
       // next_seq, 既清掉前端显示又让后续增量轮询从后端新游标开始。
-      try { await API.post('/api/reset'); } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } }
+      try { await API.post('/api/reset'); } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } note('清空失败: ' + (e.message || e), 'var(--red)'); return; }
       real.logs = []; clearLogUI();
       try {
-        const r = await API.get('/api/logs?since=' + real.logSeq);
+        // 与 pollLogs 同一筛选构造器, 保持重置后游标补齐语义一致(空筛选则等价原行为)。
+        const _sq0 = logsServerQuery();
+        const r = await API.get('/api/logs?since=' + real.logSeq + (_sq0 ? '&' + _sq0 : ''));
         real.logSeq = (r && r.next_seq != null) ? r.next_seq : real.logSeq;
       } catch(e){ if (e && e.isAuthError){ _onAuthLost(); return; } /* GET 失败时保留旧游标, 不置 0——否则下一周期 pollLogs(since=0)
                    会把后端 deque 全部旧日志拉回, 用户刚点的"清空"被回退 */ }

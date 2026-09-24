@@ -143,6 +143,10 @@ def decode_name(data, offset):
             if jumps > 32:
                 raise DNSError("too many compression jumps")
             ptr = ((length & 0x3F) << 8) | data[pos + 1]
+            # L5: 压缩指针只能向后引用(ptr < 当前 pos)。指向自身或更靠后的位置
+            # (ptr >= pos) 是前向/自引用指针, 可能造成循环或误解码, 直接拒绝。
+            if ptr >= pos:
+                raise DNSError("forward compression pointer")
             if not jump_done:
                 end = pos + 2
                 jump_done = True
@@ -194,9 +198,13 @@ def build_query(domain, qtype, qid=None, edns=False, edns_client_subnet=None,
             # ECS: family(2)=1 IPv4, src(1)=0, scope(1)=0, addr
             options = _ecs_option(edns_client_subnet)
         if padding:
-            # RFC 8467 Padding 选项(option code 12, 数据全零): 对齐 128B 块
+            # RFC 8467 Padding 选项(option code 12, 数据全零): 对齐整条 DNS 消息到
+            # 128B 块(非仅 OPT options 段)。整条消息 = header(12) + question +
+            # OPT RR 固定头(11: root name 1 + type/class/ttl/rdlen 10) + options。
+            # padding option 自身占 4B(type 2B + length 2B), 计入 prefix。
             opts_len = len(options)
-            need = (128 - (opts_len % 128)) % 128
+            prefix = 12 + len(question) + 11 + opts_len
+            need = (128 - (prefix % 128)) % 128
             if need < 4:
                 need += 128
             if need > 512:
@@ -289,6 +297,10 @@ def extract_qname(data):
             ln = data[pos]
             if ln == 0:
                 return data[start:pos + 1]
+            # 高位有置位但不是标准压缩指针(0xC0/0xC1...): 0x40/0x80 等非法标签
+            # decode_name 已拒绝, 此处 0x20 快速路径必须同等校验, 否则 pos 跳跃错误。
+            if ln & 0xC0 and not (ln & 0xC0 == 0xC0):
+                return None
             if ln & 0xC0 == 0xC0:  # 压缩指针不应出现在 question 区
                 return None
             pos += 1 + ln
@@ -308,8 +320,14 @@ def check_0x20(query_bytes, response_data):
     """
     qn = extract_qname(query_bytes)
     rn = extract_qname(response_data)
-    if qn is None or rn is None:
-        return True  # 无法解析不误杀（qid+源IP校验仍在）
+    if qn is None:
+        # 查询本身畸形(question 无法解析): 无法逐位比较, 不误杀
+        # (qid+源IP校验仍在)。
+        return True
+    if rn is None:
+        # M5: 响应 question 畸形/与查询不一致无法提取——响应侧结构性异常,
+        # 视为缓存投毒嫌疑, fail-closed(拒绝该响应), 而非 fail-open 放行。
+        return False
     return qn == rn
 
 
@@ -697,6 +715,11 @@ def _question_edns_info(data):
                         return (None if qi == 0 else qbytes), 512, None
                     pos += 2
                     break
+                # S2: 最高两位为 0x40/0x80(非压缩指针)的非法标签长度必须拒绝,
+                # 否则会被当成普通长度字节 pos+=1+ln 引发越界/误解码。对齐
+                # decode_name(:137) 的校验语义。question 段畸形 → 返回 (None,512,None)。
+                if ln & 0xC0:
+                    return (None if qi == 0 else qbytes), 512, None
                 pos += 1 + ln
                 if pos >= dlen:
                     return (None if qi == 0 else qbytes), 512, None
@@ -734,6 +757,11 @@ def _question_edns_info(data):
                     if not (ptr < pos and ptr < dlen):
                         skip_rr = True
                     pos += 2
+                    break
+                # S2: 与 question 段对齐, 拒绝 0x40/0x80 非法标签长度(非压缩指针)。
+                # 直接当成普通长度会 pos+=1+ln 越界/误解码, 此处跳过整条坏 RR。
+                if ln & 0xC0:
+                    skip_rr = True
                     break
                 pos += 1 + ln
                 # R3-P2-1: 正常标签遍历后越界校验, 对齐 question 段(:576)。
@@ -793,7 +821,7 @@ def _opt_rr_bytes(query_data):
 
 def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
                        owner_name=None, fallback_type=0, _edns=None, _ttl_override=None,
-                       bufsize_cap=None):
+                       bufsize_cap=None, enc_owner=None):
     """UDP 响应公共拼接函数(v1.9.76 P0-1): 快路径与完整路径统一走这里做
     EDNS bufsize 截断 + 逐条丢弃 + 置 TC。
 
@@ -807,7 +835,8 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
       _question_edns_info 一遍拿到 qbytes+bufsize+opt, 直接传入避免本函数
       再遍历一次 question/additional 段。
     - bufsize_cap: 客户端侧 bufsize 上限(防开放解析器放大攻击); 非空时
-      钳制客户端声明的 bufsize, 超限应答置 TC 走 TCP。"""
+      钳制客户端声明的 bufsize, 超限应答置 TC 走 TCP。
+    - enc_owner: R2 调用方预编码的 owner_name bytes; 传入则跳过内部 encode_name。"""
     if len(raw_query) < 12:
         return None
     # P3-4: qbytes 防御性兜底(调用方 extract_question 失败可能传 None,
@@ -833,13 +862,21 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
         return (build_response_header(raw_query, rcode, len(answers), False, 1 if opt else 0)
                 + qbytes + abody + (opt or b""))
     # 逐条累计: 超 bufsize 丢尾部并置 TC(让客户端走 TCP 重试)
-    out = bytearray(qbytes)
+    # bytearray(); out.extend(qbytes) 替代 bytearray(qbytes): 语义等价(构造出含
+    # qbytes 字节的可缓冲 bytearray), 但避免一次性拷贝构造的冗余拷贝路径。
+    # R2: owner_name 在截断循环外预编码一次(调用方预传或此处补编码), 逐条 chunk
+    # 复用, 避免每条 RR 重复 encode_name(同一 owner_name)(多答案超 bufsize 截断路径)。
+    out = bytearray()
+    out.extend(qbytes)
     kept = 0
     truncated = False
+    if enc_owner is None:
+        enc_owner = encode_name(owner_name) if owner_name else b"\x00"
     for a in answers:
         chunk = build_response_body_answers([a], owner_name=owner_name,
                                             fallback_type=fallback_type,
-                                            _ttl_override=_ttl_override)
+                                            _ttl_override=_ttl_override,
+                                            enc_owner=enc_owner)
         if 12 + len(out) + len(chunk) + opt_len > limit:
             truncated = True
             break
@@ -862,7 +899,8 @@ def build_simple_response(raw_query, rcode):
             + qbytes + (opt or b""))
 
 
-def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_override=None):
+def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_override=None,
+                                enc_owner=None, enc_map=None):
     """只构造 answer section bytes(不含 question)。
     v1.9.74 P0-2: 快路径缓存的 resp_body 只缓存 answer 段; question 段每次从
     raw_query 原样切片(extract_question), 既保证 0x20 大小写逐位回显, 又避免把
@@ -870,10 +908,20 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
     v1.9.85: 缓存回填的 answers 无 "name" 键, owner_name 对所有答案相同——
     域名编码只做一次(原每条答案都 encode_name(name), 多答案时重复 N 次)。
     v1.9.85: _ttl_override 传入时统一覆盖每条 TTL, 避免快路径为 TTL 衰减而
-    [dict(a, ttl=...) for a in answers] 整表拷贝 dict(每命中一次的临时对象)。"""
+    [dict(a, ttl=...) for a in answers] 整表拷贝 dict(每命中一次的临时对象)。
+    R2: enc_owner 由调用方预编码 owner_name bytes 传入; 截断路径逐条
+    build_response_body_answers([a]) 时外层编码一次即可复用, 避免每条 RR 重复
+    encode_name(同一 owner_name)。"""
     out = bytearray()
-    enc_owner = encode_name(owner_name) if owner_name else b"\x00"
+    if enc_owner is None:
+        enc_owner = encode_name(owner_name) if owner_name else b"\x00"
     _rr_hdr = _RR_HDR
+    # v1.9.139: 同一 abody 内多条 RR 共享同一显式 name(如 CNAME 链展开后多条
+    # A/AAAA RR 的 owner 都是 CNAME 目标 tgt)时, encode_name(name) 对同一 name
+    # 重复调用 N 次。encode_name 是纯函数, 调用内 memo 去重: 同一 name 只编一次,
+    # 后续直接复用 bytes。调用方可传 enc_map(跨命中共享的有界 name->wire memo)
+    # 进一步把 CNAME 目标名的编码跨命中复用; 不传则用局部 dict(仅调用内去重)。
+    _enc_names = enc_map if enc_map is not None else {}
 
     def _append(a, ttl):
         rtype = int(a.get("type", fallback_type) or fallback_type)
@@ -882,9 +930,16 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
         if rdata is None:
             return
         name = a.get("name")
-        # 注意: 必须用 out.extend 方法调用, 不能写 out += —— 增广赋值会让
-        # Python 把 out 当作本内嵌函数的局部变量, 触发 UnboundLocalError。
-        out.extend(encode_name(name) if name else enc_owner)
+        if name:
+            # 注意: 必须用 out.extend 方法调用, 不能写 out += —— 增广赋值会让
+            # Python 把 out 当作本内嵌函数的局部变量, 触发 UnboundLocalError。
+            w = _enc_names.get(name)
+            if w is None:
+                w = encode_name(name)   # 非法 name 异常自然上抛, 与原路径一致
+                _enc_names[name] = w
+            out.extend(w)
+        else:
+            out.extend(enc_owner)
         out.extend(_rr_hdr.pack(rtype, CLASS_IN, ttl, len(rdata)))
         out.extend(rdata)
 
@@ -906,11 +961,14 @@ def build_response_body(domain, qtype, answers):
                                                  fallback_type=qtype)
 
 
-def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None):
+def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None,
+                   _ttl_override=None):
     """基于请求报文构造响应。answers: [{value, type, ttl, name?}]。
     v1.9.76 P0-1: 统一走 build_udp_response 做 EDNS bufsize 截断 + 逐条丢弃 + 置 TC,
     并回显 OPT(保留 DO 位)。答案数仍限 MAX_ANSWERS。
-    bufsize_cap: 客户端侧 bufsize 上限(防放大), 透传 build_udp_response。"""
+    bufsize_cap: 客户端侧 bufsize 上限(防放大), 透传 build_udp_response。
+    _ttl_override: M2 缓存命中路径透传剩余 TTL, 与 answer_fast 快路径同型,
+    避免为 TTL 衰减对 answers 整表 dict 拷贝(热路径 GC 压力)。None 时用各答案自身 ttl。"""
     if len(query_data) < 12:
         return None
     answers = (answers or [])[:MAX_ANSWERS]
@@ -919,7 +977,7 @@ def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None
         qbytes = encode_name(domain) + struct.pack(">HH", qtype, CLASS_IN)
     return build_udp_response(query_data, qbytes, answers, rcode,
                               abody=None, owner_name=domain, fallback_type=qtype,
-                              bufsize_cap=bufsize_cap)
+                              bufsize_cap=bufsize_cap, _ttl_override=_ttl_override)
 
 
 def build_error_response(query_data, rcode=2):

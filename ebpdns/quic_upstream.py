@@ -47,6 +47,16 @@ def _host_port(up):
         idx = addr.find("]")
         return addr[1:idx], port
     return addr, port
+def _is_conn_closed(proto):
+    """P3-LOW: 防御性判断 QUIC 连接是否已关闭, 替代直接访问 aioquic 私有属性
+    proto._quic._close_event。aioquic 版本升级可能重命名/移除该私有属性, 直接
+    访问会 AttributeError 穿透保活循环/查询路径。这里用 getattr 逐层防御,
+    任一私有层缺失即视为"无法确认关闭"(返回 False), 由后续
+    transport.is_closing()/超时/异常兜底, 安全方向不退化。"""
+    quic = getattr(proto, '_quic', None)
+    if quic is None:
+        return False
+    return getattr(quic, '_close_event', None) is not None
 if _HAVE_AIOQUIC:
     class _H3Client(QuicConnectionProtocol):
         """HTTP/3 客户端：按 stream_id 收集响应头/体，支持并发多请求。
@@ -324,8 +334,8 @@ class _QuicUpstream:
                     self.reconnects += 1
                     self._conn_ready.set()
                     # 保持打开直至: 连接终止 / transport 关闭 / 请求重建
-                    while (proto._quic._close_event is None
-                           and not proto._transport.is_closing()
+                    while (not _is_conn_closed(proto)
+                           and not (getattr(proto, "_transport", None) and proto._transport.is_closing())
                            and not self._reconnect_flag):
                         await asyncio.sleep(0.3)
                     if self._closing:
@@ -385,7 +395,9 @@ class _QuicUpstream:
             while time.monotonic() < sleep_end and not self._closing:
                 await asyncio.sleep(min(1.0, sleep_end - time.monotonic()))
             if backoff >= 16.0:
-                gc.collect()
+                # UP-LOW-02: gc.collect 可能耗时数十~数百 ms, 在事件循环线程同步
+                # 执行会阻塞已排队查询。放到独立 daemon 线程异步回收, 不阻塞事件循环。
+                threading.Thread(target=gc.collect, daemon=True).start()
     def _request_reconnect(self):
         """连接级失败触发: 置位重建标志并关闭 transport, 让 _maintain 检测并重建。"""
         with self._lock:
@@ -478,7 +490,7 @@ class _QuicUpstream:
         except (asyncio.TimeoutError, _cf.TimeoutError):
             return False, None
         proto = self._protocol
-        if proto is None or proto._quic._close_event is not None:
+        if proto is None or _is_conn_closed(proto):
             # 连接已失效: 触发重建
             self._request_reconnect()
             return False, None
@@ -519,6 +531,9 @@ class _QuicUpstream:
                 return False, None
             if len(st["buf"]) < 2 + st["n"]:
                 return False, None
+            if len(st["buf"]) > 2 + st["n"]:
+                log.warning("DoQ stream %d 收到多余字节(声明 %d, 实际 %d), 截断",
+                            sid, st["n"], len(st["buf"]) - 2)
             # v1.9.84 QUIC-07: 直接从 bytearray slice 一次拷贝返回
             return True, bytes(st["buf"][2:2 + st["n"]])
         finally:

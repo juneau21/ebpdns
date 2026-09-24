@@ -30,12 +30,13 @@ _REGEX_TIMEOUT_SEC = 0.5
 # v1.9.74 P1-6: 2 worker 是 ReDoS 保护池瓶颈(高并发规则匹配时请求排队等槽位)。
 # R3-P3-1: 提到 6 worker(原 4), 降低灾难性正则占满全部运行槽位的概率;
 # 超时仍 0.5s——即使被恶意正则占满, 也只占 6 槽位, 主解析线程池不受影响。
-# R5/P3-3: _REGEX_POOL 是模块级单例, 跨所有 Resolver 实例共享。这是有意设计:
-# 正则匹配是纯 CPU、无状态操作, 全进程共享一个有界池(6 worker)避免每个 Resolver
-# 实例各开 6 个线程导致线程膨胀。当前架构 Resolver 为单实例(热重载原地更新配置,
-# 不重建 Resolver 对象), 因此 shutdown() 关闭此池后不会再有第二个实例 submit。
-# 若未来支持多 Resolver 实例/测试隔离, 需把本池下沉为实例属性(届时本注释即
-# 设计约束)。shutdown() 处(P3-4)统一用 wait=False+cancel_futures 退出, 见下。
+# R5/P3-3 -> v1.9.9x 修复: 本池原先是模块级单例, 跨所有 Resolver 实例共享,
+# shutdown() 直接关闭它会让同进程内其他存活实例后续 submit 全部
+# RuntimeError→None(屏蔽规则 fail-closed 反而误杀)。现已把"生产用"池下沉为
+# Resolver 实例属性(self._regex_pool / self._regex_sem, 见 __init__), 每实例
+# 独立关闭。这里保留模块级单例仅作为"直接调用 _regex_search_safe /
+# _regex_match_safe 时不传 pool/sem"的向后兼容回退(测试与脚本直接调用仍可用),
+# 生产路径 match_rule 始终传入实例池。
 _REGEX_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="regex-safe")
 # v1.9.76 2.9: 正则池有界。原 ThreadPoolExecutor 无界队列, 高并发规则匹配时
 # submit 任务无限排队(每个被 ReDoS 占满的 worker 跑满 0.5s 超时), 内存与调度
@@ -223,7 +224,7 @@ def _detect_catastrophic_regex(pat):
         i = j + 1
     return False
 
-def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
+def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC, pool=None, sem=None):
     """带超时的正则搜索, 防止 ReDoS。三态返回:
     - True  = 正则执行完成且命中
     - False = 正则执行完成且不匹配
@@ -231,35 +232,43 @@ def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
       fail-closed(当作命中), 不得当"不匹配"放行。
     v1.9.76 2.9: 池满(_REGEX_SEM 耗尽)放弃本次匹配, 不排队。
 
+    pool/sem: 传入 Resolver 实例的 _regex_pool/_regex_sem 以实现多实例隔离;
+    为 None 时回退到模块级 _REGEX_POOL/_REGEX_SEM(向后兼容, 测试/脚本直接调用)。
+
     安全语义(已从 fail-open 改为 fail-closed): 灾难性正则把 worker 占满/池耗尽
     时, 依赖正则命中的 block 规则不再按放行处理, 而是由 match_rule 对该规则
     fail-closed 屏蔽对应查询, 防止 ReDoS 窗口内屏蔽规则被绕过。超时后 worker
     线程仍在后台跑至自然结束(Python re 不可取消), 信号量有界(6+8), blast radius
     可控。"""
-    if not _REGEX_SEM.acquire(blocking=False):
+    pool = pool if pool is not None else _REGEX_POOL
+    sem = sem if sem is not None else _REGEX_SEM
+    if not sem.acquire(blocking=False):
         return None
     try:
-        fut = _REGEX_POOL.submit(pattern.search, text)
+        fut = pool.submit(pattern.search, text)
     except Exception:
-        _REGEX_SEM.release()
+        sem.release()
         return None
-    fut.add_done_callback(lambda _f: _REGEX_SEM.release())
+    fut.add_done_callback(lambda _f: sem.release())
     try:
         return bool(fut.result(timeout=timeout))
     except Exception:
         return None
 
-def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC):
+def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC, pool=None, sem=None):
     """带超时的正则匹配(match), 防止 ReDoS。三态与 _regex_search_safe 完全一致
-    (True=命中 / False=不匹配 / None=不确定, 屏蔽规则 fail-closed)。"""
-    if not _REGEX_SEM.acquire(blocking=False):
+    (True=命中 / False=不匹配 / None=不确定, 屏蔽规则 fail-closed)。
+    pool/sem 语义同 _regex_search_safe(None 回退模块级单例)。"""
+    pool = pool if pool is not None else _REGEX_POOL
+    sem = sem if sem is not None else _REGEX_SEM
+    if not sem.acquire(blocking=False):
         return None
     try:
-        fut = _REGEX_POOL.submit(pattern.match, text)
+        fut = pool.submit(pattern.match, text)
     except Exception:
-        _REGEX_SEM.release()
+        sem.release()
         return None
-    fut.add_done_callback(lambda _f: _REGEX_SEM.release())
+    fut.add_done_callback(lambda _f: sem.release())
     try:
         return bool(fut.result(timeout=timeout))
     except Exception:
@@ -394,7 +403,9 @@ class Resolver:
         # 放大攻击(客户端可自声明 65535)。应答超限走 TC→TCP。
         self._client_bufsize_cap = _safe_int(cfg.get("edns_client_max_size", 1232), 1232)
         # 候选 IP 测速结果缓存: ip -> (rtt_ms, ts)。命中直接复用, 避免重复探测。
-        self._ip_speed_cache = {}
+        # M6: OrderedDict 真 LRU——命中/更新 move_to_end, 驱逐 popitem(last=False)
+        # (原 plain dict 重赋值不改插入序, 头部条目虽最近被写仍会被 next(iter) 弹出)。
+        self._ip_speed_cache = OrderedDict()
         self._ip_speed_lock = threading.Lock()
         # 上游延迟排序缓存: 避免每次 miss 都对所有上游做 sorted() + 多次 _upstream_eff_lat 调用。
         # 延迟值变化较慢(EWMA), 缓存排序结果 5s 刷新一次即可, 减少 miss 热路径开销。
@@ -406,7 +417,10 @@ class Resolver:
         self._last_speed_test = OrderedDict()   # domain -> ts
         self._speed_hist_max = 4096
         self._prefetch_lock = threading.Lock()
-        self._prefetch_pending = set()
+        # S1: OrderedDict 保证待预取 key 的遍历顺序稳定(按调度时间序)。原 plain set
+        # 转 list 后顺序随增删动态变化, _prefetch_scan_idx 指针在重排列表上前进无法
+        # 保证覆盖全部 key。value 存调度时间戳(便于后续按时间序判定到期), 不参与读。
+        self._prefetch_pending = OrderedDict()
         # v1.9.86 P2-1: 预取待调度队列硬上限。与其它有界累积结构对齐
         # (_ip_speed_cache 65536 / _err_log_ts 8192 / _rule_match_cache 8192)。
         # 极端随机域名洪泛下(唯一域名速率 > 扫描消化速率 2000/tick)裸 set 会
@@ -419,12 +433,21 @@ class Resolver:
         # 解包得到一致快照, 绝不会读到"旧 exact + 新 wild"的混合状态。
         # 元组布局: (exact, wild, allow_exact, allow_wild, suffix_wild, regex)
         self._rule_index = ({}, {}, {}, {}, {}, [])
-        self._rule_match_cache = {}         # domain -> rule/None(哨兵), 规则重建时清空
+        self._rule_match_cache = OrderedDict()  # domain -> rule/None(哨兵), 规则重建时清空; L7 真 LRU
         self._rule_cache_max = 8192
         # v1.9.76 2.10: match_rule 缓存普通 dict, 多 worker 线程并发读写(读热路径 +
         # 淘汰迭代)无锁。CPython GIL 下单次 get/set 安全, 但 _cache_rule 的"满则迭代
         # list 半量淘汰"在并发下可能读到中间态/重复淘汰。加锁保护缓存读与写。
         self._rule_cache_lock = threading.Lock()
+        # 快路径 owner-name 线格式编码 memo: domain(lower) -> encode_name(domain) bytes。
+        # answer_fast 缓存命中快路径(UDP recv 单线程内同步执行, 无并发竞争)每次命中都
+        # 对同一域名重复 encode_name(~0.6us/次, 纯 CPU/GIL 绑定)。同一 lowercased domain
+        # 的线格式编码是纯函数(无 0x20——answer owner 名按 DNS 惯例小写), 可安全 memo。
+        # 有界: 随机 miss 域名洪泛时 dict 不能无界增长, 满则淘汰最旧一半(同 _cache_rule)。
+        # 即使在多线程下, 单次 get/set 由 GIL 原子保护, 竞态最坏是重复 encode_name 一次,
+        # 结果仍正确(只是未命中 memo)。
+        self._enc_owner = OrderedDict()
+        self._enc_owner_max = 4096
         self._has_group_rules = False       # 有无 group 分流规则: 无则 _ckey 跳过 match_rule
         self._rebuild_rule_index()
         # Bootstrap 预解析: 用 UDP 上游解析所有 DoH/DoT hostname, 缓存 IP,
@@ -487,6 +510,12 @@ class Resolver:
         # 容量需覆盖高峰并发(16 worker × 800ms 超时 ≈ 每秒 20 次探测), 队列满丢弃
         # (下轮/下个域名再测), 不影响查询路径。
         self._probe_pool = _BoundedExecutor(max_workers=16, max_pending=256, name="probe")
+        # ReDoS 保护池下沉为实例属性(原模块级单例 shutdown 后会误伤其他存活实例)。
+        # 每实例独立 6 worker + 有界信号量(6+_REGEX_MAX_PENDING), shutdown() 只关
+        # 本实例的池, 不影响同进程其他 Resolver。match_rule 调用 _regex_search_safe
+        # / _regex_match_safe 时显式传入 pool=self._regex_pool, sem=self._regex_sem。
+        self._regex_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="regex-safe")
+        self._regex_sem = threading.BoundedSemaphore(6 + _REGEX_MAX_PENDING)
         self._prefetch_interval = 1.0
         self._prefetch_scan_idx = 0          # 预取扫描轮转游标(分批扫描, 防大缓存卡顿)
         self._prefetch_batch = 2000          # 每 tick 最多扫描的 key 数(大容量缓存时保证预取时效)
@@ -642,8 +671,11 @@ class Resolver:
                         upstream="内核直答" if cfg.get("kernel_direct", True) else "缓存直答",
                         answer=c["chosen"], rule=self._rule_label(_rule) if _rule else None)
             self.schedule_prefetch(key, d, qtype)  # 命中即续入预取队列(与持久化恢复配合)
-            # v1.9.81: TTL 随剩余时间衰减, 不直接复用写入时的固定 ttl
-            hit_answers = [dict(a, ttl=ttl_left) for a in c["answers"]]
+            # M2: 直接引用缓存 answers(只读不改), 不再每命中一次
+            # [dict(a, ttl=...) for a in c["answers"]] 整表拷贝(热路径临时对象/GC 压力)。
+            # TTL 衰减由下游 answer_raw 对缓存命中(hit=True)传 _ttl_override=ttl_left
+            # 下推到编码器, 与 answer_fast 快路径同型。answers dict 不被 mutate。
+            hit_answers = c["answers"]
             return self._result(d, qtype, hit_answers, c["chosen"], True, False, None,
                                 latency=lat, trace=trace, ttl_left=ttl_left, rcode=0)
         # ---- 过期缓存兜底 (serve-stale): 缓存过期但在 stale 窗口内 ----
@@ -783,15 +815,24 @@ class Resolver:
             _now_sort = time.monotonic()
             _ups_sig = tuple(u.get("id", "") for u in ups)
             # P1-1: 单次读取元组后解包, 单次原子赋值发布新元组, 杜绝混合态。
-            _cached = self._sorted_ups
-            if (_cached is None
-                    or _cached[2] != _ups_sig
-                    or _now_sort - _cached[1] > 5.0):
-                _sorted_list = sorted(ups, key=self._upstream_eff_lat)
-                self._sorted_ups = (_sorted_list, _now_sort, _ups_sig)
-                _all_ups = _sorted_list
-            else:
-                _all_ups = _cached[0]
+            # 用已存在的 self._speed_lock 保护这段读-改-写: 原无锁时多 miss 线程
+            # 可能同时读到过期缓存、各自 sorted() 后互相覆盖(冗余排序), 更糟的是
+            # 读端在持锁外解包 _cached[0]/[1]/[2] 与写端赋值之间存在 TOCTOU。
+            # 仅锁这几行(_upstream_eff_lat 不获取任何锁, 无嵌套死锁), 不扩大锁范围。
+            with self._speed_lock:
+                _cached = self._sorted_ups
+                if (_cached is None
+                        or _cached[2] != _ups_sig
+                        or _now_sort - _cached[1] > 5.0):
+                    # R-review P-low: weight 为畸形字符串(如 "abc")时裸 float() 抛
+                    # ValueError 穿透 sorted()→resolve() 致 SERVFAIL; 与 latency 口径
+                    # 统一用 _safe_float 兜底 1.0。weight=0 时 _safe_float 返回 0.0,
+                    # max(1.0,0.0)=1.0, 与原 `or 1` 语义一致。
+                    _sorted_list = sorted(ups, key=lambda u: self._upstream_eff_lat(u) / max(1.0, _safe_float(u.get("weight", 1), 1.0)))
+                    self._sorted_ups = (_sorted_list, _now_sort, _ups_sig)
+                    _all_ups = _sorted_list
+                else:
+                    _all_ups = _cached[0]
             ups = _all_ups[:_n]
             _backup_ups = _all_ups[_n:] if _n < len(_all_ups) else []
             trace.append({"tag": "eng", "text": "解析失败降级开 → 先并发最快 %d/%d 个上游(实测延迟排序): %s%s" % (
@@ -868,7 +909,11 @@ class Resolver:
                     # P3/R25: sub_ans 的 dict 与子缓存共享引用(resolve miss 路径
                     # 返回的 answers 即子缓存 _fill_cache 入库的同一批 dict)。
                     # _fill_cache 会就地改写 ttl, 浅拷贝隔离父子, 避免污染子缓存条目。
-                    answers = chain + [dict(a) for a in sub_ans]
+                    # v1.9.139: 为 A/AAAA 记录补 name=tgt, 使应答 owner name 为
+                    # CNAME 目标域名而非查询域名 (RFC 1034 要求 CNAME 链后续 RR
+                    # 的 owner 为 CNAME 目标), build_response_body_answers 遇 name
+                    # 键走 encode_name(name), 无 name 的 CNAME RR 仍用 enc_owner。
+                    answers = chain + [dict(a, name=tgt) for a in sub_ans]
                     self._fill_cache(key, d, qtype, answers, rule=rule)
                     tel.push_latency(lat)
                     trace.append({"tag": "eng",
@@ -941,6 +986,10 @@ class Resolver:
                         # R-04: 缩短阻塞时间 1s→500ms, 减少 worker 线程占用。
                         # R-03: boot 重试不消耗 CNAME 深度(原 _depth+1 会导致深层 CNAME
                         # 链在 boot 重试时达到深度上限被截断为 NODATA)。
+                        # 【有意保留, 勿改】这是有意阻塞: 启动后 45s 预热窗口内全局仅
+                        # 一个查询(_boot_retry_in_progress Event 互斥)会走到这条重试路径,
+                        # 仅占用一个 worker 线程 0.5s。把它改成非阻塞/缩短/异步化的修复
+                        # 风险大于收益(会破坏"全局仅一次"语义, 或让预热期风暴放大)。
                         time.sleep(0.5)
                         return self.resolve(d, qtype, silent=silent, counted=False,
                                             force_refresh=force_refresh,
@@ -971,12 +1020,13 @@ class Resolver:
                     # R6/P2-1: cand["ttl"] 兜底原裸 cfg.get("ttl",300); 上游答案缺
                     # ttl 键时 :889 min(cand[v]["ttl"], ...) 会拿畸形串与 int 比较
                     # 抛 TypeError。统一 _safe_int 兜底为 int。
-                    cand[v] = {"value": v, "from": [], "ttl": a.get("ttl", _safe_int(cfg.get("ttl", 300), 300)),
+                    cand[v] = {"value": v, "from": set(), "ttl": a.get("ttl", _safe_int(cfg.get("ttl", 300), 300)),
                                "type": a.get("type", dnsmsg.type_code(qtype)), "lat": r["lat"],
                                "probe": "tcp443" if proto in ("doh", "dot", "doq", "doh3") else "udp53",
                                "allow_private": False}
-                if r["up_name"] not in cand[v]["from"]:
-                    cand[v]["from"].append(r["up_name"])
+                # up_name 去重: 用 set O(1) add 替代 list 的 "not in + append" O(n) 线性查找。
+                # 最终输出(:1049 join 前)再转 sorted list, 保持展示顺序确定。
+                cand[v]["from"].add(r["up_name"])
                 # 任一贡献该答案的上游豁免私有 IP → 该答案整体豁免
                 if r.get("up_name") in _allow_priv_names:
                     cand[v]["allow_private"] = True
@@ -1018,7 +1068,9 @@ class Resolver:
             trace.append({"tag": "eng", "text": "测速择优(EWMA+加权随机): 首选 %s (%dms)" % (cand_list[0]["value"], cand_list[0].get("measured", 0))})
         else:
             trace.append({"tag": "eng", "text": "按序应答, 首选 %s" % cand_list[0]["value"]})
-        answers = [{"value": a["value"], "from": "+".join(a["from"]),
+        # cand[v]["from"] 内部为 set(去重 O(1)), 输出时转 sorted list 再 join——
+        # set 迭代序不确定, sorted 保证 trace/日志中上游名展示顺序稳定。
+        answers = [{"value": a["value"], "from": "+".join(sorted(a["from"])),
                     "ttl": a["ttl"], "type": a["type"]} for a in cand_list]
         chosen = answers[0]["value"]
         # ---- 回填缓存 ----
@@ -1146,9 +1198,52 @@ class Resolver:
             # P3-1: 答案数超 MAX_ANSWERS 时 abody 含被丢弃的多余记录, 构造它是无效工作。
             # 超限时直接传 abody=None, 走 build_udp_response 的逐条重编码截断路径。
             if len(c["answers"]) <= dnsmsg.MAX_ANSWERS:
+                # 复用 owner-name 线格式编码 memo(纯函数, 同 domain 结果恒定):
+                # 避免每命中一次对同一域名重复 encode_name(~0.6us, GIL 绑定 CPU)。
+                # enc_owner 仅用于无独立 "name" 键的缓存答案(标准 A/AAAA 答案),
+                # 有独立 name 的 CNAME 链 RR 仍走 encode_name(name), 语义不变。
+                eo = self._enc_owner.get(domain)
+                if eo is None:
+                    eo = dnsmsg.encode_name(domain)  # 与原路径同, 非法域名异常自然上抛
+                    self._enc_owner[domain] = eo
+                else:
+                    # LRU: 命中时移到 MRU 末尾, 防止热点域名被 FIFO 误逐。
+                    # v1.9.141 P2: reload() 从 API 线程 clear() 本 dict, get() 返回后
+                    # move_to_end 之间存在 clear 窗口 → KeyError。吞掉降级慢路径即可。
+                    try:
+                        self._enc_owner.move_to_end(domain)
+                    except KeyError:
+                        pass
+                _ec = self._enc_owner
+                # v1.9.139: CNAME 链展开的 answers 带 name=tgt, 跨命中复用其线格式编码。
+                # 预编码 distinct name 进同一有界 memo, build_response_body_answers 经
+                # enc_map 命中复用, 避免每次命中重编 CNAME 目标名。容量守卫: 显式 name
+                # (CNAME tgt) 也会增长 memo, 超限即淘汰最旧一半(与 domain 同口径)。
+                # LRU: 已存在的 CNAME 目标名命中时也 move_to_end, 保持热点不被误逐。
+                for a in c["answers"]:
+                    nm = a.get("name")
+                    if nm:
+                        if nm in _ec:
+                            # v1.9.141 P2: in 与 move_to_end 之间也有 clear 窗口,
+                            # try/except 作为竞态兜底(与下方 popitem 防御风格一致)。
+                            try:
+                                _ec.move_to_end(nm)
+                            except KeyError:
+                                pass
+                        else:
+                            try:
+                                _ec[nm] = dnsmsg.encode_name(nm)
+                            except Exception:
+                                pass
+                if len(_ec) >= self._enc_owner_max:
+                    for _ in range(self._enc_owner_max // 2):
+                        try:
+                            _ec.popitem(last=False)
+                        except Exception:
+                            break
                 abody = dnsmsg.build_response_body_answers(
                     c["answers"], owner_name=domain, fallback_type=q["qtype"],
-                    _ttl_override=ttl_override)
+                    _ttl_override=ttl_override, enc_owner=eo, enc_map=_ec)
             else:
                 abody = None
             # v1.9.76 P0-1: 快路径统一走 build_udp_response 做 UDP 截断(>bufsize 逐条
@@ -1205,8 +1300,13 @@ class Resolver:
         if res.get("error"):
             return dnsmsg.build_error_response(raw_query, 2 if rcode == 2 else rcode)
         answers = res.get("answers", [])
+        # M2: 缓存命中路径 answers 是对缓存 dict 的只读引用(不再逐 dict 拷贝衰减 TTL)。
+        # 仅对命中(hit=True)把剩余 TTL 作为 _ttl_override 下推到编码器; miss/新鲜响应
+        # 各答案自带正确 TTL, 不覆盖(避免把混合 TTL 的 CNAME 链压平成单一值)。
+        ttl_override = res.get("ttl_left") if res.get("hit") else None
         resp = dnsmsg.build_response(raw_query, domain, qtype, answers, rcode=rcode,
-                                     bufsize_cap=self._client_bufsize_cap)
+                                     bufsize_cap=self._client_bufsize_cap,
+                                     _ttl_override=ttl_override)
         if resp:
             self.tel.inc("bytes_out", len(resp))
         return resp
@@ -1452,7 +1552,10 @@ class Resolver:
 
         # 批量读取熔断状态(一次加锁, 避免每个上游一次锁竞争)
         with self._cb_lock:
-            _cb_snapshot = {uid: (st.get("until", 0.0) and time.time() < st.get("until", 0.0))
+            # L3: 外包 bool(...) 统一返回 bool。原表达式 until=0.0(falsy)时短路返回
+            # 0.0(float), 与"until 未过期"分支的 True/False 混合类型, 下游
+            # _is_cb_open 依赖布尔语义, 此处规范化为纯 bool。
+            _cb_snapshot = {uid: bool(st.get("until", 0.0) and time.time() < st.get("until", 0.0))
                             for uid, st in self._cb.items()}
 
         def _is_cb_open(u):
@@ -1819,6 +1922,12 @@ class Resolver:
             ip = a["value"]
             with self._ip_speed_lock:
                 hit = self._ip_speed_cache.get(ip)
+                if hit is not None:
+                    # M6: 读命中提升到 MRU 端, 使热 IP 不被 popitem(last=False) 误驱逐。
+                    try:
+                        self._ip_speed_cache.move_to_end(ip)
+                    except Exception:
+                        pass
             if hit is not None and now - hit[1] < cache_ttl:
                 a["measured"] = hit[0]
             else:
@@ -1829,12 +1938,12 @@ class Resolver:
                         # 粗略延迟估计覆盖先到者(或 _probe_candidate_ip 已写入的实测
                         # EWMA)。仅在槽位真空时写入, 消除两次持锁之间的 TOCTOU。
                         self._ip_speed_cache.setdefault(ip, (a["measured"], now))
-                        # R-05: 利用 dict 插入序(Py3.7+)从头弹出最旧条目, 避免 O(n log n)
-                        # 排序在锁内执行。保留 3/4 条目作为水位线, 防止频繁触发淘汰。
+                        # M6: OrderedDict popitem(last=False) 弹出最久未用条目,
+                        # 保留 3/4 条目作为水位线, 防止频繁触发淘汰。
                         if len(self._ip_speed_cache) > 65536:
                             _target = 65536 * 3 // 4
                             while len(self._ip_speed_cache) > _target:
-                                self._ip_speed_cache.pop(next(iter(self._ip_speed_cache)), None)
+                                self._ip_speed_cache.popitem(last=False)
                 self._probe_pool.submit_drop(
                     self._probe_candidate_ip, ip, query_bytes,
                     a.get("probe", "udp53"), _safe_int(self.cfg.get("speed_timeout_ms", 300), 300))
@@ -1842,20 +1951,18 @@ class Resolver:
         # R42/P3-3: measured 为实测延迟(ms), 下界 0(lat 不可能为负), 故 measured+10 >= 10,
         # 每项权重 >= 0.1 > 0, sum(ws) >= 0.1*len(pool) > 0, 除零与 total==0 均不可达。
         # 此处不额外加防御性除零分支(死代码); 若未来有人把 +10 改为 +0 需重新评估。
+        # 性能优化: ws 一次性预计算(measured 已在上一循环写好), 选优改用
+        # random.choices 单次加权抽取; 索引标记法(remaining)替代原 list.pop(pick)
+        # 的 O(n) 移位 + 每轮重算 ws 的 O(n²)。remaining 至多 8 项, del 开销可忽略。
+        out_pool = list(work)
+        ws = [1.0 / (it.get("measured", 999) + 10) for it in out_pool]
         out = []
-        pool = list(work)
-        while pool:
-            ws = [1.0 / (it.get("measured", 999) + 10) for it in pool]
-            total = sum(ws)
-            r = random.random() * total
-            acc = 0.0
-            pick = 0
-            for i, w in enumerate(ws):
-                acc += w
-                if r <= acc:
-                    pick = i
-                    break
-            out.append(pool.pop(pick))
+        remaining = list(range(len(out_pool)))
+        while remaining:
+            rw = [ws[i] for i in remaining]
+            rel = random.choices(range(len(remaining)), weights=rw, k=1)[0]
+            out.append(out_pool[remaining[rel]])
+            del remaining[rel]
         rest = cand_list[8:]
         for a in rest:
             a["measured"] = a.get("lat", 999)
@@ -1890,11 +1997,16 @@ class Resolver:
             else:
                 ewma = rtt
             self._ip_speed_cache[ip] = (ewma, _now)
-            # R-05: 同上, dict 插入序从头弹出最旧条目, 避免 O(n log n) 排序锁内阻塞。
+            # M6: 写已有 key 时 OrderedDict 不改插入序, 必须 move_to_end 标记为最近使用;
+            # 驱逐 popitem(last=False) 弹出最久未用条目(非首插条目)。
+            try:
+                self._ip_speed_cache.move_to_end(ip)
+            except Exception:
+                pass
             if len(self._ip_speed_cache) > 65536:
                 _target = 65536 * 3 // 4
                 while len(self._ip_speed_cache) > _target:
-                    self._ip_speed_cache.pop(next(iter(self._ip_speed_cache)), None)
+                    self._ip_speed_cache.popitem(last=False)
         return rtt
 
     def _clamp_ttl(self, ttl, rule=None):
@@ -2017,12 +2129,18 @@ class Resolver:
         # _prefetch_lock 内, 热路径多一次锁竞争(~100ns)但彻底消除竞态。
         with self._prefetch_lock:
             if key in self._prefetch_pending:
+                # S1: 已在队列则刷新其调度位置到 MRU 端(OrderedDict 重赋值不改序),
+                # 保证热 key 在稳定序窗口中不被漏扫。
+                self._prefetch_pending.move_to_end(key)
                 return
-            # v1.9.86 P2-1: 硬上限兜底。队列已满时放弃本次标记(不阻塞查询热路径),
-            # 已入队的 due/过期 key 由 _scan_prefetch 每 tick 2000 条自然消化。
-            if len(self._prefetch_pending) >= self._prefetch_pending_max:
-                return
-            self._prefetch_pending.add(key)
+            self._prefetch_pending[key] = time.time()
+            # v1.9.86 P2-1 / S1: 硬上限兜底。原满则放弃新标记; 改为驱逐最久未调度
+            # (LRU 头 popitem(last=False)) 的旧 key, 既保上限又不让热路径丢标记。
+            while len(self._prefetch_pending) > self._prefetch_pending_max:
+                try:
+                    self._prefetch_pending.popitem(last=False)
+                except Exception:
+                    break
 
     def rearm_prefetch(self):
         """重启恢复持久化缓存后, 把恢复的未过期条目重新纳入预取调度。
@@ -2048,11 +2166,16 @@ class Resolver:
             # 按原 key 查缓存(PartitionedCache 据此路由到 domestic/global/default 分区),
             # 剥离 group 会导致非 default 分区条目查不到、预取调度静默丢失。
             with self._prefetch_lock:
-                # v1.9.86 P2-1: 与 schedule_prefetch 一致的硬上限(启动恢复路径)
-                if (key not in self._prefetch_pending
-                        and len(self._prefetch_pending) < self._prefetch_pending_max):
-                    self._prefetch_pending.add(key)
+                # S1: OrderedDict 赋值(原 .add(key))。与 schedule_prefetch 一致,
+                # 超限驱逐最久未调度旧 key, 保硬上限。
+                if key not in self._prefetch_pending:
+                    self._prefetch_pending[key] = now
                     added += 1
+                    while len(self._prefetch_pending) > self._prefetch_pending_max:
+                        try:
+                            self._prefetch_pending.popitem(last=False)
+                        except Exception:
+                            break
         if added:
             self.tel.log("", "", "sys", "预取重调度: 恢复缓存 %d 条纳入预取队列" % added, 0)
             log.info("预取重调度: 恢复缓存 %d 条纳入预取队列", added)
@@ -2076,7 +2199,9 @@ class Resolver:
         now = time.time()
         due = []
         with self._prefetch_lock:
-            pending = list(self._prefetch_pending)
+            # S1: OrderedDict.keys() 按调度时间序(稳定), 轮转指针在固定序窗口上
+            # 前进才能保证覆盖全部 key(原 set→list 顺序随增删漂移, 指针无法对齐)。
+            pending = list(self._prefetch_pending.keys())
             # 快照正在被 serve-stale 后台刷新的 key: 这些 key 虽仍在 pending 中
             # (_do_stale_refresh 完成后才会从 pending 移除), 若本扫描也选中并
             # 提交 _do_prefetch, 会与正在跑的 force_refresh 并发打重复上游请求。
@@ -2097,10 +2222,11 @@ class Resolver:
             if entry is None:
                 with self._prefetch_lock:
                     # P2-8: TOCTOU——cache.get() 在锁外执行, 持锁前另一线程可能已
-                    # 移除并重新加入该 key。重新确认 key 仍在 pending 中才 discard,
+                    # 移除并重新加入该 key。重新确认 key 仍在 pending 中才移除,
                     # 避免误删其他线程刚调度的同 key 预取。
+                    # S1: OrderedDict 无 set.discard, 用 pop(key, None)。
                     if key in self._prefetch_pending:
-                        self._prefetch_pending.discard(key)
+                        self._prefetch_pending.pop(key, None)
                 continue
             ttl = entry.get("ttl", 0)
             expires = entry.get("expires_at", 0)
@@ -2116,8 +2242,9 @@ class Resolver:
             # 先按原始(分区)key 从待预取集合移除, 再剥离 group 得到 (d, qtype)。
             # 原实现先把 key 重绑定为 2 元组再 discard, 而 _prefetch_pending 存的
             # 是 3 元组 (group, key_d, qtype), discard(2元组) 永远 miss, 旧 key 残留。
+            # S1: OrderedDict 无 set.discard, 用 pop(key, None)。
             with self._prefetch_lock:
-                self._prefetch_pending.discard(key)
+                self._prefetch_pending.pop(key, None)
             if len(key) == 3:
                 _key_d, qtype = key[1], key[2]
             else:
@@ -2170,18 +2297,27 @@ class Resolver:
                 pool.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
-        # R4-P3-2/R5/P3-4: 模块级 _REGEX_POOL 是唯一未在 shutdown() 中关闭的 ThreadPoolExecutor。
-        # 其 worker 为非 daemon 线程, Python 退出时 threading._shutdown 会 join 所有
-        # 非 daemon 线程; 若 ReDoS 正则仍在运行(re 模块不可中断), 进程退出被阻塞。
-        # R5 决策(为何不把 worker 设为 daemon): ThreadPoolExecutor 不公开线程工厂,
-        # 线程惰性创建于首次 submit, 构造后遍历私有 _threads 设 daemon=True 在 Py 版本间
-        # 脆弱且不可靠。改以 shutdown(wait=False, cancel_futures=True) 作为指定退出路径:
-        # wait=False 不阻塞 shutdown(); cancel_futures=True 取消队列中未开始的任务;
-        # 正在运行的正则由 _detect_catastrophic_regex 静态检测 + fut.result(timeout=0.5)
-        # 双层兜底, 最多 0.5s 自然结束。即便解释器退出时 join 残留 worker, 最坏延迟也是
-        # 秒级(6 worker × 0.5s 有界), 不影响运行态。blast radius 已钳制, 可接受。
+        # R4-P3-2/R5/P3-4 -> v1.9.9x 修复: ReDoS 保护池已下沉为实例属性
+        # self._regex_pool(原模块级单例)。worker 为非 daemon 线程, Python 退出时
+        # threading._shutdown 会 join 所有非 daemon 线程; 若 ReDoS 正则仍在运行
+        # (re 模块不可中断), 进程退出被阻塞。R5 决策(为何不把 worker 设为 daemon):
+        # ThreadPoolExecutor 不公开线程工厂, 线程惰性创建于首次 submit, 构造后遍历
+        # 私有 _threads 设 daemon=True 在 Py 版本间脆弱且不可靠。改以
+        # shutdown(wait=False, cancel_futures=True) 作为指定退出路径: wait=False 不
+        # 阻塞 shutdown(); cancel_futures=True 取消队列中未开始的任务; 正在运行的正则
+        # 由 _detect_catastrophic_regex 静态检测 + fut.result(timeout=0.5) 双层兜底,
+        # 最多 0.5s 自然结束。即便解释器退出时 join 残留 worker, 最坏延迟也是秒级
+        # (6 worker × 0.5s 有界), 不影响运行态。
+        # 关键: 这里只关本实例的 self._regex_pool, 绝不触碰模块级 _REGEX_POOL——
+        # 否则同进程其他存活 Resolver 实例后续正则 submit 会 RuntimeError→None。
+        # 关闭后置 None 防重复 shutdown() 报错。
         try:
-            _REGEX_POOL.shutdown(wait=False, cancel_futures=True)
+            if self._regex_pool is not None:
+                self._regex_pool.shutdown(wait=False, cancel_futures=True)
+                self._regex_pool = None
+            # 成对销毁: sem 置空防 shutdown 后在途 match_rule 混搭
+            # 「模块池+实例信号量」(实例池已关, submit 走 except→None fail-closed)。
+            self._regex_sem = None
         except Exception:
             pass
 
@@ -2313,6 +2449,42 @@ class Resolver:
             changed.append("规则索引已重建")
         except Exception as e:
             log.error("热重载规则索引重建失败: %r", e)
+        # M3: 热重载后清理已删除上游的熔断器死条目。_cb 以 up_id 为 key 累积,
+        # 上游从配置移除后其熔断状态永久残留(若 id 复用会误熔断新上游)。用新配置
+        # 的存活上游 id 集合过滤, 与 _cb_fail/_cb_ok 的 key 派生保持一致
+        # (u.get("id") or u.get("name") or "?"), 在 _cb_lock 内执行。
+        try:
+            alive = set()
+            alive_ids = set()
+            for u in (new_cfg.get("upstreams") or []):
+                alive.add(u.get("id") or u.get("name") or "?")
+                alive_ids.add(u.get("id", ""))
+            with self._cb_lock:
+                dead = [k for k in self._cb if k not in alive]
+                for k in dead:
+                    del self._cb[k]
+            if dead:
+                changed.append("熔断器清理已删除上游 %d 条" % len(dead))
+        except Exception as e:
+            log.error("热重载熔断器清理失败: %r", e)
+        # 0x20 自适应降级状态按 up_id(仅 id, 无 name 回退) 累积, reload 删除上游后
+        # key 不清理, 复用同名上游时会继承旧禁用状态。用 alive_ids 与 upstream.py
+        # 的 key 派生口径 (up.get("id","")) 对齐清理。
+        try:
+            from . import upstream as _up_mod
+            with _up_mod._0x20_lock:
+                dead_x20 = [k for k in _up_mod._0x20_misses if k not in alive_ids]
+                for k in dead_x20:
+                    _up_mod._0x20_misses.pop(k, None)
+                    _up_mod._0x20_DISABLED_SINCE.pop(k, None)
+                dead_x20_disabled = [k for k in _up_mod._0x20_disabled if k not in alive_ids]
+                for k in dead_x20_disabled:
+                    _up_mod._0x20_disabled.discard(k)
+        except Exception as e:
+            log.error("热重载 0x20 状态清理失败: %r", e)
+        # 防御性清理 owner-name 编码 memo: encode_name 是纯函数(旧条目编码结果始终
+        # 正确), 但 reload 重建规则索引/缓存策略时一并清空以保持状态一致性。
+        self._enc_owner.clear()
         return changed
 
     # ---------------- 周期任务: 健康检查 + 订阅自动更新 ---------------- #
@@ -2366,21 +2538,30 @@ class Resolver:
             n = self._hc_off
             ups2 = (ups2 + ups2)[n:n + n_probe]
             self._hc_off = (n + n_probe) % len(ups)
-        for u in ups2:
-            # P2-1: 与 _classify_one 对齐, 漏写 id 时回退 name, 防 KeyError
-            _uid = u.get("id") or u.get("name") or "?"
-            try:
-                ok, _data, _lat, _e = query_upstream(u, qbytes, timeout)
+        # v1.9.142: 多上游探测改为并发(原串行在有慢/不可达境外上游时逐个等超时,
+        # 一轮健康检查可耗时数十秒、周期漂移并长期占用后台线程)。所有探测同时发起,
+        # 一轮耗时收敛到约单次超时; query_upstream 各路径线程安全(QUIC 复用同一常驻连接)。
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(8, len(ups2))) as _hcex:
+            _futs = {_hcex.submit(query_upstream, u, qbytes, timeout): u for u in ups2}
+            for _fut in as_completed(_futs):
+                u = _futs[_fut]
+                # P2-1: 与 _classify_one 对齐, 漏写 id 时回退 name, 防 KeyError
+                _uid = u.get("id") or u.get("name") or "?"
+                _uname = u.get("name") or u.get("id", "?")
+                try:
+                    ok, _data, _lat, _e = _fut.result()
+                except Exception as e:
+                    self._cb_fail(_uid)
+                    # R7/P2-2: 与同函数其他日志对齐, name 缺失时回退 id。
+                    log.debug("健康检查异常 %s: %r", _uname, e)
+                    continue
                 if ok:
                     self._cb_ok(_uid)
-                    log.debug("健康检查 OK  %s (%s)", u.get("name") or u.get("id", "?"), u.get("addr"))
+                    log.debug("健康检查 OK  %s (%s)", _uname, u.get("addr"))
                 else:
                     self._cb_fail(_uid)
-                    log.info("健康检查失败 %s (%s): %s", u.get("name") or u.get("id", "?"), u.get("addr"), _e or "无应答")
-            except Exception as e:
-                self._cb_fail(_uid)
-                # R7/P2-2: 与同函数其他日志(:2260/:2263)对齐, name 缺失时回退 id。
-                log.debug("健康检查异常 %s: %r", u.get("name") or u.get("id", "?"), e)
+                    log.info("健康检查失败 %s (%s): %s", _uname, u.get("addr"), _e or "无应答")
 
     def _fetch_sub_text(self, url, timeout=20):
         """拉取订阅文本(共享实现): SSRF 初始+每跳重定向校验, 16MB 流式上限。"""
@@ -2709,6 +2890,17 @@ class Resolver:
         hit = cache.get(n, _MISS)
         if hit is not _MISS:
             # R-09: hit 要么是规则 dict, 要么是 None(缓存未命中), 直接返回即可。
+            # L7: 命中提升到 MRU 端, 使热域名不被 LRU 半量驱逐。读路径保持无锁——
+            # 与 _cache_rule 淘汰竞态时最多 move_to_end 抛 KeyError(已被淘汰), try 吞掉;
+            # GIL 下 OrderedDict C 方法原子完成, 不会读到不一致的键值。
+            # R2 实测: 曾尝试 `next(reversed(cache)) != n` 跳过已在末尾的 move_to_end,
+            # 但在 96 域名循环基准下, 同一域名两次命中之间间隔 ~95 次其他查询,
+            # 几乎不可能仍在 MRU 端, reversed() 迭代器开销反使 match_rule cumtime
+            # 涨 ~26% (0.382→0.481s)。move_to_end 仅占快路径 ~1.2% tottime, 回退。
+            try:
+                cache.move_to_end(n)
+            except Exception:
+                pass
             return hit
         # ---- 白名单(allow)优先: 仅缓存未命中时检查 ----
         r = allow_exact.get(n)
@@ -2747,7 +2939,7 @@ class Resolver:
             group = suffix_wild.get(core)
             if group:
                 for c, rule in group:
-                    m = _regex_match_safe(c, n)
+                    m = _regex_match_safe(c, n, pool=self._regex_pool, sem=self._regex_sem)
                     if m is True:
                         self._cache_rule(n, rule)
                         return rule
@@ -2762,7 +2954,7 @@ class Resolver:
             core = core[idx + 1:]
         # 正则规则: 编译已缓存, 按配置顺序首个命中生效(带 ReDoS 超时保护)
         for c, rule in regex:
-            m = _regex_search_safe(c, n)
+            m = _regex_search_safe(c, n, pool=self._regex_pool, sem=self._regex_sem)
             if m is True:
                 self._cache_rule(n, rule)
                 return rule
@@ -2778,10 +2970,16 @@ class Resolver:
         with self._rule_cache_lock:
             cache = self._rule_match_cache
             if len(cache) >= self._rule_cache_max:
-                # 满时淘汰最早插入的一半(OrderedDict 语义保持插入序), 而非整体清空,
-                # 避免突发查询把整表命中结论打散造成回源风暴。
-                for _k in list(cache)[: len(cache) // 2]:
-                    cache.pop(_k, None)
+                # L7: 满时从 MRU 头弹出最久未用(popitem(last=False))的一半,
+                # 而非整体清空, 避免突发查询把整表命中结论打散造成回源风暴。
+                # 与读路径 move_to_end 配合构成真 LRU(原 plain dict 半量淘汰按插入序,
+                # 不反映最近命中)。
+                half = len(cache) // 2
+                for _ in range(half):
+                    try:
+                        cache.popitem(last=False)
+                    except Exception:
+                        break
             cache[n] = rule
 
     def _guess_type(self, value, qtype):

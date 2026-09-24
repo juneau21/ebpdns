@@ -1,21 +1,13 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
-请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新
+请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新**真实可部署的 DNS 解析软件**。
 
-- 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT）
-- 复刻 SmartDNS 的**测速择优、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
+- 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT / DoQ / DoH3）
+- 复刻 SmartDNS 的**测速择优、上游 weight 加权轮询、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
 - 默认数据面运行在**用户态**：以**用户态 LRU 缓存模拟 BPF LRU_HASH Map**，命中由 daemon 快路径直接回包，**无需内核权限**即可完整运行
 - 内置 **HTTP JSON API + Web 控制台**：控制台连上后端即为真实数据（REAL 模式），后端不可达时自动降级为浏览器内仿真（SIM 模式）
 - 可选 **eBPF XDP 内核旁路**（`bpf/`）：`bpf/` 目录为参考实现、当前**未集成**到 daemon 运行路径，默认部署即为上方用户态路径
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
-
-
-- **六协议上游**：UDP/TCP/DoH/DoT/DoQ/DoH3，连接复用 + 熔断
-- **智能解析**：测速择优、域名分流、TTL 管控、预取、负缓存、双栈智能
-- **零依赖**：纯 Python 标准库，systemd 一键部署
-- **Web 控制台**：实时遥测、查询控制台、配置管理、分流规则
-- **高性能**：缓存命中 p50 0.1ms，QPS 5.8 万，10 分钟 3500 万查询 0 错误
-- **稳定**：崩溃自动重启、缓存持久化跨重启恢复、上游熔断降级
 
 WEB运行截图
 <img width="2560" height="1294" alt="8b7fd55aebaabd3c6b02dbf5cebad588" src="https://github.com/user-attachments/assets/04e6dcbb-b222-491a-80c7-118b15af7561" />
@@ -27,7 +19,6 @@ WEB运行截图
 <img width="2560" height="1755" alt="229f9d952d7ac82736bd199e083c2f31" src="https://github.com/user-attachments/assets/8da11ddf-6bf2-4736-9e3e-ba876defbdc7" />
 
 <img width="2560" height="1294" alt="b1677fd9bb0a07c0fc65f6625fa16d42" src="https://github.com/user-attachments/assets/be6a213b-14f7-4fc8-8668-9085595c41a6" />
-
 
 
 ---
@@ -57,7 +48,7 @@ WEB运行截图
 |---|---|
 | 用户态守护进程 | Python 3.10+（零第三方依赖） |
 | 缓存语义 | 用户态 LRU 模拟 `BPF_MAP_TYPE_LRU_HASH`（命中计数计入遥测 `kernel_direct`） |
-| 上游协议 | UDP / TCP / DoH (HTTPS) / DoT (TLS) |
+| 上游协议 | UDP / TCP / DoH (HTTPS) / DoT (TLS) / DoQ (QUIC) / DoH3 (HTTP/3) |
 | 管理接口 | HTTP JSON API + Web 控制台（内置 ECharts，本地化无外网依赖） |
 | 可选内核数据面 | C + libbpf (XDP)，`bpf/` 目录参考实现（预留接口，未集成） |
 
@@ -89,7 +80,8 @@ curl -s http://127.0.0.1:8080/api/status
 > **53 端口冲突**：Debian 的 `systemd-resolved` 默认占用 `127.0.0.53:53`（监听回环地址，通常不冲突）。
 > 若你的机器另有 DNS 占用 `0.0.0.0:53`，可先 `sudo systemctl stop systemd-resolved`，
 > 或在 `/etc/ebpdns/config.json` 里把 `listen` 改成其它端口（如 `0.0.0.0:5353`）。
-> 53 端口需 root 权限；非 root 本地调试可用 `127.0.0.1:1053` 等非特权端口。
+> 53 端口需特权：systemd 部署由专用 `ebpdns` 用户 + `CAP_NET_BIND_SERVICE` 绑定（无需 root 全权）；
+> 手动非 root 本地调试请改用 `127.0.0.1:1053` 等非特权端口。
 
 ### 手动部署（不走 install.sh）
 
@@ -102,12 +94,28 @@ sudo cp systemd/ebpdns.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ebpdns
 ```
 
+### 升级
+
+```bash
+# 在新版本解压目录里重新运行 install.sh 即可（保留现有配置）
+sudo ./install.sh
+#   - 代码 rsync 到 /opt/ebpdns（纯代码子目录 bin/ebpdns/web/systemd 带 --delete 清理陈旧 .py）
+#   - /etc/ebpdns/config.json 已存在则原样保留不动（用户数据不在 /opt 内，不受影响）
+#   - 重装 systemd unit 并 daemon-reload
+sudo systemctl restart ebpdns     # 重启加载新代码（配置热重载也可 POST /api/reload）
+dig @127.0.0.1 www.baidu.com       # 验证
+```
+
 ### 卸载
 
 ```bash
 sudo systemctl stop ebpdns && sudo systemctl disable ebpdns
-sudo rm -f /etc/systemd/system/ebpdns.service && sudo systemctl daemon-reload
+sudo systemctl disable ebpdns-restart.timer 2>/dev/null || true
+sudo rm -f /etc/systemd/system/ebpdns.service /etc/systemd/system/ebpdns-restart.{service,timer}
+sudo systemctl daemon-reload
 sudo rm -rf /opt/ebpdns /etc/ebpdns
+# 可选：删除运行用户（install.sh 创建的系统账号，无登录 shell）
+sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 ```
 
 ---
@@ -122,7 +130,7 @@ sudo rm -rf /opt/ebpdns /etc/ebpdns
 /opt/ebpdns/bin/ebpdns config-path        # 打印配置文件位置
 ```
 
-也可用 `EBPNDS_CONFIG=<路径>` 环境变量指定配置文件。
+也可用 `EBPDNS_CONFIG=<路径>` 环境变量指定配置文件。
 
 ---
 
@@ -130,16 +138,16 @@ sudo rm -rf /opt/ebpdns /etc/ebpdns
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `listen.udp` / `listen.tcp` | `0.0.0.0:53` | DNS 监听地址 |
-| `listen.udp6` / `listen.tcp6` | 不监听 | IPv6 DNS 监听（可选）。默认 `null` 不绑定 IPv6；需显式写出地址（如 `[::1]:53` 或 `[::]:53`）才开启，避免未配置时成为隐蔽的开放 IPv6 解析器 |
-| `api.host` / `api.port` | `127.0.0.1` / `8080` | API 与控制台监听（install.sh 模板为 `0.0.0.0:8080`） |
+| `listen.udp` / `listen.tcp` | `127.0.0.1:53` | DNS 监听地址（默认仅回环，无配置时不暴露到全网卡；需局域网提供 DNS 时显式改为 `0.0.0.0:53`） |
+| `listen.udp6` / `listen.tcp6` | `[::1]:53` | IPv6 DNS 监听，默认开启（仅回环 `[::1]:53`；系统无 IPv6 协议栈时仅告警跳过，不影响 IPv4 服务）。不希望监听 IPv6 时显式设为 `null`，需全网卡可改 `[::]:53` |
+| `api.host` / `api.port` | `127.0.0.1` / `8080` | API 与 Web 控制台监听（默认仅本机回环，天然安全无需 token；模板与 install.sh 均为 `127.0.0.1:8080`，需局域网访问时显式改 `0.0.0.0` 并配 `api.token`） |
 | `cache_size` | 131072 | 用户态缓存容量（模拟 BPF Map 容量，范围 1–10000000，配置值越界会被 API 拒绝） |
 | `cache_policy` | `lru` | 缓存淘汰策略：`lru`=8 分桶 LRU（全局共享池，开销最低）；`partitioned`=按分流 group 隔离独立缓存池（各 group 互不挤占）；`tinylfu`=W-TinyLFU 三段式（抗扫描污染，命中率通常高 5-15%，额外内存约 512KB）。切换后自动热重载重建缓存 |
 | `cache_partitions` | 见配置 | partitioned 模式下各 group 的容量比例分配（如 domestic/global/default），仅 cache_policy=partitioned 时生效 |
 | `ttl` | 300 | 缓存默认 TTL（秒），实际取上游返回 TTL 与它的较小值 |
 | `ttl_min` / `ttl_max` | 0 / 0 | 下发 TTL 管控：内网客户端应答 TTL 钳制到该区间（0=不限制），同时作为缓存存活时长 |
 | `serve_stale` / `stale_ttl` | false / 3600 | 过期缓存兜底：缓存过期后在窗口内仍返回旧数据（下发 TTL=0）并后台强制刷新，避免上游抖动时 SERVFAIL |
-| `persist_ttl` | 0 | 持久化缓存恢复后的独立 TTL（秒）；0=按保存时剩余 TTL 原样恢复（重启间隙不消耗缓存寿命） |
+| `persist_ttl` | 0 | 持久化缓存恢复后的独立 TTL（秒）；0=按保存时剩余 TTL 原样恢复（重启间隙不消耗缓存寿命）。取值范围 0–31536000（一年），越界回退默认 |
 | `prefetch` | true | TTL 到期前 85% 自动预取刷新（跳过 NXDOMAIN 负缓存；恢复缓存自动重排入预取队列） |
 | `kernel_direct` | true | 用户态缓存命中即计为「内核直答」遥测计数（真实 XDP 集成时保持 true 语义一致） |
 | `speed_test` / `speed_interval_ms` | true / 2000 | 上游测速择优；两次主动探测最小间隔 |
@@ -153,12 +161,14 @@ sudo rm -rf /opt/ebpdns /etc/ebpdns
 | `prefer_ipv4` | false | 双栈智能：仅当域名存在 A 记录（双栈）才屏蔽 AAAA 返回 NODATA，纯 IPv6 域名（无 A）正常解析——替代全局 `ipv6` 开关的精细化方案，不误伤 v6-only 域名。A 探测先查缓存快判，无缓存才查上游（仅首次 AAAA 查询多一次上游往返），结果回填 A 缓存 |
 | `edns` / `edns_client_subnet` | true / null | 携带 EDNS0 OPT；可填 `203.0.113.0/24` 启用 ECS |
 | `edns_udp_size` | 1232 | 出站查询 EDNS0 UDP payload（字节）。1232=IPv6 最小 MTU 1280 减 IPv6 头 40 + UDP 头 8 的最大不分片安全值——大应答 UDP 分片穿越 NAT/防火墙/PPPoE 时经常被丢弃导致解析超时，钳制到该值保证应答不分片（超限应答置 TC 位由客户端走 TCP 重试） |
+| `edns_client_max_size` | 1232 | 入站方向：对客户端通告的 EDNS0 UDP payload 大小设上限（范围 512–65535）。应答按该上限截断，防止客户端通告超大 bufsize 时返回巨型 UDP 报文被放大利用/分片丢弃 |
 | `padding` | false | 加密查询报文填充（RFC 8467）：DoT/DoH/DoH3/DoQ 出站报文 OPT options 段填充到 128B 块（上限 512），抹平报文长度指纹，防流量分析通过长度推断查询内容。明文 UDP/TCP 不填充（只增大报文无收益）。前端开关按协议自动分流，无需手配 |
 | `timeout_ms` | 1500 | 单次上游查询超时 |
 | `max_parallel_upstreams` | 3 | 单查询并发上游数 |
-| `upstreams[]` | 见模板 | `proto`: udp/tcp/doh/dot/doq/doh3；`addr`+`port`；`url`(DoH/DoH3 路径)；`group`: domestic/global；`latency` 基础延迟（首次启动自动实测写回）；`enabled`；`latency_measured` |
+| `upstreams[]` | 见模板 | `proto`: udp/tcp/doh/dot/doq/doh3；`addr`+`port`；`url`(DoH/DoH3/DoQ 路径)；`group`: domestic/global；`latency` 基础延迟（默认 5000ms，首次启动自动实测写回，范围 0–3600000ms）；`enabled`；`latency_measured`；`weight` 加权轮询权重（默认 **1**，范围 0–1000 且支持小数；选择排序 key = 实测延迟 `eff_lat` / `max(1.0, weight)`，weight 越大越易被选中，<1 按 1 计即与默认相同）；`allow_private_ip`（上游级布尔，默认 **false**：该上游返回的私网/保留 IP 仍受全局 `rebind_protection` 丢弃；显式设 `true` 后豁免，使其内网/私有地址答案不被丢弃，所有协议可用）；`doh_strict_cert` / `dot_strict_cert`（上游级布尔，默认 **true**：证书链 + SAN/主机名必须匹配，不匹配直接失败；仅显式设为 `false` 才允许降级，降级连接即用即弃不入连接池；仅 DoH/DoH3 / DoT 协议分别生效） |
+| `nxdomain_quorum` | 2 | 多上游 NXDOMAIN 一致性判定：需至少 `nxdomain_quorum` 个上游一致返回 NXDOMAIN 才确认域名不存在并提前返回，否则继续等其余上游/超时（防单个上游撒谎把存在的域名判成不存在）。quorum 自动钳到实际参与投票的健康上游数；设为 1 恢复旧行为。未在配置中写出时按默认 2 |
 
-> **默认上游**（v1.7.7 起，后续版本持续扩充）：内置 2 个国内 UDP 兜底 + 15 个 DoH/DoH3 端点（AliDNS/DNSPod 的域名与 IP 直连、Cloudflare/Google/Quad9/NextDNS/OpenDNS/DNS.SB/AdGuard/HiNet）。其中国内 9 项默认启用（首次启动自动实测延迟写回），海外 4 项默认启用、其余海外端点已写入但默认 `enabled:false`，可在控制台按需启用（海外端点受网络环境限制，走超时/熔断自动降级）。
+> **默认上游**（v1.7.7 起，后续版本持续扩充）：内置 2 个国内 UDP 兜底 + 20 个 DoH/DoH3 端点（AliDNS/DNSPod 的域名与 IP 直连、Cloudflare/Google/Quad9/NextDNS/OpenDNS/DNS.SB/AdGuard/HiNet）。其中国内 9 项默认启用（首次启动自动实测延迟写回），海外 4 项默认启用、其余海外端点已写入但默认 `enabled:false`，可在控制台按需启用（海外端点受网络环境限制，走超时/熔断自动降级）。
 > **DoQ / DoH3（v1.8.0，可选依赖 aioquic）**：`proto:"doq"`（DNS over QUIC，RFC 9250，默认端口 853）与 `proto:"doh3"`（HTTP/3 DoH，默认端口 443）已内置实现。每个 QUIC 上游维护一条常驻连接（断线自动重连 + 查询失败主动重建），多查询在同一连接上多路复用；未安装 aioquic 时相应上游返回「aioquic 未安装」错误，不影响 UDP/TCP/DoH/DoT 路径。安装：`sudo pip3 install aioquic`（Debian 13 用户级安装 `pip3 install --user aioquic`）。`server-http3` 端点可直接配置为 `proto:"doh3"`。
 | `rules[]` | 见模板 | `match`: 精确域名或 `*.example.com` 通配；`action`: group/forceIp/block；规则按哈希索引匹配（10 万条级 O(1)）。规则可带 `ttl_min`/`ttl_max`（规则级 TTL）：命中规则时**整体替换**全局 TTL 区间（未显式设置的边界按 0=不限制），用于 CDN/动态域名保持短 TTL 及时更新、稳定域名拉长 TTL 提升命中率。逐条规则在控制台规则行直接填写，留空继承全局 |
 | `cache_file` | `/etc/ebpdns/cache.json` | 缓存持久化落盘路径（每 60s 自动保存 + 退出时保存，重启自动恢复） |
@@ -187,30 +197,61 @@ sudo rm -rf /opt/ebpdns /etc/ebpdns
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/api/health` | 存活探针（无需 token，供容器/编排探活），返回 `status/running/version/uptime_s` |
 | GET | `/api/status` | 运行状态、QPS、命中率、延迟、计数器、LRU Map 占用 |
 | GET | `/api/snapshot` | 完整快照：历史序列、日志事件、上游健康、手动查询记录 |
 | POST | `/api/query` | `{domain, qtype}` 手动解析，返回完整 trace |
-| GET/PUT | `/api/config` | 读写配置（PUT 全量持久化，`cache_size` 越界返回 400） |
+| GET/PUT | `/api/config` | 读写配置（PUT 全量持久化，`cache_size` 越界返回 400；GET 自动把 `api.token` 脱敏为 `***`） |
 | GET/POST | `/api/upstreams` | 上游列表 / 新增 |
-| PUT/DELETE | `/api/upstreams/<id>` | 修改 / 删除上游 |
+| PUT/DELETE | `/api/upstreams/<id>` | 修改 / 删除上游（透传 `weight`/`allow_private_ip`/`doh_strict_cert`/`dot_strict_cert`） |
 | GET/POST | `/api/rules` | 分流规则列表 / 新增 |
 | PUT/DELETE | `/api/rules/<id>` | 修改 / 删除规则 |
-| POST | `/api/rules/import` | `{url}` 或 `{text}` 批量导入域名列表（URL 实时下载，支持 anti-ad 等规则源） |
+| POST | `/api/rules/import` | `{url}` 或 `{text}` 批量导入域名列表（URL 实时下载，支持 anti-ad 等规则源；body 上限放宽到 16MB） |
+| POST/DELETE | `/api/rules/subscribe` | 新增 / 删除规则订阅（仅允许 `https://` 源） |
+| POST | `/api/rules/subscribe/update` | 手动立即重拉全部订阅 |
+| GET | `/api/cache/stats` | 缓存统计（`cache.summary()` + 条目数） |
 | POST | `/api/reprobe` | 一键重新测速：对所有启用上游并发实测延迟并写回配置 |
 | POST | `/api/restart` | 重启服务（systemd 托管用 `systemctl restart`；手动运行时 `os.execv` 重启自身） |
-| POST | `/api/reset` | 重置遥测计数与缓存 |
+| POST | `/api/reload` | 热重载配置（与 SIGHUP 等价，原子换配置引用，返回 changed 明细，无需重启） |
+| POST | `/api/reset` | 重置遥测计数与清空缓存 |
+| POST | `/api/profile` | cProfile 性能剖析采样 N 秒（默认 5，上限 30，返回 Top 25；仅 POST 触发） |
 | GET | `/api/logs?since=N` | 增量日志 |
 | GET | `/api/pipeline` | 流水线站点信息 |
-| GET | `/` `/index.html` `/echarts.min.js` | 控制台静态资源 |
+| GET | `/metrics` | Prometheus 文本指标（配置了 token 时同样需要认证） |
+| GET | `/` `/index.html` `/echarts.min.js` `/static/*` | 控制台静态资源 |
+
+> 配置了 `api.token` 时，除 `/api/health` 与静态资源外，所有 `/api/*` 与 `/metrics` 都需携带 token：
+>
+> ```bash
+> # 环回默认（未配 token）
+> curl -s http://127.0.0.1:8080/api/status
+> # 非环回 + 已配 token：三种等价认证头之一
+> curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8080/api/status
+> curl -s -H "X-Api-Key: <token>" http://127.0.0.1:8080/api/status
+> curl -s "http://127.0.0.1:8080/api/status?token=<token>"
+> ```
+
+### API 安全：CSRF / Token / 监听边界
+
+所有**状态变更类**请求（POST/PUT/DELETE）均做 CSRF 检查，判定顺序：
+
+1. 请求带 `Origin` / `Referer`：来源主机必须与服务监听地址一致，否则 **403**；
+2. 两者都没有（典型的非浏览器客户端，如 `curl`/脚本）：
+   - 若请求携带正确的 API Token（`Authorization: Bearer <token>` 或 `?token=`），放行；
+   - 否则仅当服务**只绑定在环回地址**（`127.0.0.1` / `::1` / `localhost`）时放行；
+3. 无 Token 且监听在非环回地址（如 `0.0.0.0:8080`）上、又无 `Origin`/`Referer` 的请求一律 **403**——浏览器表单/跨站请求总会带 `Origin` 或 `Referer`，此分支只拦非浏览器的直连写入。
+
+> **部署须知**：默认 `api.host=127.0.0.1`（仅环回，无 CSRF 攻击面，本机脚本/curl 不带凭据也可写）。若把 API 暴露到非环回地址（改 `api.host=0.0.0.0` 或具体 LAN IP），**务必**在配置中设置 `api.token`：此时非浏览器客户端（`curl`/脚本）在非环回监听下必须携带 `Authorization: Bearer <token>`（或 `X-Api-Key: <token>` / `?token=`）才能发起写操作，否则被 403 拒绝；浏览器控制台因自动带 `Origin` 不受影响。未设 Token 又暴露到非环回地址时，任何跨站网页都可能借浏览器发起 CSRF 写操作，属高风险。
 
 ---
 
 ## 7. 稳定性与运维
 
-- **systemd 托管**：`Restart=on-failure` + `TimeoutStopSec=15`。进程异常退出（含 SIGKILL/OOM 强杀）后约 3s 自动重启，重启后从磁盘载入持久化缓存、恢复分流规则/上游并重新排入预取队列；SIGTERM 优雅退出 1-3s 完成（退出时保存缓存）。
+- **systemd 托管（降权运行）**：服务以专用系统用户 `ebpdns`（nologin，install.sh 自动创建）运行，**不再以 root 常驻**；仅通过 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（+ `CapabilityBoundingSet` 同值）获得绑定 53 特权端口的能力。`/opt/ebpdns` 保持 `root:root` 只读，`/etc/ebpdns` 置 `ebpdns:ebpdns` 750（服务可读写配置/缓存），配合 `ProtectSystem=strict`（仅 `ReadWritePaths=/etc/ebpdns` 可写）、`NoNewPrivileges`、`PrivateTmp`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` 等沙箱硬化收敛攻击面。`Restart=on-failure` + `TimeoutStopSec=5`，崩溃循环保护（60s 内最多 5 次后进入 failed）。进程异常退出（含 SIGKILL/OOM 强杀）后约 3-5s 自动重启，重启后从磁盘载入持久化缓存、恢复分流规则/上游并重新排入预取队列；SIGTERM 优雅退出（正常 <10ms，trim 线程 join 超时 2s），退出时保存缓存。另装每日 04:30 低峰 `ebpdns-restart.timer` 做内存卫生兜底。
 - **优雅退出**：预取线程池 `cancel_futures` 取消积压、DoH/DoT 连接锁加超时、结果收集 `as_completed` 加超时兜底，高负载下 stop 不再卡死。
 - **上游熔断**：连续失败达阈值（默认 3 次）临时跳过该上游 30s，防单个故障上游拖垮 miss 查询（配置 `circuit_fails` / `circuit_open_s`）。
-- **DoS 防御**：UDP miss 队列有界信号量（池满丢弃、客户端自动重试）；`decode_name` 压缩指针 32 跳上限；应答上限 8 条 + TC 位。
+- **DoS 防御**：UDP miss 队列有界信号量（池满丢弃、客户端自动重试）；`decode_name` 压缩指针 32 跳上限；应答上限 8 条 + TC 位；客户端 EDNS bufsize 钳制到 `edns_client_max_size`（默认 1232）。
+- **接收循环致命错误**：UDP socket 连续 20 次接收错误时，不再直接 `os._exit` 丢弃内存状态——先触发缓存持久化落盘再以非零码退出，由 systemd `Restart=on-failure` 重启，最多丢失一个保存周期（60s）内的缓存/预取状态。
 
 ---
 
@@ -264,7 +305,8 @@ sudo ip link set dev eth0 xdp off   # 卸载
 ## 10. 本地开发 / 测试
 
 ```bash
-# 单元测试
+# 单元测试（两种等价方式）
+make test
 python3 -m unittest discover -s tests
 # 部署自检
 python3 deploy-test/errcheck.py     # 错误检查（协议/边界/fuzz/API/并发）
@@ -301,7 +343,7 @@ ebpdns/
 │   └── api.py              # HTTP JSON API + 静态服务
 ├── web/index.html          # 控制台（双模式，ECharts 本地化）
 ├── bpf/                    # 可选 eBPF XDP 内核旁路（参考实现，未集成）
-├── systemd/ebpdns.service  # systemd 单元（Restart=on-failure, TimeoutStopSec=15）
+├── systemd/ebpdns.service  # systemd 单元（ebpdns 降权用户 + CAP_NET_BIND_SERVICE，Restart=on-failure, TimeoutStopSec=5）
 ├── etc/ebpdns.conf.json    # 配置模板
 ├── install.sh              # 安装脚本
 ├── deploy-test/            # 部署自检：errcheck.py + bench.py
@@ -320,6 +362,19 @@ ebpdns/
 ---
 
 ## 13. 版本历史（要点）
+
+- **v1.9.141**：文档与行为对齐，收敛近期多项加固与新功能（本节按现状补记）。
+  - **上游 weight 加权轮询**：上游选择排序 key = 实测延迟 `eff_lat / max(1.0, weight)`；`weight` 默认 1，范围 0–1000、支持小数（<1 按 1 计）。前端上游行「高级选项」列已加权重输入框。
+  - **上游级 `allow_private_ip`**：默认 `false`（私网 IP 仍受全局 `rebind_protection` 丢弃）；某上游返回内网/私有地址确为合法（自建内网解析）时，在上游级显式置 `true` 豁免。
+  - **上游级 `doh_strict_cert` / `dot_strict_cert`**：默认 `true`（严格证书链 + SAN/主机名校验，不匹配直接失败）；字段缺失/None 保持严格，只有显式 `false` 才允许降级。分别作用于 DoH/DoH3 与 DoT。
+  - **`edns_client_max_size`**：客户端侧 EDNS UDP bufsize 钳制（默认 1232，范围 512–65535），超限应答置 TC 走 TCP，防开放解析器放大攻击。
+  - **EDNS Padding 128B 整条对齐（RFC 8467）**：`padding=true` 时对发往加密上游（DoH/DoT/DoQ/DoH3）的出站查询按 128 字节块对齐整条 DNS 消息（上限 512B），抹平长度指纹；不填充明文 UDP/TCP 响应。
+  - **CNAME 链 owner name 修正**：CNAME 链展开后落缓存/回包的 A/AAAA RR 的 owner name 为 CNAME 目标域名（而非查询域名），符合 RFC 1034。
+  - **NXDOMAIN quorum（`nxdomain_quorum`，默认 2）**：多上游需达 quorum 个一致 NXDOMAIN 才判域名不存在，防单个上游撒谎；quorum 自动钳到实际健康上游数，置 1 恢复旧行为。
+  - **正则三态 fail-closed**：屏蔽规则正则匹配异常/超时时按「命中」处理（fail-closed，安全方向），不在 ReDoS 窗口内被绕过。
+  - **CSRF 策略收敛**：API 请求无 `Origin`/`Referer` 时，仅当携带有效 token **或** API 绑定在环回地址（`127.0.0.1`/`::1`/`localhost`）才放行；非浏览器客户端在非环回监听下必须带 token，否则 403。
+  - **systemd 降权**：服务改由专用系统用户 `ebpdns`（nologin）运行，仅授 `CAP_NET_BIND_SERVICE` 绑定 53，配合整套沙箱硬化（`ProtectSystem=strict` 等）。
+  - 文档同步：配置默认值改回真实代码（`listen` 默认 `127.0.0.1:53`/`[::1]:53`、`api.host` 默认 `127.0.0.1`）、补全 API 端点表与 token 示例、修正 `EBPDNS_CONFIG` 拼写与 `TimeoutStopSec=5`。
 
 - **v1.9.47**：**响应 IP 合法性校验（防 DNS 劫持/rebinding）**。上游返回的 A/AAAA 若为私有/保留/环回地址（10.x/192.168.x/127.x/169.254.x/fc00::/7 等）自动丢弃，全部答案均为私有 IP 时返回 NODATA；forceIp 规则豁免。配置项 `rebind_protection`（默认开启），前端可开关。
 

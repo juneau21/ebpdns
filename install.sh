@@ -96,6 +96,18 @@ else
 fi
 
 
+# ---------- 创建运行用户 ebpdns ----------
+# systemd 以专用系统用户 ebpdns 运行服务(配合 User=ebpdns/Group=ebpdns)。
+# 该用户无需登录 shell(nologin), 仅用于降权运行; home 指向代码目录 /opt/ebpdns。
+# 不创建会导致 systemd 启动报 "Failed to determine user credentials"。
+if ! getent group ebpdns >/dev/null 2>&1; then
+  groupadd --system ebpdns
+fi
+if ! id -u ebpdns >/dev/null 2>&1; then
+  useradd --system --gid ebpdns --home-dir /opt/ebpdns --shell /usr/sbin/nologin ebpdns
+  echo "==> 已创建系统用户 ebpdns (运行服务, 无登录 shell)"
+fi
+
 # ---------- 1/4 代码就位 ----------
 IN_PLACE=0
 if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
@@ -113,6 +125,10 @@ if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
       exit 1
     fi
   done
+  # 就地安装: 包就在 /opt/ebpdns, 仍清理构建缓存(__pycache__/*.pyc),
+  # 与异地 rsync/cp 分支行为对齐, 避免陈旧字节码随升级残留。
+  find "${INSTALL_DIR}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+  find "${INSTALL_DIR}" -name '*.pyc' -delete 2>/dev/null || true
 else
   echo "==> 1/4 复制代码到 ${INSTALL_DIR}"
   # P2-26(第九轮审查): 异地安装前, 若发布包附带 SHA256SUMS, 先校验文件完整性。
@@ -127,19 +143,29 @@ else
   fi
   mkdir -p "${INSTALL_DIR}"
   if command -v rsync >/dev/null 2>&1; then
-    # v1.9.76: 去掉 --delete。旧 --delete 会把 INSTALL_DIR 里用户自有的本地文件
-    # (rules_local.json / 缓存持久化 / 备份)随升级一并删除, 危险。改为只覆盖拷贝。
-    # v1.9.80: 去掉末尾 || true, rsync 失败必须立即中止(磁盘满/权限不足), 否则
-    # 后续 systemd 启动报 ModuleNotFoundError 且日志看不到根因。
+    # v1.9.90: --delete 重新引入, 但仅按纯代码子目录逐项加 --delete(尾斜杠语义),
+    # 清理上一版本已删除的陈旧 .py/入口文件, 避免升级后残留死模块被误导入。
+    # 不做整目录 --delete: 用户数据目录是独立的 /etc/ebpdns(rules_local.json/cache.json),
+    # 不在 ${INSTALL_DIR} 内, 天然不受影响; bpf/ 与 etc/(配置模板)按覆盖拷贝, 不加 --delete。
+    # v1.9.80: rsync 失败必须立即中止(磁盘满/权限不足), 不带 || true。
+    for _d in bin ebpdns web systemd; do
+      rsync -a --delete --ignore-missing-args \
+        --exclude='*.pyc' --exclude='__pycache__' \
+        "${SRC_DIR}/${_d}/" "${INSTALL_DIR}/${_d}/"
+    done
     rsync -a --ignore-missing-args \
       --exclude='*.pyc' --exclude='__pycache__' --exclude='tools' \
       --exclude='deploy-test' --exclude='tests' \
-      "${SRC_DIR}/bin" "${SRC_DIR}/ebpdns" "${SRC_DIR}/web" \
-      "${SRC_DIR}/bpf" "${SRC_DIR}/etc" "${SRC_DIR}/systemd" \
+      "${SRC_DIR}/bpf" "${SRC_DIR}/etc" \
       "${SRC_DIR}/README.md" "${SRC_DIR}/LICENSE" \
       "${INSTALL_DIR}/"
   else
-    # rsync 不可用 → 退回 cp(不 rm -rf, 保留用户本地文件)
+    # rsync 不可用 → 退回 cp。纯代码子目录(bin/ebpdns/web/systemd)先删旧再拷,
+    # 对齐 rsync --delete: 清除上版本已删除的陈旧 .py/入口文件。bpf/etc(模板)按覆盖拷贝。
+    # 用户数据目录 /etc/ebpdns 独立于 ${INSTALL_DIR}, 不受影响。
+    for _d in bin ebpdns web systemd; do
+      rm -rf -- "${INSTALL_DIR:?}/${_d}"
+    done
     mkdir -p "${INSTALL_DIR}"/bin "${INSTALL_DIR}"/ebpdns "${INSTALL_DIR}"/web \
              "${INSTALL_DIR}"/bpf "${INSTALL_DIR}"/etc "${INSTALL_DIR}"/systemd
     cp -r "${SRC_DIR}"/bin "${SRC_DIR}"/ebpdns "${SRC_DIR}"/web \
@@ -160,6 +186,11 @@ chmod +x "${INSTALL_DIR}/bin/ebpdns"
 # 改为显式 WARN(非致命, root 仍可读既有 root 文件), 不再静默。
 chown -R root:root "${INSTALL_DIR}" 2>/dev/null \
   || echo "[WARN] chown ${INSTALL_DIR} 失败(只读挂载/NFS root-squash?), 请人工确认文件属主为 root"
+# M2 修复: 降权后服务以 ebpdns 用户运行, 需读 /opt/ebpdns/web/ 下的静态控制台资源。
+# 源码包中 index.html 等可能是 600(root:root), chown -R root:root 后 ebpdns 无权读,
+# 会导致控制台静态资源 404。补一条目录 755 / 静态文件 644, 保证 ebpdns(及其它用户)可读。
+chmod 755 "${INSTALL_DIR}/web" 2>/dev/null || true
+chmod 644 "${INSTALL_DIR}/web/"*.{html,js,css,svg,png,ico} 2>/dev/null || true
 
 # ---------- 2/4 生成配置 ----------
 echo "==> 2/4 生成配置 ${CONF_DIR}/config.json"
@@ -186,15 +217,20 @@ if [[ ! -f "${CONF_DIR}/config.json" ]]; then
     #          DNS 默认仅本机; 需局域网 DNS/控制台访问时用户显式把 api.host/listen 改为 0.0.0.0。
     # R10 P2: Python 布尔字面量必须大写 True/False, 小写 true 会触发 NameError: name 'true' is not defined。
     echo "    (未找到配置模板, 写入最小默认配置)"
-    python3 -c 'import json; json.dump({"listen":{"udp":"127.0.0.1:53","tcp":"127.0.0.1:53"},"api":{"host":"127.0.0.1","port":8080},"upstreams":[{"id":"ali","name":"AliDNS","proto":"udp","addr":"223.5.5.5","port":53,"url":"","group":"domestic","latency":8,"enabled":True}]}, open("'"${CONF_DIR}/config.json"'","w"), ensure_ascii=False, indent=2)' || { echo "错误: 写入兜底配置失败" >&2; exit 1; }
+    python3 -c 'import json; json.dump({"listen":{"udp":"127.0.0.1:53","tcp":"127.0.0.1:53"},"api":{"host":"127.0.0.1","port":8080},"upstreams":[{"id":"ali","name":"AliDNS","proto":"udp","addr":"223.5.5.5","port":53,"url":"","group":"domestic","latency":5000,"enabled":True}]}, open("'"${CONF_DIR}/config.json"'","w"), ensure_ascii=False, indent=2)' || { echo "错误: 写入兜底配置失败" >&2; exit 1; }
   fi
   echo "    (新配置已创建, 请按需编辑上游/端口/规则)"
 else
   echo "    (已存在配置, 保留不动)"
 fi
-# P3-5(R3 修复): 同上, chown 失败显式 WARN 而非静默 `|| true`。
-chown -R root:root "${CONF_DIR}" 2>/dev/null \
-  || echo "[WARN] chown ${CONF_DIR} 失败(只读挂载/NFS root-squash?), 请人工确认配置属主为 root"
+# P3-5(R3 修复): chown 失败显式 WARN 而非静默 `|| true`。
+# v1.9.90: 服务现以 ebpdns 用户运行(systemd User=ebpdns), 配置目录需读写(含
+# cache.json/rules_sub.json/rules_local.json 落盘), 故属主改 ebpdns:ebpdns,
+# 目录权限 750(仅 ebpdns 与 root 可读/进入), config.json 保持 640。
+chown -R ebpdns:ebpdns "${CONF_DIR}" 2>/dev/null \
+  || echo "[WARN] chown ${CONF_DIR} 失败(只读挂载/NFS root-squash?), 请人工确认配置属主为 ebpdns"
+chmod 750 "${CONF_DIR}" \
+  || echo "[WARN] chmod 750 ${CONF_DIR} 失败(只读挂载?), 请人工确认配置目录权限为 750"
 # v1.9.76: chmod 前判存在, 防模板缺失且 python 落盘失败时 chmod 报错中断安装
 # v7 P2-4: 644(全局可读)→640(仅 root 可读/组可读), 配置含上游地址/订阅链接, 不应全局可读
 # R31 P3-1: 与上方 chown 显式 WARN 风格对齐。文件不存在时条件已判静默跳过;

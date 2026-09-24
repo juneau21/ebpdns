@@ -19,7 +19,10 @@
   "ipv4_first": true,
   "ipv6": true,
   "edns": true,
+  "edns_udp_size": 1232,
+  "edns_client_max_size": 1232,
   "edns_client_subnet": null,
+  "padding": false,
   "hook": "XDP 原生",
   "map_type": "LRU_HASH",
   "percpu": true,
@@ -37,7 +40,11 @@
       "group": "domestic",
       "latency": 5000,
       "enabled": true,
-      "latency_measured": false
+      "latency_measured": false,
+      "weight": 1,
+      "allow_private_ip": false,
+      "doh_strict_cert": true,
+      "dot_strict_cert": true
     },
     {
       "id": "dnspod-doh3",
@@ -312,5 +319,5 @@
       "group": "global"
     }
   ],
-  "speed_timeout_ms": 80
+  "speed_timeout_ms": 300
 }

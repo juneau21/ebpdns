@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import http.client
+import signal
 import socket as _socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -145,9 +146,12 @@ def _validate_upstream_dict(u):
     # R19 P3-3: 布尔字段归一化——bulk 路径此前只校验不归一, 字符串 "false"/"0"
     # 被原样落库(字符串 "false" 是真值), 与单条 PUT 路径 _as_bool 归一不一致。
     # 在全部校验通过后就地归一(函数入参 u 是引用, 修改后调用方 deep_merge 生效)。
+    # R-review P-low: strict_cert 畸形值兜底方向改为 True(安全方向), 与运行时
+    # upstream.py up.get("doh_strict_cert", True) 缺省一致。显式传畸形值("maybe")
+    # 不应比不传更不安全(关闭严格校验)。allow_private_ip 缺省 False 是安全方向, 保持不变。
     for _bk, _bd in (("allow_private_ip", False),
-                     ("doh_strict_cert", False),
-                     ("dot_strict_cert", False)):
+                     ("doh_strict_cert", True),
+                     ("dot_strict_cert", True)):
         if _bk in u:
             u[_bk] = _as_bool(u[_bk], _bd)
     return None
@@ -374,6 +378,31 @@ def _as_bool(v, default=True):
     return bool(v)
 
 
+def _upstream_optional_fields(body):
+    """M4 修复: POST /api/upstreams 新建时, 从 body 提取 weight /
+    allow_private_ip / doh_strict_cert / dot_strict_cert 四个可选字段, 校验+归一
+    与 PUT 单条编辑白名单(_UPSTREAM_WHITELIST)完全同型。此前构造 u dict 时只挑
+    id/proto/addr/port/url/group/latency/latency_measured/enabled, body 中这四个
+    字段被静默丢弃。返回 (fields, err): fields 仅含 body 显式提供的键; err 非 None
+    表示校验失败(调用方应 400)。"""
+    fields = {}
+    w = body.get("weight")
+    if w is not None:
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            return None, "weight 必须是数字 (不能是布尔值)"
+        if not (0 <= w <= 1000):
+            return None, "weight 必须在 0-1000 之间 (got %r)" % (w,)
+        fields["weight"] = w
+    # R-review P-low: strict_cert 畸形值兜底 True(安全方向), 与运行时缺省一致;
+    # allow_private_ip 缺省 False(不过滤豁免)保持不变。
+    for bk, bd in (("allow_private_ip", False),
+                   ("doh_strict_cert", True),
+                   ("dot_strict_cert", True)):
+        if bk in body:
+            fields[bk] = _as_bool(body.get(bk), bd)
+    return fields, None
+
+
 def _sub_url_blocked(url):
     """SSRF 防护: 解析订阅 URL 的主机名, 拒绝指向私有/环回/链路本地地址。
     解析出的任何一个 IP 命中即拒绝(防止 DNS rebinding 到内网)。
@@ -572,6 +601,13 @@ class AppContext:
         self.dns_server = dns_server
         self.resolver_holder = resolver_holder  # 若解析器可热重建，放这里
         self._lock = threading.Lock()
+        # S1 修复: systemd 托管时 /api/restart 无法以专用用户 `systemctl restart`
+        # (polkit 拒绝非 root restart 系统 unit)。改为进程自退出: 触发 SIGTERM 走现有
+        # 优雅收尾(缓存落盘/停 server/停池), 再以非零退出码退出——unit 为
+        # Restart=on-failure, 非零退出码才会被 systemd 拉起新实例。正常退出码 0
+        # (SIGTERM 自然终止)不会触发 on-failure 重启。此属性由 restart() 在 systemd
+        # 分支置 3, cli.py 收尾时读取并作为 os._exit 码。
+        self.restart_exit_code = 0
 
     def reload(self):
         """热重载入口(H-2): 全程持 self._lock, 与 _api_update_config 串行化,
@@ -701,22 +737,30 @@ class AppContext:
     def restart(self):
         """重启 daemon 服务。
 
-        systemd 托管时调用 `systemctl restart ebpdns`（systemd 先 SIGTERM 当前
-        进程再拉起新实例）；手动运行时用 os.execv 以相同参数替换自身进程
+        systemd 托管时不再调用 `systemctl restart ebpdns`(v1.9.137 起服务以专用用户
+        ebpdns 运行, 默认 polkit 拒绝非 root 用户 restart 系统 unit, 且 Popen 不查返回码
+        导致静默失败、服务从未重启)。改为进程自退出: 置非零退出码后向自身发 SIGTERM,
+        由现有 SIGTERM handler 走优雅收尾(缓存落盘/停 server/停池), 最终以非零码退出;
+        unit 为 Restart=on-failure, 非零退出码触发 systemd 拉起新实例, 达成重启效果。
+        手动运行时用 os.execv 以相同参数替换自身进程
         （Python socket 默认 CLOEXEC，exec 后端口自动释放可重新 bind）。
         本方法在调用方线程中执行，调用前应先返回 HTTP 响应（延迟触发）。
         """
         # systemd 托管检测：INVOCATION_ID / JOURNAL_STREAM 由 systemd 注入
         if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
+            # 置非零退出码(3): cli.py 收尾 os._exit 读取, 使 on-failure 重启生效。
+            # SIGTERM 由 Python 投递到主线程, 现有 handler 置 stop 事件触发完整优雅清理;
+            # 清理完毕进程退出(码 3), systemd Restart=on-failure 拉起新实例。
+            log.info("检测到 systemd 托管, 进程自退出以触发重启 (exit code 3 → on-failure)")
+            self.restart_exit_code = 3
             try:
-                subprocess.Popen(
-                    ["systemctl", "restart", "ebpdns"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                return
-            except Exception:
-                pass
+                os.kill(os.getpid(), signal.SIGTERM)
+            except Exception as e:
+                # 兜底: 发信号失败则直接非零退出(跳过优雅清理, 但保证 systemd 能拉起)。
+                log.warning("自退出 SIGTERM 投递失败(%r), 直接 os._exit(3)", e)
+                os._exit(3)
+            # 主线程正在收尾, 本后台线程让出; 进程即将退出, 无需后续动作。
+            return
         # 手动运行兜底：exec 替换自身。
         # 不依赖 sys.argv(可能是相对路径/无 -m 前缀), 用绝对路径重建命令:
         #   python3 -m ebpdns run --config <绝对路径>
@@ -1026,8 +1070,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not host:
             host = str((self.app.cfg.get("api") or {}).get("host") or "")
         host = host.strip().lower()
-        return (host in ("localhost",) or host.startswith("127.")
-                or host in ("::1", "[::1]"))
+        # M6 修复: 原判定只认 localhost / 127. 前缀 / ::1 / [::1], 不认展开 IPv6
+        # 写法(如 0:0:0:0:0:0:0:1)与其它 127/8 地址。统一走 ipaddress.is_loopback,
+        # 覆盖全部 127/8 与 ::1 的各种形式; 解析失败(主机名)再回退 localhost 字符串匹配。
+        if host in ("localhost", "localhost."):
+            return True
+        # 去掉 IPv6 字面量外层方括号([::1] → ::1)再解析。
+        _norm = host
+        if _norm.startswith("[") and _norm.endswith("]"):
+            _norm = _norm[1:-1]
+        try:
+            return ipaddress.ip_address(_norm).is_loopback
+        except ValueError:
+            return False
 
     def _check_api_token(self):
         """P2-24: 可选 API token 认证。配置了 api.token(非空)时, 校验请求头
@@ -1135,6 +1190,13 @@ class _Handler(BaseHTTPRequestHandler):
             # 逐条规则已独立存储(rules_local.json): 返回配置时注入, 前端直接展示
             # P3: 纯读 GET 不触发惰性补 id 落盘(避免只读请求在锁外写盘)。
             cfg_out = dict(self.app.cfg)
+            # M1 修复: 脱敏 api.token——浅拷贝后原样返回会把明文 token 暴露给任何
+            # 能 GET 该端点的调用方。复制 api 子表后, 非空 token 替换为 "***"。
+            # PUT /api/config 收到 "***" 时在 _api_update_config 中识别并忽略, 不覆盖原值。
+            if "api" in cfg_out:
+                cfg_out["api"] = dict(cfg_out["api"])
+                if cfg_out["api"].get("token"):
+                    cfg_out["api"]["token"] = "***"
             cfg_out["rules"] = self._local_rules(persist=False)
             return self._send(200, cfg_out)
         if path == "/api/config" and method == "PUT":
@@ -1226,7 +1288,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _snapshot(self):
         s = self.app.telemetry.snapshot()
         # /api/snapshot 快照轮询: events 截断为最近 20 条避免 500 条全量序列化
-        # (完整实时日志走 /api/logs 增量拉取, 前端不消费 snapshot.events)
+        # (完整实时日志走 /api/logs 增量拉取, 前端不消费 snapshot.events)。
+        # 低级别评审结论: 该字段前端虽不消费, 但外部脚本/API 使用者可能依赖其存在,
+        # 删除有兼容性风险, 故保留截断而非移除字段, 仅在此注释说明。
         s["events"] = s["events"][-20:]
         # R35 P3-1: 与 /api/cache/stats 同型包裹 cache.summary(), 失败时回退空 dict。
         try:
@@ -1234,6 +1298,9 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             s["map"] = {}
         s["upstreams"] = self._upstreams_with_health()
+        # 低级别评审结论: config_snippet 这组字段前端控制台不消费(前端走独立的
+        # /api/config), 但外部脚本/API 使用者可能依赖该结构做配置概览, 移除有兼容性
+        # 风险, 故保留, 仅在此注释说明"前端不消费, 保留供外部 API 使用"。
         s["config_snippet"] = {
             "hook": self.app.cfg.get("hook"),
             "map_type": self.app.cfg.get("map_type"),
@@ -1366,7 +1433,7 @@ class _Handler(BaseHTTPRequestHandler):
             def _watchdog():
                 time.sleep(30.0)
                 _RESTART_STARTED.clear()
-                log.info("重启看门狗: 进程仍存活(疑似 systemctl 未生效), 已清除 _RESTART_STARTED 允许再次重启")
+                log.info("重启看门狗: 进程仍存活(疑似自退出信号未投递/优雅清理卡死), 已清除 _RESTART_STARTED 允许再次重启")
             threading.Thread(target=_watchdog, daemon=True, name="svc-restart-watchdog").start()
         threading.Thread(target=_do, daemon=True, name="svc-restart").start()
         return self._send(200, {"ok": True, "restarting": True})
@@ -1459,6 +1526,12 @@ class _Handler(BaseHTTPRequestHandler):
                    and k not in _RUNTIME_KEYS
                    and k not in _SERVER_KEYS]
         data = {k: v for k, v in data.items() if k in _CFG_WRITABLE_KEYS}
+        # M1 防御: GET /api/config 已把 api.token 脱敏为 "***" 回传前端。若前端原样
+        # 回传保存, 白名单(_CFG_WRITABLE_KEYS 排除了 api)本就会丢弃整个 api 子表; 此处
+        # 再显式剥一次 "***" 哨兵, 防止未来把 api 纳入可写键时误把脱敏占位符当真 token
+        # 覆盖落盘(导致重启后 token 变成字面量 "***")。
+        if isinstance(data.get("api"), dict) and data["api"].get("token") == "***":
+            data["api"] = {k: v for k, v in data["api"].items() if k != "token"}
         # 防御: cache_size 仅在请求中显式传入时校验; 未传则保留现有值。
         # 显式 null/非整数/越界均拒绝, 否则后续 int(None) 崩溃或容量被静默清空。
         if "cache_size" in data:
@@ -1860,6 +1933,11 @@ class _Handler(BaseHTTPRequestHandler):
                 "latency_measured": False,
                 "enabled": _as_bool(body.get("enabled", True)),
             }
+            # M4: 透传 weight/allow_private_ip/doh_strict_cert/dot_strict_cert
+            _opt, _err = _upstream_optional_fields(body)
+            if _err:
+                return self._send(400, {"error": _err})
+            u.update(_opt)
             saved = None
             with self.app._lock:
                 cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
@@ -1931,6 +2009,11 @@ class _Handler(BaseHTTPRequestHandler):
             "latency_measured": False,
             "enabled": _as_bool(body.get("enabled", True)),
         }
+        # M4: 透传 weight/allow_private_ip/doh_strict_cert/dot_strict_cert
+        _opt, _err = _upstream_optional_fields(body)
+        if _err:
+            return self._send(400, {"error": _err})
+        u.update(_opt)
         saved = None
         with self.app._lock:
             cfg = self.app.cfg   # 重新取最新引用, 防止持旧 cfg 覆盖并发更新
@@ -2066,9 +2149,12 @@ class _Handler(BaseHTTPRequestHandler):
                 if k == "allow_private_ip":
                     v = _as_bool(v, False)
                 # R12 P2: doh_strict_cert/dot_strict_cert 与 allow_private_ip 同型,
-                # 宽松 bool 归一(字符串 "true"/"1" → True, 默认 False 保持兼容)。
+                # 宽松 bool 归一(字符串 "true"/"1" → True)。
+                # R-review P-low: 兜底 True(安全方向)——畸形值("maybe"/[])解析失败时
+                # 保持严格证书校验, 与运行时 upstream.py up.get(..., True) 缺省一致;
+                # 显式传畸形值不应比不传更不安全。
                 if k in ("doh_strict_cert", "dot_strict_cert"):
-                    v = _as_bool(v, False)
+                    v = _as_bool(v, True)
                 if k == "proto" and str(v).lower() not in _ALLOWED_UPSTREAM_PROTO:
                     return self._send(400, {"error": "proto 必须是 %s 之一" % "/".join(sorted(_ALLOWED_UPSTREAM_PROTO))})
                 # P3-2(R4-S6): addr 字符集校验——复用 _valid_host, 拒绝含空格/分号/引号等

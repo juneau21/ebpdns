@@ -11,13 +11,14 @@ import time
 # 默认配置（与前端控制台语义对齐）
 DEFAULTS = {
     "listen": {
-        "udp": "0.0.0.0:53",
-        "tcp": "0.0.0.0:53",
-        # IPv6 默认监听 [::]:53（与 IPv4 双栈同时提供服务）。无 IPv6 栈的环境
-        # server.py 绑定失败仅告警跳过, 不影响 IPv4。仅需本机服务时可显式改为
-        # "[::1]:53"；不希望监听 IPv6 时显式置 null。
-        "udp6": "[::]:53",   # IPv6 UDP 监听(默认全部接口; 可改 "[::1]:53" 或 null)
-        "tcp6": "[::]:53",   # IPv6 TCP 监听(默认全部接口; 可改 "[::1]:53" 或 null)
+        # v1.9.90: 裸跑(无 config.json)默认仅监听回环, 与 etc/ebpdns.conf.json 模板对齐,
+        # 避免无配置时意外把 DNS 暴露到全网卡。需局域网提供 DNS 时用户显式改为 0.0.0.0。
+        "udp": "127.0.0.1:53",
+        "tcp": "127.0.0.1:53",
+        # IPv6 默认监听回环 [::1]:53(与模板一致)。无 IPv6 栈的环境 server.py 绑定失败
+        # 仅告警跳过, 不影响 IPv4。不希望监听 IPv6 时显式置 null; 需全网卡可改 "[::]:53"。
+        "udp6": "[::1]:53",   # IPv6 UDP 监听(默认回环; 可改 "[::]:53" 或 null)
+        "tcp6": "[::1]:53",   # IPv6 TCP 监听(默认回环; 可改 "[::]:53" 或 null)
     },
     "api": {
         "host": "127.0.0.1",   # API 监听地址, 默认仅本机回环(天然安全, 无需 token)
@@ -262,10 +263,25 @@ def parse_upstream_addr(raw, proto_sel=None):
         if proto in ("doh", "doh3", "doq"):
             url = p if p.startswith("/") else "/" + p
         host = host[:slash]
-    # 端口切分: 先排除裸 IPv6 字面量(含多个冒号且未用方括号包裹),
-    # 否则 rfind(":") 会把 2606:4700::1 的末段 ":1" 误切为 port=1。
-    # 裸 IPv6 整体作为 host, 不切端口; 带方括号形式 [v6]:port 由 _host_port 解析。
-    if not (host.count(":") > 1 and not host.startswith("[")):
+    # 端口切分, 三类 host:
+    #   1) 带方括号的完整 IPv6 字面量 "[v6]" / "[v6]:port":
+    #      - 裸 "[v6]"(右括号后无 :port) → 整体作为 host, 用默认端口。此前靠 rfind(":")
+    #        后 host[colon+1:] 含 "]" 不 isdigit() 而"侥幸"不切, 属脆弱启发式; 现显式识别。
+    #      - "[v6]:port" → 切出 port, host 保留 "[v6]"。
+    #   2) 裸 IPv6(多冒号且未用方括号, 如 "::1"/"2001:db8::1"): 整体作为 host, 不切,
+    #      否则 rfind(":") 会把末段 ":1" 误切为 port=1。
+    #   3) 普通 host: "host:port" → 切 port。
+    if host.startswith("["):
+        _rb = host.find("]")
+        if _rb > 0:
+            _after = host[_rb + 1:]
+            if _after == "":
+                pass  # 裸 [v6] 无端口, 保留默认端口
+            elif _after.startswith(":") and _after[1:].isdigit():
+                port = int(_after[1:])
+                host = host[:_rb + 1]
+            # 其余([v6] 后非法后缀)保持原样, 交由下方畸形拦截
+    elif host.count(":") <= 1:
         colon = host.rfind(":")
         if colon > 0 and host[colon + 1:].isdigit():
             port = int(host[colon + 1:])
@@ -334,17 +350,20 @@ _NUM_RANGES = {
     "timeout_ms": (1, 60000),
     # P3-9: 删除从未使用的顶层 "port" 键(顶层配置无 port, port 仅嵌套在上游/api 内,
     # 由 parse_upstream_addr 与 _validate_upstream_dict 分别校验)。
-    "health_check_interval": (0, None),
+    # v1.9.90: 周期类字段加一周上限(604800=7*86400), 防止手编超大值让健康检查/
+    # 测速/规则订阅形同关闭(永远不再触发)。health_check_interval/rule_sub_interval 单位
+    # 为秒, speed_interval_ms 为毫秒(604800ms≈10min, 测速间隔过长即失去择优意义)。
+    "health_check_interval": (0, 604800),
     "max_parallel_upstreams": (1, 16),
     "stale_ttl": (0, None),
     "persist_ttl": (0, 31_536_000),
-    "speed_interval_ms": (0, None),
+    "speed_interval_ms": (0, 604800),
     "speed_timeout_ms": (1, 60000),
     # 客户端侧 EDNS bufsize 上限: 最小 512(经典 DNS), 最大 65535
     "edns_client_max_size": (512, 65535),
     "edns_udp_size": (512, 9000),
     "health_probe_timeout_ms": (100, 60000),
-    "rule_sub_interval": (0, None),
+    "rule_sub_interval": (0, 604800),
     # v1.9.89 P3-1(第八轮): 补齐 circuit breaker / IP 速度缓存 TTL 的数值范围校验
     "circuit_fails": (1, 100),
     "circuit_open_s": (1, 86400),
@@ -359,6 +378,10 @@ _ENUM_VALUES = {
     # _BOOL_KEYS 会导致每次启动把用户值回退为默认 "both" 并刷一条告警。
     "ip_speed_probe": {"udp53", "tcp443", "both"},
 }
+# v1.9.90: map_type 合法值(保留大写, 不进 _ENUM_VALUES——该表会 v.lower() 归一,
+# 会把 "LRU_HASH" 错写成 "lru_hash")。当前 Python 态仅作语义标记/控制台展示,
+# 合法值对齐 BPF map 类型命名: LRU_HASH(默认)/LRU/LPM_TRIE。
+_MAP_TYPES = frozenset(("LRU_HASH", "LRU", "LPM_TRIE"))
 # 布尔字段
 _BOOL_KEYS = {
     "prefetch", "serve_stale", "kernel_direct", "speed_test", "fallback",
@@ -376,6 +399,34 @@ def _fallback(cfg, key):
 # v7 P2-2: rule_subscriptions[] 合法 action 枚举(与 api._RULE_ACTIONS 一致)。
 # config.py 不导入 api.py(循环依赖), 在此独立维护一份轻量校验。
 _RULE_SUB_ACTIONS = ("allow", "block", "group", "forceIp")
+
+# M1: upstreams[] 合法 proto 枚举。与 UP_PORT_DEFAULT / parse_upstream_addr 支持的
+# 协议集合对齐(udp/tcp/doh/dot/doh3/doq); 不在此集合的上游配置期跳过, 不进 resolver。
+_UPSTREAM_PROTOCOLS = frozenset(("udp", "tcp", "doh", "dot", "doh3", "doq"))
+
+
+def _validate_upstream_item(item):
+    """轻量校验单个 upstreams[] 项(加载期/热重载)。
+    检查: 必须是 dict; proto 在 _UPSTREAM_PROTOCOLS 内; port 为 int(非 bool)且
+    1..65535; addr/id 为非空字符串。返回 True=通过, False=非法(调用方跳过)。
+    不抛异常, 不中断启动。与 _validate_rule_subscription_item 同型。"""
+    if not isinstance(item, dict):
+        return False
+    if item.get("proto") not in _UPSTREAM_PROTOCOLS:
+        return False
+    port = item.get("port")
+    # bool 是 int 子类, int(True)==1 会穿透到合法端口; 显式拒绝(与 _NUM_RANGES 同型)。
+    if isinstance(port, bool) or not isinstance(port, int):
+        return False
+    if not (1 <= port <= 65535):
+        return False
+    addr = item.get("addr")
+    if not isinstance(addr, str) or not addr.strip():
+        return False
+    _id = item.get("id")
+    if not isinstance(_id, str) or not _id.strip():
+        return False
+    return True
 
 
 def _validate_rule_subscription_item(item):
@@ -420,6 +471,16 @@ def _validate_cfg(cfg):
             _fallback(cfg, key)
             continue
         cfg[key] = iv
+    # M4: ttl_min/ttl_max 交叉一致性。默认 0=不限制; 两者均启用(非 0)却 min>max 时,
+    # 自动交换并告警(比回退默认更友好, 保留用户意图: 只是上下限写反了)。此处位于
+    # 数值范围循环之后, ttl_min/ttl_max 已被钳为合法 int, 仅需判大小。
+    _tmin = cfg.get("ttl_min", 0)
+    _tmax = cfg.get("ttl_max", 0)
+    if (isinstance(_tmin, int) and isinstance(_tmax, int)
+            and not isinstance(_tmin, bool) and not isinstance(_tmax, bool)
+            and _tmin and _tmax and _tmin > _tmax):
+        logging.warning("ttl_min(%d) > ttl_max(%d), 已自动交换两者", _tmin, _tmax)
+        cfg["ttl_min"], cfg["ttl_max"] = _tmax, _tmin
     for key, allowed in _ENUM_VALUES.items():
         if key not in cfg:
             continue
@@ -433,6 +494,31 @@ def _validate_cfg(cfg):
             continue
         if not isinstance(cfg.get(key), bool):
             _fallback(cfg, key)
+    # v1.9.90: map_type 枚举校验(保留大小写, 不进 _ENUM_VALUES)。
+    if "map_type" in cfg and cfg.get("map_type") not in _MAP_TYPES:
+        logging.warning("map_type 非法(got %r, 合法 %s), 已回退默认 %r",
+                        cfg.get("map_type"), sorted(_MAP_TYPES), DEFAULTS["map_type"])
+        cfg["map_type"] = DEFAULTS["map_type"]
+    # v1.9.90: bootstrap_dns 必须是合法 host:port(DoH/DoT hostname 预解析用的 UDP
+    # bootstrap)。用 parse_upstream_addr 校验格式与端口范围, 非法回退 223.5.5.5:53。
+    if "bootstrap_dns" in cfg:
+        _bs = cfg.get("bootstrap_dns")
+        _bs_ok = isinstance(_bs, str) and bool(_bs.strip())
+        if _bs_ok:
+            _bp = parse_upstream_addr(_bs)
+            _bs_ok = _bp is not None and 1 <= _bp["port"] <= 65535
+        if not _bs_ok:
+            logging.warning("bootstrap_dns 非法(host:port 格式, got %r), 已回退默认 %r",
+                            _bs, DEFAULTS["bootstrap_dns"])
+            cfg["bootstrap_dns"] = DEFAULTS["bootstrap_dns"]
+    # v1.9.90: health_probe_domain 必须是非空可打印字符串(长度 ≤253, 符合域名上限)。
+    if "health_probe_domain" in cfg:
+        _hpd = cfg.get("health_probe_domain")
+        if (not isinstance(_hpd, str) or not _hpd.strip()
+                or not _hpd.isprintable() or len(_hpd) > 253):
+            logging.warning("health_probe_domain 非法(非空可打印字符串, ≤253, got %r), "
+                            "已回退默认 %r", _hpd, DEFAULTS["health_probe_domain"])
+            cfg["health_probe_domain"] = DEFAULTS["health_probe_domain"]
     # P2-4(R3): edns_client_subnet 加载期校验。与 api._validate_cfg_update 对齐:
     # 非空时必须是合法 CIDR 网络, 前缀钳制到地址族合法范围(v4≤32 / v6≤128),
     # 非法时回退为 None 并告警。此前仅 API 写入路径有校验, 手编 config.json 写
@@ -458,6 +544,21 @@ def _validate_cfg(cfg):
     for key in ("upstreams", "rules"):
         if key in cfg and not isinstance(cfg.get(key), list):
             _fallback(cfg, key)
+    # M1: upstreams[] 逐项轻量校验(加载期/热重载)。此前只校验是 list, 不对项内容
+    # 校验——手改/损坏配置可落库 proto 非法/port 越界/addr 空的死上游项。非法项
+    # 跳过并告警, 不中断启动(与 rule_subscriptions 逐项过滤同型)。
+    ups = cfg.get("upstreams", [])
+    if not isinstance(ups, list):
+        logging.warning("upstreams 不是列表, 已置空: %r", ups)
+        cfg["upstreams"] = []
+    else:
+        kept_up = []
+        for i, item in enumerate(ups):
+            if _validate_upstream_item(item):
+                kept_up.append(item)
+            else:
+                logging.warning("upstreams[%d] 非法(proto 非枚举/port 越界/addr 或 id 为空), 已跳过: %r", i, item)
+        cfg["upstreams"] = kept_up
     # P3-1(第八轮): cache_partitions 各分区权重加载期校验。API 写入路径
     # (_validate_cfg_update) 已 400 拒绝非数值权重; 手编 config.json 写入
     # {"domestic": "abc"} 之类畸形值时, 启动期这里回退整个 cache_partitions 为
@@ -470,6 +571,14 @@ def _validate_cfg(cfg):
         logging.warning("cache_partitions 不是对象也不是 null, 已回退默认: %r", _cp)
         cfg["cache_partitions"] = None
     elif isinstance(_cp, dict):
+        # v1.9.90: 分区键必须 ∈ {domestic, global, default}; 未知键告警并剔除,
+        # 不回退整表(未知键本就不参与加权, 保留合法键用户意图)。
+        _VALID_CP_KEYS = frozenset(("domestic", "global", "default"))
+        for _ck in list(_cp.keys()):
+            if _ck not in _VALID_CP_KEYS:
+                logging.warning("cache_partitions 未知键 %r(合法 %s), 已剔除",
+                                _ck, sorted(_VALID_CP_KEYS))
+                del _cp[_ck]
         for _ck, _cv in _cp.items():
             if isinstance(_cv, bool) or not isinstance(_cv, (int, float)) or _cv < 0:
                 logging.warning("cache_partitions[%r] 权重非法(非数字/布尔/负数, got %r), 整个分区配置回退默认",
@@ -505,8 +614,20 @@ def _validate_cfg(cfg):
     if isinstance(cfg.get("listen"), dict):
         for _lk in ("udp", "tcp", "udp6", "tcp6"):
             _v = cfg["listen"].get(_lk)
-            if _v is not None and not isinstance(_v, str):
+            if _v is None:
+                continue   # 显式 null = 不监听该协议(用户主动关闭 IPv6 等), 保留
+            if not isinstance(_v, str):
                 logging.warning("listen.%s 不是字符串, 已回退默认: %r", _lk, _v)
+                cfg["listen"][_lk] = copy.deepcopy(DEFAULTS["listen"].get(_lk))
+                continue
+            # M2: host:port 格式与端口范围校验。parse_upstream_addr 已处理 IPv6
+            # [::1]:53 的方括号拆包, 并在内部拒绝 port 越界(1..65535)与畸形 host;
+            # 返回 None 即视为非法绑定串, 回退默认并告警(与 api.port 回退同型)。
+            # 校验通过则保留原字符串(不改写), 保持向后兼容。
+            _parsed = parse_upstream_addr(_v)
+            if _parsed is None or not (1 <= _parsed["port"] <= 65535):
+                logging.warning("listen.%s 绑定串非法(host:port 格式/端口越界, got %r), 已回退默认",
+                                _lk, _v)
                 cfg["listen"][_lk] = copy.deepcopy(DEFAULTS["listen"].get(_lk))
     # P2-24: api.token 校验。必须是字符串且不超过 256 字符; 非字符串类型
     # (数字/列表等)回退为空串(不启用认证), 防止把畸形值带入请求头比较路径。
@@ -665,8 +786,17 @@ def save_config(cfg, path=None):
     # R37 P3-2: 逐条规则已迁移到独立文件 rules_local.json(cli.py 启动时 cfg["rules"]=[]),
     # 此处不再检查 rules 数量; 仅 upstreams 仍常驻 config.json, 作为 compact 触发条件。
     big = len(cfg.get("upstreams", [])) > 100
-    payload = (json.dumps(cfg, ensure_ascii=False, separators=(",", ":")) if big
-               else json.dumps(cfg, ensure_ascii=False, indent=2))
+    # v1.9.90: 落盘前剔除运行时注入键(rule_sub_file/rule_local_file,
+    # 由 cli.run() 按启动 config_path 派生注入)。它们是进程态绝对路径, 若随一次控制台
+    # 保存固化进静态 config.json, 迁移配置目录/换机后会指向旧路径。浅拷贝后 pop,
+    # 不改调用方持有的活 cfg。
+    # 注意: cache_file 是用户可配项(README 文档化, cli._default_cache_file 优先采用用户值),
+    # 不得剥离——否则用户手配的自定义缓存路径会在一次控制台保存后静默丢失。
+    _out = cfg.copy()
+    for _rk in ("rule_sub_file", "rule_local_file"):
+        _out.pop(_rk, None)
+    payload = (json.dumps(_out, ensure_ascii=False, separators=(",", ":")) if big
+               else json.dumps(_out, ensure_ascii=False, indent=2))
     # R36 P3-2: tmp 提到 try 外, 便于 except 分支清理残留 .tmp
     tmp = target + ".tmp"
     try:

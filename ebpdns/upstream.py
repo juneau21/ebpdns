@@ -9,6 +9,7 @@ import collections
 import http.client
 import logging
 import os
+import select
 import socket
 import ssl
 import struct
@@ -81,6 +82,29 @@ _DNS_RESOLVE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dns-re
 # 路径完全不受影响(仅在解释器退出时触发一次)。
 atexit.register(_DNS_RESOLVE_POOL.shutdown, wait=False, cancel_futures=True)
 
+# UP-MED-02: 背压保护。ThreadPoolExecutor 内部队列(_work_queue)无界, DNS 完全不可达
+# 时 4 个 worker 全部阻塞在 getaddrinfo(无超时系统调用), 后续任务会无限排队。
+# submit 前检查待办队列长度, 超过阈值直接拒绝(返回 None), 调用方按解析失败走已有
+# 错误路径, 避免队列无界增长。_work_queue 为 SimpleQueue, qsize() 为尽力而为估计值。
+_DNS_RESOLVE_QUEUE_LIMIT = 128
+
+
+def _submit_dns_resolve(fn, *args):
+    """背压保护版线程池提交。
+
+    队列积压超过 _DNS_RESOLVE_QUEUE_LIMIT 时拒绝提交并返回 None; 调用方须把 None
+    视为解析失败(走已有 except/空集错误路径)。正常情况下与 _DNS_RESOLVE_POOL.submit
+    行为一致, 返回 Future。"""
+    q = getattr(_DNS_RESOLVE_POOL, "_work_queue", None)
+    if q is not None:
+        try:
+            if q.qsize() > _DNS_RESOLVE_QUEUE_LIMIT:
+                return None
+        except Exception:
+            # qsize 异常不应阻断正常提交路径
+            pass
+    return _DNS_RESOLVE_POOL.submit(fn, *args)
+
 
 def _cached_udp_addrs(host, timeout=None):
     """返回上游 hostname 的 IPv4 地址集合, 带 300s TTL 缓存。
@@ -111,10 +135,11 @@ def _cached_udp_addrs(host, timeout=None):
     # P3-17: 先查 A 记录; 无 A 记录时尝试 AAAA 并合并, 记录日志告知管理员。
     # 原实现仅查 AF_INET, 纯 IPv6-only 上游 hostname 永远解析为空 → 静默不工作。
     try:
-        fut = _DNS_RESOLVE_POOL.submit(socket.getaddrinfo, host, None, socket.AF_INET)
-        infos = fut.result(timeout=_resolve_timeout) if _resolve_timeout else fut.result()
-        for i in infos:
-            ips.add(i[4][0])
+        fut = _submit_dns_resolve(socket.getaddrinfo, host, None, socket.AF_INET)
+        if fut is not None:
+            infos = fut.result(timeout=_resolve_timeout) if _resolve_timeout else fut.result()
+            for i in infos:
+                ips.add(i[4][0])
     except Exception:
         pass
     if not ips:
@@ -128,10 +153,11 @@ def _cached_udp_addrs(host, timeout=None):
         else:
             aaaa_timeout = None
         try:
-            fut = _DNS_RESOLVE_POOL.submit(socket.getaddrinfo, host, None, socket.AF_INET6)
-            infos = fut.result(timeout=aaaa_timeout) if aaaa_timeout else fut.result()
-            for i in infos:
-                ips.add(i[4][0])
+            fut = _submit_dns_resolve(socket.getaddrinfo, host, None, socket.AF_INET6)
+            if fut is not None:
+                infos = fut.result(timeout=aaaa_timeout) if aaaa_timeout else fut.result()
+                for i in infos:
+                    ips.add(i[4][0])
         except Exception:
             pass
         if ips:
@@ -507,12 +533,13 @@ def _resolve_host_once(host, timeout=None):
     _resolve_timeout = timeout
     _t0 = time.monotonic()
     try:
-        fut = _DNS_RESOLVE_POOL.submit(
+        fut = _submit_dns_resolve(
             socket.getaddrinfo, host, None, socket.AF_INET, socket.SOCK_STREAM)
-        infos = fut.result(timeout=_resolve_timeout) if _resolve_timeout else fut.result()
-        for _fam, _stype, _proto, _canon, sa in infos:
-            if sa and sa[0]:
-                return sa[0]
+        if fut is not None:
+            infos = fut.result(timeout=_resolve_timeout) if _resolve_timeout else fut.result()
+            for _fam, _stype, _proto, _canon, sa in infos:
+                if sa and sa[0]:
+                    return sa[0]
     except Exception:
         pass
     # AF_INET 无可用地址: 按已消耗时间重算剩余预算后回退 AF_INET6(共享同一硬预算)
@@ -521,12 +548,13 @@ def _resolve_host_once(host, timeout=None):
             aaaa_timeout = max(0.001, min(_resolve_timeout, timeout - (time.monotonic() - _t0)))
         else:
             aaaa_timeout = None
-        fut = _DNS_RESOLVE_POOL.submit(
+        fut = _submit_dns_resolve(
             socket.getaddrinfo, host, None, socket.AF_INET6, socket.SOCK_STREAM)
-        infos = fut.result(timeout=aaaa_timeout) if aaaa_timeout else fut.result()
-        for _fam, _stype, _proto, _canon, sa in infos:
-            if sa and sa[0]:
-                return sa[0]
+        if fut is not None:
+            infos = fut.result(timeout=aaaa_timeout) if aaaa_timeout else fut.result()
+            for _fam, _stype, _proto, _canon, sa in infos:
+                if sa and sa[0]:
+                    return sa[0]
     except Exception:
         pass
     return None
@@ -1005,7 +1033,11 @@ def _doh_query(up, query_bytes, timeout_ms):
     #   - proto: doh
     #     addr: 1.2.3.4          # IP 字面量直连
     #     doh_strict_cert: false # 显式允许降级(默认 true, 不匹配即失败)
-    strict_cert = bool(up.get("doh_strict_cert", True))
+    # v1.9.141 P2: dict.get(key, default) 仅在键缺失时返回 default; 键存在但值为
+    # None(JSON null) 时返回 None → bool(None)=False, 与 API 层 _as_bool(v, True)
+    # (null→True) 方向相反。改为 is not False: 仅显式 False 才关闭严格校验,
+    # None/缺失/0/"" 均保持严格(安全方向), 与 API 归一一致。
+    strict_cert = up.get("doh_strict_cert") is not False
     # R31 P3-1: 经 bootstrap-IP 直连时, 底层 socket 已直连到 bp_ip, 但所有
     # HTTPSConnection 构造点仍传入原始域名 host(非 IP), HTTPConnection 据此自动
     # 生成的 Host 头本来就是域名。此处显式再设一次 Host 头作为 defense-in-depth:
@@ -1058,6 +1090,13 @@ def _doh_query(up, query_bytes, timeout_ms):
             # v1.9.74 P2-2: 读上限 65536 并校验 <=65535, 与 DoT/QUIC 对齐,
             # 防上游异常返回超大 body 撑爆内存。
             body = resp.read(65536)
+            # UP-MED-01: http.client.HTTPResponse 在 Content-Length 已知模式下,
+            # resp.length 表示本次响应剩余未读字节数。read(65536) 读完声明 body 后,
+            # 若上游实际多发了字节(length>0), 残留字节仍在 socket 缓冲; 此连接归还
+            # 连接池后, 下次请求会把残留字节当成新响应 → 协议错位。检测到残留字节时
+            # 关闭连接、不归还池(release(entry, None) 只回收槽位不入队)。chunked 模式
+            # length 可能为 None, 用 getattr 防御。
+            _leftover = getattr(resp, "length", 0) or 0
             # P3-5: 校验 Content-Type 必须为 application/dns-message(RFC 8484),
             # 非预期类型(如 HTML 错误页/重定向)按失败处理。
             # R7 P3-5: 子串匹配转小写, 兼容大写/混合大小写的 Content-Type(如
@@ -1073,7 +1112,8 @@ def _doh_query(up, query_bytes, timeout_ms):
                 _pool.release(entry, None)
                 return False, None
             # v1.9.80: 上游要求 close 时不复用, 关闭后放回 None(下次新建)
-            if getattr(resp, "will_close", False):
+            # UP-MED-01: 响应残留未读字节(_leftover>0)时同样不复用, 防协议错位。
+            if getattr(resp, "will_close", False) or _leftover > 0:
                 try:
                     conn.close()
                 except Exception:
@@ -1126,6 +1166,8 @@ def _doh_query(up, query_bytes, timeout_ms):
                 conn.request("POST", path, body=query_bytes, headers=headers)
                 resp = conn.getresponse()
                 body = resp.read(65536)  # P2-2: 同上读上限+长度校验
+                # UP-MED-01: 同首路径, 检查响应剩余未读字节, 有残留则不复用连接。
+                _leftover = getattr(resp, "length", 0) or 0
                 # P3-5: 同首路径, 校验 Content-Type
                 # R7 P3-5: 子串匹配转小写, 兼容大写/混合大小写。
                 ctype = resp.getheader("Content-Type", "")
@@ -1139,7 +1181,8 @@ def _doh_query(up, query_bytes, timeout_ms):
                     _pool.release(entry, None)
                     return False, None
                 # v1.9.80: will_close 时不复用
-                if getattr(resp, "will_close", False):
+                # UP-MED-01: 有残留未读字节时同样关闭不归还。
+                if getattr(resp, "will_close", False) or _leftover > 0:
                     try:
                         conn.close()
                     except Exception:
@@ -1325,7 +1368,8 @@ def _dot_query(up, query_bytes, timeout_ms):
     #   - proto: dot
     #     addr: 1.2.3.4          # IP 字面量直连
     #     dot_strict_cert: false # 显式允许降级(默认 true, 不匹配即失败)
-    strict_cert = bool(up.get("dot_strict_cert", True))
+    # v1.9.141 P2: 同 DoH, null 不降级为 False, 与 API 层 _as_bool(v, True) 一致。
+    strict_cert = up.get("dot_strict_cert") is not False
 
     def _exchange(sock):
         remaining = deadline - time.monotonic()
@@ -1562,6 +1606,9 @@ def _udp_query(up, query_bytes, timeout_ms):
     # 单值校验会误丢来自其他 IP 的响应); 解析失败则集合为空 → 不校验源,
     # 靠 qid(16bit 随机)兜底防投毒。
     expect_ips = set()
+    # P3-LOW: 多 IP 上游并行目标列表。hostname 解析出 >=2 个 IP 时, 向前两个
+    # IP 各发一个 socket, 最先返回匹配 qid 响应者胜, 另一个 socket 随 finally 关闭。
+    multi_targets = []
     send_addr = (host, port)
     if not _is_hostname(host):
         expect_ips.add(host)
@@ -1572,19 +1619,126 @@ def _udp_query(up, query_bytes, timeout_ms):
         expect_ips = set(ips)
         if ips:
             # v1.9.74 P1-3: 直接向已解析出的 IP sendto, 不再把 hostname 交给
-            # sendto(其会走系统解析/行为不确定)。多 IP 取集合首个(确定性, 不引入
-            # 额外状态); expect_ips 仍用于响应源 IP 校验。
-            send_addr = (next(iter(ips)), port)
-    # P3-17: fam 必须按实际 sendto 的地址(可能是解析出的 AAAA)判定, 而非按
-    # 原始 host 字符串。否则 hostname 仅解析到 IPv6 时, 仍用 AF_INET socket 向
-    # IPv6 地址 sendto, 必抛 OSError 被静默吞掉。
-    fam = socket.AF_INET6 if ":" in send_addr[0] else socket.AF_INET
+            # sendto(其会走系统解析/行为不确定); expect_ips 仍用于响应源 IP 校验。
+            # P3-LOW: 原实现多 IP 时确定性取集合首个 IP 发送——若该 IP 丢包,
+            # 即使其他 IP 健康也整体超时。改为: >=2 个 IP 时取前两个并行发送,
+            # 先到的合法响应获胜; 单 IP 保持原逻辑。
+            if len(ips) > 1:
+                multi_targets = list(ips)[:2]
+            else:
+                send_addr = (next(iter(ips)), port)
     # R7 P1-1: 冷缓存 getaddrinfo 硬截断超时后 ips 为空, send_addr 仍为 hostname。
     # 此时若继续 sendto(hostname) 会触发同步无超时 getaddrinfo(~10s 阻塞),
     # 且 expect_ips 为空导致源 IP 校验被跳过。直接返回 False 让上层 resolver
     # 切换备用上游, 不再阻塞在 hostname 上。
     if _is_hostname(host) and not expect_ips:
         return False, None
+
+    def _response_ok(data, src):
+        """校验一条 UDP 响应是否可接受: 源 IP/端口 + qid + 0x20 大小写。
+        校验通过返回 True; 否则返回 False(调用方继续等待下一条)。"""
+        # 校验源地址（域名 host 用解析 IP 集合; 解析失败则不校验源, 靠 qid 兜底）
+        if expect_ips and src[0] not in expect_ips:
+            return False
+        if port and src[1] != port:
+            return False
+        if qid is not None and len(data) >= 2:
+            rid = struct.unpack(">H", data[:2])[0]
+            if rid != qid:
+                return False  # 响应 ID 不匹配，继续等待（防乱序/投毒）
+        # DNS 0x20 投毒防护: 响应 question qname 大小写必须与查询一致
+        # (仅对明文 UDP 生效; 查询未做 0x20 时全小写 qname 也通过)
+        # v1.9.76 2.3: 已降级上游跳过校验; 失配按上游计数, 连续 3 次降级。
+        # v1.9.77 R4: _0x20_misses/_0x20_disabled 全部走 _0x20_lock 串行化, 消除
+        # 并发 read-modify-write 竞态。R5: 降级时记录时间戳供 600s 后自恢复。
+        # P2-1: check_0x20 为纯函数(无共享状态), 在锁外计算失配判定;
+        # 但"读旧值+1"的失配计数 与 "成功清零" 的写, 合并到同一个 _0x20_lock
+        # 块内原子完成, 杜绝跨锁获取丢失增量/过早降级。
+        # P3-21: 消除 stale-read 窗口——锁外只算 check_0x20, x20_off 在锁内重读后决策。
+        _is_mismatch = not dnsmsg.check_0x20(query_bytes, data)
+        with _0x20_lock:
+            x20_off = up_id in _0x20_disabled
+            if not x20_off and _is_mismatch:
+                # 锁内先读旧值再 +1 (read-modify-write 整体原子)
+                _0x20_misses[up_id] = _0x20_misses.get(up_id, 0) + 1
+                if _0x20_misses[up_id] >= _0x20_FAIL_LIMIT and up_id not in _0x20_disabled:
+                    _0x20_disabled.add(up_id)
+                    _0x20_DISABLED_SINCE[up_id] = time.monotonic()
+                    log.warning("上游 %s(%s) 连续 %d 次 0x20 大小写失配, 自动关闭 0x20 校验"
+                                "(疑似规范化大小写上游, %.0fs 后自动重试)",
+                                up.get("name"), up_id,
+                                _0x20_FAIL_LIMIT, _0x20_RECOVER_S)
+            else:
+                # 本查询收到 0x20 校验通过(或已降级)的响应 → 锁内清零连续失配计数
+                _0x20_misses[up_id] = 0
+            # R26 P3-2: 把"丢弃决策"也并入同一把锁内, 关闭读 x20_off 与决策间窗口。
+            if _is_mismatch and not x20_off:
+                return False  # 大小写失配 = 伪造应答嫌疑, 丢弃继续等
+        return True
+
+    # ---- P3-LOW: 多 IP 并行发送路径 ----
+    if multi_targets:
+        socks = []
+        try:
+            for tip in multi_targets:
+                # 每个目标 IP 独立选地址族(理论上 A/AAAA 混合时也能工作),
+                # 与单 IP 路径 P3-17 同型判定。
+                fam = socket.AF_INET6 if ":" in tip else socket.AF_INET
+                s = None
+                try:
+                    s = socket.socket(fam, socket.SOCK_DGRAM)
+                    # sendto 前先按剩余 deadline 设超时, 与单 socket 路径 R5 P2-2 一致,
+                    # 防发送缓冲区满/路由异常时阻塞。
+                    s.settimeout(max(0.001, deadline - time.monotonic()))
+                    s.sendto(query_bytes, (tip, port))
+                except OSError:
+                    # 某一目标建 socket/发送失败: 关掉它, 用剩余 socket 继续。
+                    # 两个都失败则下方 recv 循环立即超时返回 False, 由上层切备用上游。
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:
+                        pass
+                    continue
+                socks.append(s)
+            # 阻塞 socket + select 等待第一个可读, 总耗时受统一 deadline 约束。
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not socks:
+                    return False, None
+                r, _, _ = select.select(socks, [], [], max(0.001, remaining))
+                if not r:
+                    return False, None  # 全部目标超时
+                for s in r:
+                    try:
+                        # v1.9.76 2.6: recvfrom 65535, 与单 socket 路径一致(EDNS 上限)。
+                        data, src = s.recvfrom(65535)
+                    except OSError:
+                        # recvfrom 失败: 该 socket 已坏, 必须从等待集合移除并关闭,
+                        # 否则下一轮 select 立即再次返回该 fd 形成 tight spin 直到 deadline。
+                        try:
+                            socks.remove(s)
+                            s.close()
+                        except Exception:
+                            pass
+                        continue
+                    if _response_ok(data, src):
+                        return True, data
+                    # 校验未过(伪造/无关响应): 回到 while 重新 select 等下一条
+        finally:
+            # 无论成功/超时/异常, 关闭全部 socket(含胜出者与落选者), 防 fd 泄漏。
+            for s in socks:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return False, None
+
+    # ---- 单 IP 路径(原逻辑保持不变) ----
+    # P3-17: fam 必须按实际 sendto 的地址(可能是解析出的 AAAA)判定, 而非按
+    # 原始 host 字符串。否则 hostname 仅解析到 IPv6 时, 仍用 AF_INET socket 向
+    # IPv6 地址 sendto, 必抛 OSError 被静默吞掉。
+    fam = socket.AF_INET6 if ":" in send_addr[0] else socket.AF_INET
     # P2-5: socket 创建移入 try 块, 与 sendto/recvfrom 共用同一 finally close,
     # 确保 expect_ips/send_addr 计算之后到 recvfrom 之间任何异常都不会泄漏 fd。
     # sock 先置 None, 防止 socket.socket() 构造失败时 finally 对未绑定名 close。
@@ -1611,53 +1765,9 @@ def _udp_query(up, query_bytes, timeout_ms):
                 data, src = sock.recvfrom(65535)
             except socket.timeout:
                 return False, None
-            # 校验源地址（域名 host 用解析 IP 集合; 解析失败则不校验源, 靠 qid 兜底）
-            if expect_ips and src[0] not in expect_ips:
-                continue
-            if port and src[1] != port:
-                continue
-            if qid is not None and len(data) >= 2:
-                rid = struct.unpack(">H", data[:2])[0]
-                if rid != qid:
-                    continue  # 响应 ID 不匹配，继续等待（防乱序/投毒）
-            # DNS 0x20 投毒防护: 响应 question qname 大小写必须与查询一致
-            # (仅对明文 UDP 生效; 查询未做 0x20 时全小写 qname 也通过)
-            # v1.9.76 2.3: 已降级上游跳过校验; 失配按上游计数, 连续 3 次降级。
-            # v1.9.77 R4: _0x20_misses/_0x20_disabled 全部走 _0x20_lock 串行化, 消除
-            # 并发 read-modify-write 竞态。R5: 降级时记录时间戳供 600s 后自恢复。
-            # P2-1: check_0x20 为纯函数(无共享状态), 在锁外计算失配判定;
-            # 但"读旧值+1"的失配计数 与 "成功清零" 的写, 合并到同一个 _0x20_lock
-            # 块内原子完成, 杜绝跨锁获取丢失增量/过早降级。
-            # P3-21: 消除 stale-read 窗口——原实现先在第一个锁块读 x20_off, 锁外
-            # 算 _is_mismatch, 再进第二个锁块; 两锁之间另一线程可能刚把该上游
-            # 降级加入 _0x20_disabled, 但本线程仍按旧 x20_off 决策(误丢刚降级上游
-            # 的响应)。改为: 锁外只算 check_0x20, x20_off 在锁内重读后再决策。
-            _is_mismatch = not dnsmsg.check_0x20(query_bytes, data)
-            with _0x20_lock:
-                x20_off = up_id in _0x20_disabled
-                if not x20_off and _is_mismatch:
-                    # 锁内先读旧值再 +1 (read-modify-write 整体原子)
-                    _0x20_misses[up_id] = _0x20_misses.get(up_id, 0) + 1
-                    if _0x20_misses[up_id] >= _0x20_FAIL_LIMIT and up_id not in _0x20_disabled:
-                        _0x20_disabled.add(up_id)
-                        _0x20_DISABLED_SINCE[up_id] = time.monotonic()
-                        log.warning("上游 %s(%s) 连续 %d 次 0x20 大小写失配, 自动关闭 0x20 校验"
-                                    "(疑似规范化大小写上游, %.0fs 后自动重试)",
-                                    up.get("name"), up_id,
-                                    _0x20_FAIL_LIMIT, _0x20_RECOVER_S)
-                else:
-                    # 本查询收到 0x20 校验通过(或已降级)的响应 → 锁内清零连续失配计数
-                    _0x20_misses[up_id] = 0
-                # R26 P3-2: 把"丢弃决策"也并入同一把锁内。P3-21 已把 x20_off 的读
-                # 收敛进锁, 但原实现在出锁后(line 外)才用本地 x20_off 做丢弃决策,
-                # 出锁与决策之间仍存在微秒级窗口——另一线程恰在此刻把该上游降级
-                # 加入 _0x20_disabled, 本线程仍按旧 x20_off=False 决策, 误丢刚降级
-                # 上游的单条响应。将决策并入锁块后, 读 x20_off 与决策原子完成, 彻底
-                # 关闭该窗口。该窗口本就只能造成"多丢一条真实失配响应"(绝不会误收
-                # 投毒响应), 影响极小; 此改动为低成本收口, 与 P3-21 的原子化意图一致。
-                if _is_mismatch and not x20_off:
-                    continue  # 大小写失配 = 伪造应答嫌疑, 丢弃继续等
-            return True, data
+            if _response_ok(data, src):
+                return True, data
+            # 校验未过则 continue 等下一条
         return False, None
     except OSError:
         return False, None
@@ -1786,6 +1896,7 @@ def query_upstream(up, query_bytes, timeout_ms=1500):
     """按上游协议发起一次查询。返回 (ok, response_bytes, latency_ms, err_str)。"""
     proto = str(up.get("proto", "udp")).lower()
     t0 = time.monotonic()
+    _e = None  # v1.9.142: 保留 QUIC 路径的具体失败原因, 不被笼统 "query failed" 覆盖
     try:
         if proto == "udp":
             ok, data = _udp_query(up, query_bytes, timeout_ms)
@@ -1808,7 +1919,9 @@ def query_upstream(up, query_bytes, timeout_ms=1500):
         return False, None, int((time.monotonic() - t0) * 1000), str(e)
     lat = int((time.monotonic() - t0) * 1000)
     if not ok:
-        return False, None, lat, "query failed"
+        # v1.9.142: QUIC(doq/doh3) 路径返回的 _e(timeout/连接拒绝/TLS 错误)直接透传,
+        # 便于健康检查/首次实测区分失败根因; 其它协议无明细时回退 "query failed"。
+        return False, None, lat, _e or "query failed"
     return True, data, lat, None
 
 
@@ -1842,7 +1955,7 @@ def probe_ip(ip, query_bytes, port=53, timeout_ms=800):
                 return None
             sock.settimeout(max(0.001, remaining))
             try:
-                data, src = sock.recvfrom(2048)
+                data, src = sock.recvfrom(65535)  # UP-LOW-04: 与热路径 _udp_query 对齐缓冲
             except socket.timeout:
                 return None
             # v1.9.84 UP-10: 校验源 IP、源端口与响应 qid, 防伪造响应误导测速。

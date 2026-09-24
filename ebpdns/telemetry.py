@@ -15,7 +15,11 @@ class Telemetry:
             "bytes_in": 0, "bytes_out": 0, "rebind_blocked": 0,
         }
         # 分流规则命中统计(按 action/group 归类)
-        self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0}
+        # T 修复: 补 "allow" 键——resolver.py 对 action=="allow" 已调用
+        # tel.inc_rule("allow"), 但初始/重置 dict 漏了该键; 首个 allow 命中前快照里
+        # 缺 allow 键, 前端读 rh.allow 为 undefined。这里与 domestic/global/block/forceIp
+        # 并列初始化为 0, 保证键始终存在。
+        self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0, "allow": 0}
         self.qtype_dist = {"A": 0, "AAAA": 0, "other": 0}
         self.qps_window = deque(maxlen=600)
         self.latency_window = deque(maxlen=400)
@@ -398,7 +402,7 @@ class Telemetry:
         with self._lock:
             self.counters = {k: 0 for k in self.counters}
             self.qtype_dist = {"A": 0, "AAAA": 0, "other": 0}
-            self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0}
+            self.rule_hits = {"domestic": 0, "global": 0, "block": 0, "forceIp": 0, "allow": 0}
             self.qps_window.clear()
             self.latency_window.clear()
             self.history = []

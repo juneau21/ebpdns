@@ -1,7 +1,7 @@
 # ebpdns 顶层 Makefile —— 开发辅助
 PY ?= python3
 
-.PHONY: all test console install bpf clean
+.PHONY: all test console install bpf clean run
 
 all: console test
 

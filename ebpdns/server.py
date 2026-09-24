@@ -223,6 +223,10 @@ class _UDPHandler:
                 self.sock.close()
             except OSError:
                 pass
+        # P3-LOW(保留): cancel_futures=True 会取消队列中尚未执行的任务, 这些任务
+        # 的 finally(信号量 release)不会执行, 造成信号量计数"泄漏"。但此处是服务
+        # 关闭语义——线程池随之丢弃、不再被任何查询路径使用, 泄漏的信号量计数随
+        # 进程退出回收, 无实际影响。故不修改行为, 仅在此标注。
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 

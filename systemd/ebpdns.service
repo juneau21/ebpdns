@@ -3,6 +3,10 @@ Description=ebpdns - eBPF SmartDNS-style DNS resolver
 Documentation=file:///opt/ebpdns/README.md
 After=network-online.target
 Wants=network-online.target
+# 崩溃循环保护: 60s 内最多 5 次启动, 超过则 systemd 进入 failed 不再自动重启,
+# 避免配置坏/依赖缺失时服务疯狂重启打满 CPU 与 journald。
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -28,9 +32,12 @@ Environment=MALLOC_TRIM_THRESHOLD_=131072
 # 内存兜底: 超过 1G 触发回收压力, 超过 1.5G 被 OOM killer 选中(防止整机拖垮)
 MemoryHigh=1G
 MemoryMax=1.5G
-# 默认以 root 运行以监听 53 端口并读写 /etc/ebpdns。
-# 若改用专用用户(如 ebpdns), 可去掉 User=root 并保留 AmbientCapabilities。
-User=root
+# 以专用系统用户 ebpdns 运行(install.sh 创建, nologin)。配合下方 AmbientCapabilities
+# 仅授予 CAP_NET_BIND_SERVICE 绑定 53 端口; /etc/ebpdns 由 install.sh 置为 ebpdns:ebpdns
+# 750, 服务可读写配置/缓存, 代码目录 /opt/ebpdns 保持 root:root 只读。此前 User=root 使
+# 下方整套沙箱硬化(ProtectSystem=strict/NoNewPrivileges/...)失去降权意义。
+User=ebpdns
+Group=ebpdns
 ExecStart=/opt/ebpdns/bin/ebpdns run --config /etc/ebpdns/config.json
 Restart=on-failure
 RestartSec=5

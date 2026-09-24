@@ -113,6 +113,10 @@ class LRUCache:
             if entry["expires_at"] <= now:
                 # v1.9.74 P1-2: 过期不 pop。由 get_stale() 决定"窗口内保留/窗口外清除",
                 # 否则 serve-stale 条目在首次过期命中后即被删除, 上游故障期间只能兜底一次。
+                # stale_window=0 时无 serve-stale 需求, 惰性 pop 避免过期条目长期占用 LRU 槽位
+                # 依赖 put() 周期 purge。
+                if self._stale_window <= 0:
+                    m.pop(key, None)
                 return None
             m.move_to_end(key)
             return entry

@@ -418,7 +418,9 @@ def run(cfg, config_path=None):
     # (systemd Restart=on-failure 自动重启), 不再硬退出丢失缓存状态。
     def _fatal_exit():
         try:
-            _save_cache(cfg, config_path, app_ctx.resolver.cache)
+            # v1.9.139: 用 app_ctx.cfg 而非闭包捕获的启动期 cfg, 与 reload 后状态对齐
+            # (cache_file 路径在 reload 时可能变更)
+            _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
         except Exception:
             pass
         os._exit(1)
@@ -589,21 +591,24 @@ def run(cfg, config_path=None):
     # join 这些 worker 直至 socket 超时叠加(负载期可达数秒~十几秒), 导致
     # systemd stop-sigterm 超时 SIGKILL(result=timeout, 非优雅退出)。
     # 此处优雅收尾(持久化缓存/停 server/停池)已完成, 直接终止进程即可。
-    # P3-3: os._exit 是硬终止, 不跑解释器清理。若收尾期间某 worker 正 _save_cache /
-    # 写订阅文件写一半(tmp + fsync + rename), 硬终止会留下 *.tmp 残留(下次启动读
-    # 不到正式文件, 缓存丢失)。退出前在 cache_file 同目录清理 *.tmp, 清理失败不影响退出。
+    # P3-3: os._exit 是硬终止, 不跑解释器清理。若收尾期间某 worker 正 _save_cache
+    # 写一半(tmp + fsync + rename), 硬终止会留下 cache.json.tmp 残留(下次启动读
+    # 不到正式文件, 缓存丢失)。退出前清理缓存 tmp, 清理失败不影响退出。
+    # M7 修复: 原 glob("*.tmp") 范围过宽, 会连带删除 rules_sub.json.tmp /
+    # rules_local.json.tmp——后台订阅下载线程可能正在原子写这两个文件(tmp+rename),
+    # 误删会导致订阅/本地规则回滚到旧版甚至丢失。这里只精确清理 cache.json.tmp
+    # (缓存落盘由 _cache_save_lock + 上方显式 _save_cache 串行, 不存在在途写)。
     try:
-        import glob
-        _cache_dir = os.path.dirname(_default_cache_file(cfg, config_path)) or "."
-        for _f in glob.glob(os.path.join(_cache_dir, "*.tmp")):
-            try:
-                if os.path.isfile(_f):
-                    os.remove(_f)
-            except Exception:
-                pass
+        _cache_path = _default_cache_file(cfg, config_path)
+        _cache_tmp = _cache_path + ".tmp"
+        if os.path.isfile(_cache_tmp):
+            os.remove(_cache_tmp)
     except Exception:
         pass
-    os._exit(0)
+    # S1 修复: /api/restart 在 systemd 托管时把 restart_exit_code 置 3, 使
+    # Restart=on-failure 触发拉起新实例; 正常退出(0) 不重启。
+    _exit_code = getattr(app_ctx, "restart_exit_code", 0) or 0
+    os._exit(_exit_code)
 
 
 def cmd_status(cfg, config_path=None):
@@ -683,8 +688,22 @@ def main(argv=None):
 
     if args.cmd == "run" or args.cmd is None:
         if getattr(args, "dns_udp", None):
+            # M3: 与 --api-port 覆盖同型。--dns-udp 为 host:port 字符串, 覆盖发生在
+            # load_config 之后, 绕过 config.py listen 绑定串校验。这里补 host:port 拆分
+            # 与端口范围校验(IPv6 [::1]:53 由 parse_upstream_addr 处理); 非法/越界直接
+            # stderr 报错并 exit(2), 不让坏绑定串带入 server.bind 在运行时才崩。
+            _up = config_mod.parse_upstream_addr(args.dns_udp)
+            if _up is None or not (1 <= _up["port"] <= 65535):
+                print("--dns-udp 绑定串非法(host:port 格式/端口越界, got %r)" % (args.dns_udp,),
+                      file=sys.stderr)
+                sys.exit(2)
             cfg["listen"]["udp"] = args.dns_udp
         if getattr(args, "dns_tcp", None):
+            _tp = config_mod.parse_upstream_addr(args.dns_tcp)
+            if _tp is None or not (1 <= _tp["port"] <= 65535):
+                print("--dns-tcp 绑定串非法(host:port 格式/端口越界, got %r)" % (args.dns_tcp,),
+                      file=sys.stderr)
+                sys.exit(2)
             cfg["listen"]["tcp"] = args.dns_tcp
         if getattr(args, "api_host", None):
             cfg["api"]["host"] = args.api_host

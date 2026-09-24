@@ -4,5 +4,7 @@ Documentation=file:///opt/ebpdns/README.md
 
 [Service]
 Type=oneshot
-# 优雅重启: 先 reload 缓存到磁盘, 再重启。DNS 缓存可重建, 代价极小。
+# 每日低峰内存卫生: systemctl restart 触发 systemd 向主进程发 SIGTERM,
+# 主进程在 SIGTERM 处理钩子里优雅收尾(先把内存缓存落盘 cache.json 再退出),
+# 随后 systemd 按 Restart=on-failure 策略拉起全新实例。并非"先 reload 再 restart"。
 ExecStart=/bin/systemctl restart ebpdns.service
