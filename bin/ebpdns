@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ebpdns 启动入口（项目内直跑）。安装后由 /usr/local/bin/ebpdns 指向。"""
+"""ebpdns 启动入口（项目内直跑）。安装后位于 /opt/ebpdns/bin/ebpdns，
+systemd unit 直接以绝对路径调用（ExecStart=/opt/ebpdns/bin/ebpdns run ...）。"""
 import os
 import sys
 

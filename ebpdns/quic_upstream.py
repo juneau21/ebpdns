@@ -17,6 +17,7 @@ import asyncio
 import concurrent.futures as _cf
 import logging
 import gc
+import ssl
 import struct
 import threading
 import time
@@ -35,6 +36,13 @@ except Exception:  # pragma: no cover - 依赖缺失路径
 _MAX_MSG = 65535
 _STABLE_SEC = 60.0      # 连接存活达到该秒数才视为"稳定"并复位退避(60s 内断开均视为不稳定)
 _FAIL_RECONNECT = 3     # 连续查询失败达该次数才触发连接重建
+# TLS alert codes (RFC 8446 §6.2) that indicate a certificate problem, not a
+# bootstrap-IP problem. aioquic wraps these as QuicConnectionError with
+# error_code = 0x100 + alert_code, then closes the connection; the user-visible
+# exception from wait_connected() is a bare ConnectionError with no message, so
+# we must inspect the protocol's close_event to tell cert failures apart from
+# genuine transport failures (wrong/expired IP).
+_CERT_ALERT_CODES = frozenset({42, 43, 44, 45, 46, 116})
 def available():
     return _HAVE_AIOQUIC
 def _host_port(up):
@@ -296,6 +304,7 @@ class _QuicUpstream:
             # except 内的异常原则上都在建连阶段。该标志用于防御性收紧: 万一保活
             # 期异常(如 transport 回调抛错)穿透到这里, 也不会误 invalidate 好 IP。
             established = False
+            _proto_ref = {}   # v1.9.145 P2: 捕获 protocol 实例用于回查 close_event
             try:
                 conf = QuicConfiguration(is_client=True, alpn_protocols=[self.alpn],
                                          idle_timeout=60)  # 60s 空闲再断开, 减少频繁重连
@@ -322,8 +331,20 @@ class _QuicUpstream:
                         connect_host = bip
                 except Exception:
                     pass
+                # v1.9.145 P2: 捕获 protocol 实例以便在 except 中读取
+                # close_event.error_code, 区分证书校验失败与传输层失败。
+                # aioquic 证书校验失败时 AlertBadCertificate → QuicConnectionError
+                # → close → ConnectionTerminated → wait_connected 抛裸
+                # ConnectionError(无消息), 异常本身无法区分, 必须回查 close_event。
+                _base_cls = _H3Client if self.proto == "doh3" else _DoQClient
+
+                def _proto_factory(*a, **kw):
+                    inst = _base_cls(*a, **kw)
+                    _proto_ref["inst"] = inst
+                    return inst
+
                 async with connect(connect_host, self.port, configuration=conf,
-                                   create_protocol=_H3Client if self.proto == "doh3" else _DoQClient) as proto:
+                                   create_protocol=_proto_factory) as proto:
                     established = True  # R8 P2-2: 建连成功, 此后异常属传输阶段
                     self._conn_start = time.monotonic()
                     self._ever_connected = True
@@ -348,8 +369,22 @@ class _QuicUpstream:
                 # 表示已建连成功(异常来自传输期网络抖动), 不应误删好 IP。
                 # 用 try 守卫: connect_host 在 try 内赋值, 若异常发生在其赋值之前
                 # (理论上极罕见), 引用 NameError 被兜住不影响主失败流程。
+                # v1.9.145 P2: 与 DoH/DoT 修复对齐——证书校验失败时不清 bootstrap
+                # 缓存(IP 正确, 证书本身有问题, 清缓存只会导致下次回退到阻塞 DNS)。
+                # aioquic 将 TLS Alert 包装为裸 ConnectionError, 需回查 close_event。
+                _cert_error = isinstance(e, ssl.CertificateError)
+                if not _cert_error:
+                    inst = _proto_ref.get("inst")
+                    if inst is not None:
+                        close_ev = getattr(getattr(inst, "_quic", None),
+                                            "_close_event", None)
+                        if close_ev is not None:
+                            ec = getattr(close_ev, "error_code", 0)
+                            # CRYPTO_ERROR range: 0x100 + TLS alert code
+                            if 0x100 <= ec <= 0x1ff and (ec - 0x100) in _CERT_ALERT_CODES:
+                                _cert_error = True
                 try:
-                    if not established and connect_host != self.host:
+                    if not established and not _cert_error and connect_host != self.host:
                         from .upstream import _bootstrap_invalidate
                         _bootstrap_invalidate(self.host)
                 except Exception:

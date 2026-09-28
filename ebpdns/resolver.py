@@ -249,7 +249,13 @@ def _regex_search_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC, pool=None, sem
     except Exception:
         sem.release()
         return None
-    fut.add_done_callback(lambda _f: sem.release())
+    # v1.9.145 P3-N-1: 与 _BoundedExecutor._submit 同型加固——add_done_callback
+    # 抛异常(pool 已 shutdown 等)时回调未注册, 信号量必须手动归还, 否则永久泄漏。
+    try:
+        fut.add_done_callback(lambda _f: sem.release())
+    except Exception:
+        sem.release()
+        return None
     try:
         return bool(fut.result(timeout=timeout))
     except Exception:
@@ -268,7 +274,12 @@ def _regex_match_safe(pattern, text, timeout=_REGEX_TIMEOUT_SEC, pool=None, sem=
     except Exception:
         sem.release()
         return None
-    fut.add_done_callback(lambda _f: sem.release())
+    # v1.9.145 P3-N-1: 同 _regex_search_safe, 加固 add_done_callback 失败路径。
+    try:
+        fut.add_done_callback(lambda _f: sem.release())
+    except Exception:
+        sem.release()
+        return None
     try:
         return bool(fut.result(timeout=timeout))
     except Exception:
@@ -296,24 +307,32 @@ class _BoundedExecutor:
         self._sem = threading.BoundedSemaphore(max_workers + max_pending)
 
     def _submit(self, fn, args, kwargs):
-        fut = self._pool.submit(fn, *args, **kwargs)
+        # P2-3(v1.9.143): 信号量归还责任内聚到 _submit 的所有失败路径。
+        # 成功路径由 _release 回调在 future 完成时归还; 失败路径(pool.submit
+        # 抛异常 / add_done_callback 抛异常)在本函数内手动归还, 外层不再重复
+        # release(避免 BoundedSemaphore 双归还 ValueError)。
+        try:
+            fut = self._pool.submit(fn, *args, **kwargs)
+        except Exception:
+            # pool 已 shutdown 等: 任务未入队, 信号量必须归还
+            self._sem.release()
+            raise
         def _release(_f):
             self._sem.release()
-        # R7/P3-9: add_done_callback 仅注册 list.append(self._done_callbacks),
-        # 自身不抛异常(即使回调 _release 内部抛 BoundedSemaphore ValueError 也只在
-        # future 完成时的工作线程内抛出, 不影响已 acquire 的信号量计数)。信号量不会
-        # 因注册回调失败而泄漏——_release 是唯一释放点, 与 submit() 的 acquire 配对。
-        fut.add_done_callback(_release)
+        try:
+            fut.add_done_callback(_release)
+        except Exception:
+            # 任务已入队但回调未注册, _release 永远不会被调用 → 手动归还。
+            # 任务仍会在 pool 中执行(无信号量记账), 但不泄漏信号量计数。
+            self._sem.release()
+            raise
         return fut
 
     def submit(self, fn, *args, **kwargs):
         """队列满则阻塞（反压）。"""
         self._sem.acquire()
-        try:
-            return self._submit(fn, args, kwargs)
-        except Exception:
-            self._sem.release()
-            raise
+        # _submit 内部已处理所有失败路径的信号量归还, 此处直接返回。
+        return self._submit(fn, args, kwargs)
 
     def submit_drop(self, fn, *args, **kwargs):
         """队列满则丢弃，返回 None。"""
@@ -322,7 +341,7 @@ class _BoundedExecutor:
         try:
             return self._submit(fn, args, kwargs)
         except Exception:
-            self._sem.release()
+            # _submit 失败时已在内部归还信号量, 此处仅吞异常返回 None。
             return None
 
     def shutdown(self, *a, **k):
@@ -1169,7 +1188,13 @@ class Resolver:
             # 兜底, 客户端发畸形 question 时上游 0x20 校验语义已不成立; 重编码小写是
             # 可接受的降级(与 build_simple_response 的 b"" 兜底一致)。正常包走 raw_query
             # 原样切片路径(:1006), 0x20 大小写完整保留, 不受影响。
-            qbytes = dnsmsg.build_response_body(domain, q["qtype"], [])
+            # P2-1(v1.9.143): build_response_body → encode_name 对含 U+FFFD/超长标签的
+            # 域名会抛 DNSError(持久化恢复路径不校验域名合法性)。原无 try/except, 异常
+            # 直穿到 server 层。包裹后失败退化为 b"", 与 build_simple_response 兜底一致。
+            try:
+                qbytes = dnsmsg.build_response_body(domain, q["qtype"], [])
+            except Exception:
+                qbytes = b""
         if rcode == 3:
             # NXDOMAIN 无 answer 段; v1.9.76 2.5 回显 OPT(复用已算好的 qbytes/opt,
             # 不再让 build_simple_response 重新遍历 question/additional 段)

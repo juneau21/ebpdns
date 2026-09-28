@@ -375,6 +375,14 @@ class PartitionedCache:
             g, k = "default", tuple(key)
         if g not in self._caches:
             g = "default"
+            if g not in self._caches:
+                # P1(v1.9.143): 用户自定义 cache_partitions 未含 "default" 分组时,
+                # 原回退 g="default" 是空操作——该键仍不存在于 self._caches, 后续
+                # self._caches[g] 直接 KeyError 全量崩溃。改为回退到第一个可用分区;
+                # 若连任何分区都没有(极端空配置), 返回 None 由调用方 no-op。
+                g = next(iter(self._caches), None)
+                if g is None:
+                    return None, k
         return g, k
 
     @property
@@ -404,18 +412,26 @@ class PartitionedCache:
 
     def get(self, key, now=None):
         g, k = self._split(key)
+        if g is None:
+            return None
         return self._caches[g].get(k, now)
 
     def put(self, key, value, now=None):
         g, k = self._split(key)
+        if g is None:
+            return
         return self._caches[g].put(k, value, now)
 
     def get_stale(self, key, now=None, stale_window=3600):
         g, k = self._split(key)
+        if g is None:
+            return None
         return self._caches[g].get_stale(k, now, stale_window)
 
     def delete(self, key):
         g, k = self._split(key)
+        if g is None:
+            return
         return self._caches[g].delete(k)
 
     def clear(self):
@@ -638,14 +654,21 @@ class TinyLFUCache:
             e = self._window.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    return None  # P1-2: 过期不 pop, 由 get_stale/purge 决定
+                    # P2-2(v1.9.143): stale_window=0 时主动 pop 过期条目, 与
+                    # LRUCache.get(:118-119) 行为对齐。原直接 return None 不删除,
+                    # 低写入域名的过期条目永久驻留, 依赖 put 概率式 purge 回收。
+                    if self._stale_window <= 0:
+                        self._window.pop(key, None)
+                    return None
                 self._window.move_to_end(key)
                 self._sketch.inc(key)
                 return e
             e = self._probation.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    return None  # P1-2: 过期不 pop
+                    if self._stale_window <= 0:
+                        self._probation.pop(key, None)
+                    return None
                 # 命中即晋升 protected(受保护段), protected 满则挤队首回 probation
                 self._probation.pop(key)
                 if len(self._protected) >= self._prot_cap and self._protected:
@@ -661,7 +684,9 @@ class TinyLFUCache:
             e = self._protected.get(key)
             if e is not None:
                 if e.get("expires_at", 0) <= now:
-                    return None  # P1-2: 过期不 pop
+                    if self._stale_window <= 0:
+                        self._protected.pop(key, None)
+                    return None
                 self._protected.move_to_end(key)
                 self._sketch.inc(key)
                 return e

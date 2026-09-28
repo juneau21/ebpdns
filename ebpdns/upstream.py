@@ -912,11 +912,23 @@ def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=False):
             # R7 P2-1: 经 helper 做严格 TLS 握手 + IP 字面量 CertificateError 降级。
             ssock = _doh_tls_wrap(raw, host, port, deadline, (ip, port),
                                   strict_cert=strict_cert)
+        except ssl.CertificateError:
+            # v1.9.143 P2-1: 证书校验失败(hostname SAN 不匹配/过期)与"bootstrap IP
+            # 失效"是两回事——IP 是对的, 证书本身有问题。不清 bootstrap 缓存,
+            # 直接重抛(_doh_tls_wrap 内部已打 warning)。与 QUIC established 策略
+            # (quic_upstream.py:343-356) 及 DoT 路径对齐。
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise
         except Exception:
             try:
                 raw.close()
             except Exception:
                 pass
+            # TCP/TLS 传输层失败(非证书问题): bootstrap IP 可能已失效
+            # (CDN 调度/IP 变更) → 失效缓存, 下次回退系统解析。
             _bootstrap_invalidate(host)
             raise
         # R5 P3-5: conn.sock 已预赋值为 ssock, connect() 不会被调用,
@@ -1337,11 +1349,22 @@ def _dot_conn(host, port, timeout, strict_cert=False):
                 # 若攻击者可向受信 CA 申请到"链受信但无匹配 IP SAN"的证书, 降级会静默
                 # 放行 MITM; 强烈建议改用 hostname 上游(走严格主机名校验, 不进降级分支)。
                 sock._ebpdns_degraded = True
+    except ssl.CertificateError:
+        # v1.9.143 P2-1: 证书校验失败(hostname SAN 不匹配/过期)与"bootstrap IP 失效"
+        # 是两回事——IP 是对的, 证书本身有问题。不清 bootstrap 缓存, 直接重抛
+        # (握手 helper 内部已打 warning)。与 DoH _doh_conn 及 QUIC established 策略
+        # (quic_upstream.py:343-356) 对齐。
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
     except Exception:
         try:
             sock.close()
         except Exception:
             pass
+        # TCP/TLS 传输层失败(非证书问题): bootstrap IP 可能已失效(CDN 调度/IP 变更)
         if ip and ip != host:
             _bootstrap_invalidate(host)
         raise
@@ -1854,6 +1877,18 @@ def _tcp_query(up, query_bytes, timeout_ms):
                 #     (丢弃后回退/返回 False, 不上交残缺数据)。
                 # 残余缺口(UDP 被防火墙完全阻断、且 TCP 路径单独存在规范化中间设备)
                 # 为三重罕见场景, 不值得在回退路径再引入一套锁保护的失配计数状态机。
+                # v1.9.143 P2-2: 补 qid 比对, 与 DoT 路径(line 1438)及 UDP 四层校验
+                # (源 IP+端口+qid+0x20)对齐。明文 TCP 虽需完成三次握手才能注入(比
+                # UDP 难), 但 on-path 攻击者若能预测/抢到 TCP 序列号并注入一个 qname
+                # 大小写恰好匹配、但 qid 不同的伪造应答, 仅靠 0x20 会接受; 补 qid
+                # 比对成本极低(两次字节比较), 补齐四层校验对称。
+                if len(msg) >= 2 and bytes(msg[0:2]) != query_bytes[0:2]:
+                    # qid 不匹配: 帧错位/协议违规服务器多发帧/伪造应答, 丢弃并推进
+                    # 缓冲区到帧尾, 继续读取后续帧(与 DoT qid 失配处理同型)。
+                    buf = rest
+                    if not buf:
+                        break
+                    continue
                 if not dnsmsg.check_0x20(query_bytes, bytes(msg)):
                     # 被投毒的这一帧丢弃并推进缓冲区到帧尾, 继续读取后续帧。
                     # 原实现 buf 不推进: 下次 recv 追加后 parse_tcp_frame 仍反复解析

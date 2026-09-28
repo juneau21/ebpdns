@@ -278,6 +278,9 @@ table.tbl{width:100%; border-collapse:collapse; font-family:var(--font-mono); fo
 .cfg-row .lab{flex:1; font-size:13px}
 .cfg-row .lab small{display:block; color:var(--text3); font-size:11px; font-family:var(--font-mono); margin-top:1px}
 .cfg-row .val{display:flex; align-items:center; gap:8px}
+/* 逐条规则: group/forceIp 行动作带额外控件易溢出, 允许换行并保证删除按钮不被挤出可视区 */
+#rule-list .cfg-row{flex-wrap:wrap; row-gap:6px}
+#rule-list .cfg-row .del{flex-shrink:0}
 input.num{
   width:88px; background:var(--bg); border:1px solid var(--line2); border-radius:6px; color:var(--text);
   font-family:var(--font-mono); font-size:12px; padding:7px 9px; outline:none;
@@ -470,7 +473,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
     </nav>
     <div class="side-foot">
       <span class="dot"></span><span id="foot-mode">daemon 运行中</span>
-      <span class="uptime" id="foot-uptime">up 0m · v1.9.142</span>
+      <span class="uptime" id="foot-uptime">up 0m · v1.9.146</span>
     </div>
   </aside>
   <!-- ===================== 主区 ===================== -->
@@ -603,8 +606,11 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-prefetch"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">内核直答<small>用户态缓存命中即计为内核直答(XDP 内核旁路为预留接口)</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-kdirect"><span class="sl"></span></label></div></div>
-              <div class="cfg-row"><div class="lab">缓存持久化<small>落盘 cache.json · 每 60s 自动保存 + 退出保存, 重启后自动恢复</small></div>
-                <div class="val mono" id="cfg-cache-file" style="font-size:11px;color:var(--text3);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="">—</div></div>
+              <div class="cfg-row"><div class="lab">缓存持久化<small>总开关 · 关闭后不写盘也不从磁盘恢复; 开启时落盘 cache.json, 每 60s + 退出保存</small></div>
+                <div class="val">
+                  <label class="switch"><input type="checkbox" id="cfg-cachepersist"><span class="sl"></span></label>
+                  <div class="mono" id="cfg-cache-file" style="font-size:11px;color:var(--text3);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="">—</div>
+                </div></div>
               <div class="cfg-row"><div class="lab">下发 TTL 下限<small>seconds · 0=不限制; 内网客户端收到的应答 TTL 不低于此值（实际下发受报文格式上限 2147483647 ≈68 年钳制）</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-ttlmin" min="0" max="86400" step="5" placeholder="0"></div></div>
               <div class="cfg-row"><div class="lab">下发 TTL 上限<small>seconds · 0=不限制; 内网客户端收到的应答 TTL 不高于此值</small></div>
@@ -612,7 +618,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               <div class="cfg-row"><div class="lab">过期缓存兜底<small>serve-stale · 缓存过期后窗口内仍返回旧数据并后台刷新, 避免上游抖动时 SERVFAIL</small></div>
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-stale"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">兜底窗口<small>seconds · 过期后最多可返回旧数据的时间(超过则正常 miss)</small></div>
-                <div class="val"><input class="num" type="number" id="cfg-stalettl" min="0" max="86400" step="10"></div></div>
+                <div class="val"><input class="num" type="number" id="cfg-stalettl" min="0" max="8640000" step="10"></div></div>
               <div class="cfg-row"><div class="lab">持久化 TTL<small>seconds · 0=按保存时剩余 TTL 原样恢复; >0 时重启恢复的缓存统一用此 TTL, 配合预取长期保持</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-persistttl" min="0" max="31536000" step="60" placeholder="0"></div></div>
             </div>
@@ -661,7 +667,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
                 <div class="val"><label class="switch"><input type="checkbox" id="cfg-ipspeedcheck"><span class="sl"></span></label></div></div>
               <div class="cfg-row"><div class="lab">健康检查周期<small>seconds · 0=关闭主动健康检查</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-healthint" min="0" max="604800" step="10" placeholder="0"></div></div>
-              <div class="cfg-row"><div class="lab">规则订阅更新周期<small>seconds · 0=不自动更新订阅</small></div>
+              <div class="cfg-row"><div class="lab">规则订阅更新周期<small>自动重新拉取上方“规则订阅”链接的规则列表(写入 rules_sub.json 并重建索引) · 0=不自动更新</small></div>
                 <div class="val"><input class="num" type="number" id="cfg-rulesubint" min="0" max="604800" step="60" placeholder="0"></div></div>
               <div class="cfg-row"><div class="lab">Bootstrap DNS<small>引导解析 DoH/DoT 主机名用的普通 DNS 地址(仅支持单个, host:port 格式)</small></div>
                 <div class="val"><input class="text" type="text" id="cfg-bootstrapdns" placeholder="如 223.5.5.5:53" spellcheck="false" autocomplete="off"></div></div>
@@ -831,18 +837,18 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
             <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px">
               <div>
                 <b style="color:var(--cyan)">LRU 分区</b>（默认 · lru）<br>
-                8 分桶独立锁+OrderedDict，全局共享一个缓存池，实现简单开销低，适合热点集中场景。缺点：一次性查询会污染缓存挤出热点；不同分流 group 的条目互相挤占。
+                按分流 group（domestic/global/default）隔离的 LRU 缓存池，默认容量比 0.2/0.2/0.6，各 group 互不挤占；每个分区内部再 8 分桶独立锁+OrderedDict。适合分流规则多、希望不同流量互不影响的场景。
               </div>
               <div>
                 <b style="color:var(--cyan)">分区 LRU</b>（partitioned）<br>
-                按分流 group（domestic/global/default 等）隔离独立缓存池，容量按 cache_partitions 比例分配，各 group 互不挤占。适合分流规则多、希望不同流量互不影响的场景。
+                与 lru 同一分区引擎（PartitionedCache），显式声明分区模式并按 cache_partitions 自定义各 group 的容量权重（自动归一化）。适合需要手动调整各分流组缓存占比的场景。
               </div>
               <div>
                 <b style="color:var(--cyan)">W-TinyLFU</b>（tinylfu）<br>
                 Caffeine 风格三段式：window(1%) → probation(20%) → protected(80%) + Count-Min Sketch 频率估计。一次性访问在窗口区即淘汰，高频条目受保护不被挤出，抗扫描污染，命中率通常高 5-15%。额外内存约 512KB。
               </div>
             </div>
-            <div style="margin-top:8px; color:var(--text3); font-size:12px">切换策略后自动热重载重建缓存（已有缓存会清空），建议运行 24 小时对比命中率再决定长期策略。</div>
+            <div style="margin-top:8px; color:var(--text3); font-size:12px">lru ↔ tinylfu 切换后自动热重载重建缓存（已有缓存会清空），建议运行 24 小时对比命中率再决定长期策略。map_type（LRU_HASH/LRU/LPM_TRIE）为 BPF Map 类型语义标记，当前用户态实现下不改变上述淘汰引擎。</div>
           </div>
         </div>
       </section>
@@ -906,14 +912,14 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
           <div class="card-bd">
             <div class="kicker">SmartDNS 式智能解析</div>
             <div style="font-size:22px;font-weight:700;margin:6px 0 10px">用户态数据面 + 可选 eBPF XDP 内核旁路</div>
-            <p style="color:var(--text2);max-width:900px;margin:0" id="about-intro">本应用是仿照 <b>SmartDNS</b> 构建的智能 DNS 解析软件。默认数据面运行在<b>用户态</b>: daemon 监听 <b>UDP/TCP :53</b>(IPv4), IPv6 <code>UDP6/TCP6</code> 需在配置中显式写出地址(默认不开启), 以<b>用户态 LRU 缓存模拟 BPF LRU_HASH Map</b>——查询命中时由 daemon 主线程直接回包(快路径, 响应体预编码), 未命中时进入 SmartDNS 式解析引擎: <b>六协议上游</b>(UDP/TCP/DoH/DoT/DoH3/DoQ) 多路并发、<b>测速择优、域名分流、CNAME 链展开、TTL 预取</b>, 结果回填 LRU 并落盘持久化。内置 <b>缓存投毒防护</b>(0x20 查询名随机化)、<b>EDNS0 防分片</b>(UDP size 1232)、<b>加密查询填充</b>(RFC8467)、<b>双栈智能</b>(有 A 记录才屏蔽 AAAA, 纯 v6 不误伤)。整套运行<b>无需内核权限</b>。同时保留 <b>eBPF XDP 内核旁路</b>预留接口(<code>bpf/</code> 目录参考实现), 可在支持原生 XDP 的网卡上把缓存命中下沉到内核直答, 作为进阶加速选项。</p>
+            <p style="color:var(--text2);max-width:900px;margin:0" id="about-intro">本应用是仿照 <b>SmartDNS</b> 构建的智能 DNS 解析软件。默认数据面运行在<b>用户态</b>: daemon 监听 <b>UDP/TCP :53</b>(IPv4 回环), IPv6 默认监听回环 <code>[::1]:53</code>(无 IPv6 栈仅告警跳过, 不希望监听可置 null, 需全网卡改 <code>[::]:53</code>), 以<b>用户态 LRU 缓存模拟 BPF LRU_HASH Map</b>——查询命中时由 daemon 主线程直接回包(快路径, 响应体预编码), 未命中时进入 SmartDNS 式解析引擎: <b>六协议上游</b>(UDP/TCP/DoH/DoT/DoH3/DoQ) 多路并发、<b>测速择优、域名分流、CNAME 链展开、TTL 预取</b>, 结果回填 LRU 并落盘持久化。内置 <b>缓存投毒防护</b>(0x20 查询名随机化)、<b>EDNS0 防分片</b>(UDP size 1232)、<b>加密查询填充</b>(RFC8467)、<b>双栈智能</b>(有 A 记录才屏蔽 AAAA, 纯 v6 不误伤)。整套运行<b>无需内核权限</b>。同时保留 <b>eBPF XDP 内核旁路</b>预留接口(<code>bpf/</code> 目录参考实现), 可在支持原生 XDP 的网卡上把缓存命中下沉到内核直答, 作为进阶加速选项。</p>
           </div>
         </div>
         <div class="arch-grid">
           <div class="card">
             <div class="card-hd"><span class="t">实际数据面路径</span><span class="s">data path</span></div>
             <div class="arch-flow">
-              <div class="arch-node"><div class="tag tag-usr">DNS LISTEN</div><div class="bd"><h4>报文入口 (IPv4 + 可选 IPv6)</h4><p><code>server.py</code> 监听 UDP4/TCP4 :53; IPv6 UDP6/TCP6 仅当配置显式给出地址(如 <code>[::]:53</code>)才绑定, 默认不监听, 无 IPv6 栈自动跳过仅告警。解析 (qname, qtype) 后主线程查缓存; 命中走<b>快路径</b>直接回包(响应体预编码, 仅重拼 qid), miss 交解析引擎。</p></div></div>
+              <div class="arch-node"><div class="tag tag-usr">DNS LISTEN</div><div class="bd"><h4>报文入口 (IPv4 + IPv6 回环默认开)</h4><p><code>server.py</code> 监听 UDP4/TCP4 :53（默认回环 127.0.0.1）; IPv6 UDP6/TCP6 默认绑定回环 <code>[::1]:53</code>（无 IPv6 栈自动跳过仅告警; 不希望监听可置 null, 需全网卡改 <code>[::]:53</code>）。解析 (qname, qtype) 后主线程查缓存; 命中走<b>快路径</b>直接回包(响应体预编码, 仅重拼 qid), miss 交解析引擎。</p></div></div>
               <div class="arch-node"><div class="tag tag-bpf">LRU MAP</div><div class="bd"><h4>用户态缓存 (模拟 BPF Map)</h4><p><code>cache.py</code> 以用户态 LRU 模拟 <code>BPF_MAP_TYPE_LRU_HASH</code>: 存 (qname, qtype) → 答案 + TTL; 支持<b>按分流 group 分区</b>淘汰、TTL 钳制(ttl_min/max + 规则级覆盖)、负缓存(NXDOMAIN)、serve-stale 过期兜底、剩余 TTL 落盘持久化, 重启自动恢复。</p></div></div>
               <div class="arch-node"><div class="tag tag-usr">RESOLVER</div><div class="bd"><h4>SmartDNS 式解析引擎</h4><ul><li>域名分流: 精确 / *.通配 / 中缀通配 / re:正则 / forceIp / block (三层哈希索引, 10 万条级 &lt;1ms) + URL 订阅自动更新 + 独立文件存储</li><li>多上游并发: UDP / TCP / DoH / DoT / DoH3 / DoQ 六协议, 首答即返, 连接池复用</li><li>测速择优(EWMA) + 连接级健康度 + 慢速降级 + 熔断 + 失败降级(fallback) + IPv4 优先(双栈智能)</li><li>CNAME 链跟踪展开 + 负缓存 + TTL 到期前预取 + 规则级 TTL 覆盖</li><li>安全: 0x20 投毒防护 / EDNS0 1232 防分片 / RFC8467 加密查询填充</li></ul></div></div>
               <div class="arch-node"><div class="tag tag-sys">UPSTREAM + API</div><div class="bd"><h4>上游与观测</h4><p><code>upstream.py</code> 六协议连接复用(DoH/DoT/DoQ 连接池) + 熔断; <code>quic_upstream.py</code> 提供 DoH3/DoQ (aioquic 可选, 缺失自动降级); <code>telemetry.py</code> 计数 / 历史 / Top N / 规则命中统计; <code>api.py</code> HTTP JSON API: 查询 / 配置热重载 / 重启 / 规则 CRUD / 一键重测速 / 性能剖析 / metrics, Web 控制台实时展示遥测 / 健康度 / 实时日志筛选 / Map 占用。</p></div></div>
@@ -1004,7 +1010,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 /* ---------------- 模式与 API ---------------- */
 let MODE = 'sim';                 // 'real' | 'sim'
-const APP_VERSION = "v1.9.142";    // 前端兜底版本(REAL 模式由 /api/status.version 动态覆盖, 见 pollStatus/boot)
+const APP_VERSION = "v1.9.146";    // 前端兜底版本(REAL 模式由 /api/status.version 动态覆盖, 见 pollStatus/boot)
 let real = { status:null, snapshot:null, config:null, logs:[], logSeq:0, upstreams:[], rules:[], hiddenHistoryBefore:null, deletedIds:{} };
 const API = {
   // P1-1(R2 审查): 读取 localStorage 中的 API token(用户在「配置 → 连接设置」中保存)。
@@ -1903,6 +1909,7 @@ function renderConfig(){
     $('#cfg-ttlmin').value = c.ttl_min || 0; $('#cfg-ttlmax').value = c.ttl_max || 0;
     $('#cfg-stale').checked = !!c.serve_stale; $('#cfg-stalettl').value = c.stale_ttl || 3600;
     $('#cfg-persistttl').value = c.persist_ttl || 0;
+    $('#cfg-cachepersist').checked = c.cache_persist !== false;
     $('#cfg-speed').checked = !!c.speed_test; $('#cfg-spint').value = c.speed_interval_ms;
     $('#cfg-fallback').checked = !!c.fallback; $('#cfg-maxup').value = c.max_parallel_upstreams || 3; $('#cfg-v4first').checked = !!c.ipv4_first;
     $('#cfg-v6').checked = !!c.ipv6; $('#cfg-v4smart').checked = !!c.prefer_ipv4;
@@ -1948,6 +1955,7 @@ function renderConfig(){
     $('#cfg-ttlmin').value = config.ttl_min || 0; $('#cfg-ttlmax').value = config.ttl_max || 0;
     $('#cfg-stale').checked = config.serve_stale; $('#cfg-stalettl').value = config.stale_ttl;
     $('#cfg-persistttl').value = config.persist_ttl || 0;
+    $('#cfg-cachepersist').checked = config.cache_persist !== false;
     $('#cfg-speed').checked = config.speed_test; $('#cfg-spint').value = config.speed_interval_ms;
     $('#cfg-fallback').checked = config.fallback; $('#cfg-maxup').value = config.max_parallel_upstreams || 3; $('#cfg-v4first').checked = config.ipv4_first;
     $('#cfg-v6').checked = config.ipv6; $('#cfg-v4smart').checked = config.prefer_ipv4;
@@ -2049,14 +2057,14 @@ function renderRules(rules){
   box.innerHTML = (truncated ? '<div class="empty" style="padding:14px;text-align:center;color:var(--text3);border-bottom:1px solid var(--line);">本地规则共 <b style="color:var(--amber)">' + rules.length + '</b> 条, 为避免浏览器卡顿仅显示前 ' + RULE_RENDER_LIMIT + ' 条。大规模规则请使用上方「规则订阅」方式管理。</div>' : '') +
     visible.map(r =>
     '<div class="cfg-row">' +
-    '<input class="text" data-r="match" data-id="' + esc(r.id) + '" value="' + esc(r.match) + '" placeholder="*.example.com" style="width:190px">' +
+    '<input class="text" data-r="match" data-id="' + esc(r.id) + '" value="' + esc(r.match) + '" placeholder="*.example.com" style="width:150px">' +
     '<select class="q-sel" data-r="action" data-id="' + esc(r.id) + '">' + ['group','forceIp','block','allow'].map(a => '<option value="' + a + '"' + (r.action === a ? ' selected' : '') + '>' + ACTION_LABEL[a] + '</option>').join('') + '</select>' +
     (r.action === 'group' ? '<select class="q-sel" data-r="group" data-id="' + esc(r.id) + '">' + ['domestic','global'].map(g => '<option value="' + g + '"' + (r.group === g ? ' selected' : '') + '>' + GROUP_LABEL[g] + '</option>').join('') + '</select>' : '') +
-    (r.action === 'forceIp' ? '<input class="text" data-r="ip" data-id="' + esc(r.id) + '" value="' + esc(r.ip || '') + '" placeholder="1.2.3.4">' : '') +
+    (r.action === 'forceIp' ? '<input class="text" data-r="ip" data-id="' + esc(r.id) + '" value="' + esc(r.ip || '') + '" placeholder="1.2.3.4" style="width:110px">' : '') +
     // P3-1(第七轮审查): r.ttl_min/r.ttl_max 直接拼入 value 属性未 esc(), 与已修的
     // port/latency 转义风格对齐, 统一走 esc(String(...)) 防属性注入。
-    '<input class="num" data-r="ttl_min" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_min != null && r.ttl_min !== '' ? esc(String(r.ttl_min)) : '') + '" placeholder="TTL↓" title="规则级 TTL 下限(秒), 覆盖全局下发 TTL 下限; 留空继承全局" style="width:62px">' +
-    '<input class="num" data-r="ttl_max" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_max != null && r.ttl_max !== '' ? esc(String(r.ttl_max)) : '') + '" placeholder="TTL↑" title="规则级 TTL 上限(秒), 覆盖全局下发 TTL 上限; 留空继承全局" style="width:62px">' +
+    '<input class="num" data-r="ttl_min" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_min != null && r.ttl_min !== '' ? esc(String(r.ttl_min)) : '') + '" placeholder="TTL↓" title="规则级 TTL 下限(秒), 覆盖全局下发 TTL 下限; 留空继承全局" style="width:56px">' +
+    '<input class="num" data-r="ttl_max" data-id="' + esc(r.id) + '" type="number" min="0" max="86400" step="5" value="' + (r.ttl_max != null && r.ttl_max !== '' ? esc(String(r.ttl_max)) : '') + '" placeholder="TTL↑" title="规则级 TTL 上限(秒), 覆盖全局下发 TTL 上限; 留空继承全局" style="width:56px">' +
     '<button class="del" data-delrule="' + esc(r.id) + '" style="margin-left:auto">×</button></div>'
   ).join('');
   bindRuleEvents();
@@ -2302,8 +2310,9 @@ function bindConfigEvents(){
   bindCfg('#cfg-ttlmin','ttl_min', e => clamp(+e.target.value,0,86400));
   bindCfg('#cfg-ttlmax','ttl_max', e => clamp(+e.target.value,0,86400));
   bindCfg('#cfg-stale','serve_stale', e => e.target.checked);
-  bindCfg('#cfg-stalettl','stale_ttl', e => clamp(+e.target.value,0,86400));
+  bindCfg('#cfg-stalettl','stale_ttl', e => clamp(+e.target.value,0,8640000));
   bindCfg('#cfg-persistttl','persist_ttl', e => clamp(+e.target.value,0,31536000));
+  bindCfg('#cfg-cachepersist','cache_persist', e => e.target.checked);
   bindCfg('#cfg-speed','speed_test', e => e.target.checked);
   bindCfg('#cfg-spint','speed_interval_ms', e => clamp(+e.target.value,0,60000));
   bindCfg('#cfg-fallback','fallback', e => e.target.checked);
@@ -2941,7 +2950,17 @@ function _scheduleStatusPoll(){
   clearTimeout(_statusTimer);
   _statusTimer = setTimeout(() => {
     // finally 保证无论成功/失败都排下一轮(pollStatus 内部已 catch, 此处双保险)
-    pollStatus().finally(() => { _statusTimer = null; _scheduleStatusPoll(); });
+    // R13 P2-1: 401 认证失效后 .finally 必须加 _authLostNotified 闸门——
+    // pollStatus 命中 401 时 catch→_onAuthLost()→_stopStatusPoll() 清除的是
+    // 「已触发」的那个 setTimeout 句柄(clearTimeout 空操作), 若 .finally 仍无条件
+    // 调 _scheduleStatusPoll(), 会重新武装一个 2s 定时器; 且后续 401 路径在
+    // statusFail++ 之前 return, statusFail 不增长, 退避恒为 2s, 导致每 2s 空打 401
+    // 直到手动 reload。认证失效后停止自调度链, 等用户重填 token 触发 location.reload()
+    // 重建定时器即可。
+    pollStatus().finally(() => {
+      _statusTimer = null;
+      if (!_authLostNotified) _scheduleStatusPoll();
+    });
   }, _statusPollMs());
 }
 function _stopStatusPoll(){ clearTimeout(_statusTimer); _statusTimer = null; }

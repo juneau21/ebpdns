@@ -44,6 +44,7 @@ DEFAULTS = {
     "serve_stale": False,        # 过期缓存兜底: 缓存过期后在 stale 窗口内仍返回旧数据并后台刷新
     "stale_ttl": 3600,           # 过期兜底窗口(秒), 超过后过期条目视为失效进入正常 miss
     "persist_ttl": 0,            # 持久化缓存恢复后的独立 TTL(秒), 0=按保存时剩余 TTL 原样恢复; 上限 31536000(一年)
+    "cache_persist": True,       # 缓存持久化总开关: 关闭后不写盘(周期/退出保存均不生效)也不从磁盘载入
     "prefetch": True,
     "kernel_direct": True,          # 缓存命中语义标记"内核直答"（真实 XDP 数据面时启用）
     "speed_test": True,             # 测速择优
@@ -355,7 +356,7 @@ _NUM_RANGES = {
     # 为秒, speed_interval_ms 为毫秒(604800ms≈10min, 测速间隔过长即失去择优意义)。
     "health_check_interval": (0, 604800),
     "max_parallel_upstreams": (1, 16),
-    "stale_ttl": (0, None),
+    "stale_ttl": (0, 8_640_000),   # 上限 100 天(与前端 UI max / api 校验同口径)
     "persist_ttl": (0, 31_536_000),
     "speed_interval_ms": (0, 604800),
     "speed_timeout_ms": (1, 60000),
@@ -386,7 +387,7 @@ _MAP_TYPES = frozenset(("LRU_HASH", "LRU", "LPM_TRIE"))
 _BOOL_KEYS = {
     "prefetch", "serve_stale", "kernel_direct", "speed_test", "fallback",
     "ipv4_first", "ipv6", "edns", "padding", "rebind_protection",
-    "ip_speed_check", "dnssec_0x20", "prefer_ipv4",
+    "ip_speed_check", "dnssec_0x20", "prefer_ipv4", "cache_persist",
 }
 
 

@@ -142,8 +142,9 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | `listen.udp6` / `listen.tcp6` | `[::1]:53` | IPv6 DNS 监听，默认开启（仅回环 `[::1]:53`；系统无 IPv6 协议栈时仅告警跳过，不影响 IPv4 服务）。不希望监听 IPv6 时显式设为 `null`，需全网卡可改 `[::]:53` |
 | `api.host` / `api.port` | `127.0.0.1` / `8080` | API 与 Web 控制台监听（默认仅本机回环，天然安全无需 token；模板与 install.sh 均为 `127.0.0.1:8080`，需局域网访问时显式改 `0.0.0.0` 并配 `api.token`） |
 | `cache_size` | 131072 | 用户态缓存容量（模拟 BPF Map 容量，范围 1–10000000，配置值越界会被 API 拒绝） |
-| `cache_policy` | `lru` | 缓存淘汰策略：`lru`=8 分桶 LRU（全局共享池，开销最低）；`partitioned`=按分流 group 隔离独立缓存池（各 group 互不挤占）；`tinylfu`=W-TinyLFU 三段式（抗扫描污染，命中率通常高 5-15%，额外内存约 512KB）。切换后自动热重载重建缓存 |
-| `cache_partitions` | 见配置 | partitioned 模式下各 group 的容量比例分配（如 domestic/global/default），仅 cache_policy=partitioned 时生效 |
+| `cache_policy` | `lru` | 缓存淘汰策略：`lru`=按分流 group 分区隔离的 LRU（PartitionedCache，domestic/global/default 默认容量比 0.2/0.2/0.6，各 group 互不挤占；每个分区内部再 8 分桶独立锁）；`partitioned`=与 `lru` 同一分区引擎，显式声明分区模式并按 `cache_partitions` 自定义各 group 容量比例；`tinylfu`=W-TinyLFU 单池三段式（Count-Min Sketch 频率估计，抗扫描污染，命中率通常高 5-15%，额外内存约 512KB）。切换 lru↔tinylfu 自动热重载重建缓存 |
+| `cache_partitions` | `null` | partitioned/lru 模式下各 group 的容量权重（如 `{"domestic":0.2,"global":0.2,"default":0.6}`，自动归一化到和为 1）。`null`=默认 0.2/0.2/0.6；仅 group 键 domestic/global/default 合法，未知键剔除、负权重回退默认 |
+| `map_type` | `LRU_HASH` | 缓存 BPF Map 类型语义标记（保留大写，不做大小写归一）：`LRU_HASH`（默认，LRU 哈希表，最通用）/ `LRU`（纯 LRU 链表）/ `LPM_TRIE`（最长前缀匹配树，面向按网段路由的场景）。当前为纯用户态 Python 实现，`map_type` **仅作语义标记与控制台/API 展示**，不改变淘汰引擎（淘汰引擎由 `cache_policy` 决定）；真实 XDP 数据面集成时据此选择内核 map 类型。非法值回退 `LRU_HASH` |
 | `ttl` | 300 | 缓存默认 TTL（秒），实际取上游返回 TTL 与它的较小值 |
 | `ttl_min` / `ttl_max` | 0 / 0 | 下发 TTL 管控：内网客户端应答 TTL 钳制到该区间（0=不限制），同时作为缓存存活时长 |
 | `serve_stale` / `stale_ttl` | false / 3600 | 过期缓存兜底：缓存过期后在窗口内仍返回旧数据（下发 TTL=0）并后台强制刷新，避免上游抖动时 SERVFAIL |
@@ -171,10 +172,11 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 > **默认上游**（v1.7.7 起，后续版本持续扩充）：内置 2 个国内 UDP 兜底 + 20 个 DoH/DoH3 端点（AliDNS/DNSPod 的域名与 IP 直连、Cloudflare/Google/Quad9/NextDNS/OpenDNS/DNS.SB/AdGuard/HiNet）。其中国内 9 项默认启用（首次启动自动实测延迟写回），海外 4 项默认启用、其余海外端点已写入但默认 `enabled:false`，可在控制台按需启用（海外端点受网络环境限制，走超时/熔断自动降级）。
 > **DoQ / DoH3（v1.8.0，可选依赖 aioquic）**：`proto:"doq"`（DNS over QUIC，RFC 9250，默认端口 853）与 `proto:"doh3"`（HTTP/3 DoH，默认端口 443）已内置实现。每个 QUIC 上游维护一条常驻连接（断线自动重连 + 查询失败主动重建），多查询在同一连接上多路复用；未安装 aioquic 时相应上游返回「aioquic 未安装」错误，不影响 UDP/TCP/DoH/DoT 路径。安装：`sudo pip3 install aioquic`（Debian 13 用户级安装 `pip3 install --user aioquic`）。`server-http3` 端点可直接配置为 `proto:"doh3"`。
 | `rules[]` | 见模板 | `match`: 精确域名或 `*.example.com` 通配；`action`: group/forceIp/block；规则按哈希索引匹配（10 万条级 O(1)）。规则可带 `ttl_min`/`ttl_max`（规则级 TTL）：命中规则时**整体替换**全局 TTL 区间（未显式设置的边界按 0=不限制），用于 CDN/动态域名保持短 TTL 及时更新、稳定域名拉长 TTL 提升命中率。逐条规则在控制台规则行直接填写，留空继承全局 |
-| `cache_file` | `/etc/ebpdns/cache.json` | 缓存持久化落盘路径（每 60s 自动保存 + 退出时保存，重启自动恢复） |
+| `cache_file` | `/etc/ebpdns/cache.json` | 缓存持久化落盘路径（每 60s 自动保存 + 退出时保存，重启自动恢复）。路径由 `cache_file` 配置派生，控制台保存配置时保留用户自定义路径不被剥离 |
+| `cache_persist` | `true` | 缓存持久化总开关。开启时按 `cache_file` 周期/退出落盘并在启动时恢复；**关闭后既不写盘也不从磁盘载入**（周期保存与退出保存均失效）。布尔值，非布尔回退默认 |
 | `log_level` | info | 日志级别 |
 
-配置可在**控制台「配置」页**在线编辑并「应用配置」持久化到后端；除 `cache_size` 外全部即时生效（PUT /api/config 后无需重启）。`hook` / `map_type` / `percpu` 为 eBPF 数据面预留语义标记（真实 XDP 未集成）。
+配置可在**控制台「配置」页**在线编辑并「应用配置」持久化到后端；除 `cache_size` 外全部即时生效（PUT /api/config 后无需重启）。`hook` / `percpu` 为 eBPF 数据面预留语义标记（真实 XDP 未集成）；`map_type` 三种取值见上表，当前仅作语义标记/展示，真实淘汰引擎由 `cache_policy` 决定。
 
 ---
 
@@ -211,7 +213,7 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | POST | `/api/rules/subscribe/update` | 手动立即重拉全部订阅 |
 | GET | `/api/cache/stats` | 缓存统计（`cache.summary()` + 条目数） |
 | POST | `/api/reprobe` | 一键重新测速：对所有启用上游并发实测延迟并写回配置 |
-| POST | `/api/restart` | 重启服务（systemd 托管用 `systemctl restart`；手动运行时 `os.execv` 重启自身） |
+| POST | `/api/restart` | 重启服务（延迟触发：先返回 200 再在后台执行）。**systemd 托管时进程自退出**：不再调用 `systemctl restart`（v1.9.137 起以专用用户运行，polkit 拒绝非 root restart 系统 unit），改为置退出码 3 后向自身发 SIGTERM 走优雅收尾（缓存落盘/停 server/停池），进程以非零码退出，由 unit `Restart=on-failure` 拉起新实例；手动裸跑时用 `os.execvpe` 以相同参数替换自身进程。防重入：重启进行中重复调用返回 409 |
 | POST | `/api/reload` | 热重载配置（与 SIGHUP 等价，原子换配置引用，返回 changed 明细，无需重启） |
 | POST | `/api/reset` | 重置遥测计数与清空缓存 |
 | POST | `/api/profile` | cProfile 性能剖析采样 N 秒（默认 5，上限 30，返回 Top 25；仅 POST 触发） |
@@ -362,6 +364,14 @@ ebpdns/
 ---
 
 ## 13. 版本历史（要点）
+
+- **v1.9.144**：文档与代码严格对齐（本版为文档同步版，无数据面行为变更）。
+  - **`map_type` 三模式文档化**：`LRU_HASH`（默认）/ `LRU` / `LPM_TRIE` 为 BPF Map 类型语义标记（保留大写），当前纯用户态实现下仅作控制台/API 展示，不改变淘汰引擎（淘汰引擎由 `cache_policy` 决定）；非法值回退 `LRU_HASH`。
+  - **`cache_persist` 持久化总开关文档化**：默认 `true`；关闭后既不写盘也不从磁盘恢复（周期/退出保存均失效）。
+  - **`cache_policy` 行为订正**：`lru` 与 `partitioned` 均为按分流 group 分区隔离的 PartitionedCache（默认容量比 domestic/global/default = 0.2/0.2/0.6，各分区内部 8 分桶 LRU）；`tinylfu` 为 W-TinyLFU 单池。订正旧文档把 `lru` 描述成"全局共享池"的错误。
+  - **`/api/restart` 自退出机制文档化**：systemd 托管时不再 `systemctl restart`，改为进程发 SIGTERM 优雅收尾后以退出码 3 退出，由 `Restart=on-failure` 拉起新实例；手动裸跑仍 `os.execvpe` 替换自身。
+  - **上游高级选项 / NXDOMAIN quorum / 证书校验**：`weight`(0–1000)/`allow_private_ip`(默认 false)/`doh_strict_cert`·`dot_strict_cert`(默认 true，仅显式 false 才降级)/`nxdomain_quorum`(默认 2，自动钳到健康上游数) 与代码对齐。
+  - **`cache_partitions` 缺省 `default` 分组崩溃修复（v1.9.143 代码）**：用户自定义分区未含 `default` 键时，原回退为空操作导致 `KeyError`；改为回退到第一个可用分区，极端空配置返回 no-op。
 
 - **v1.9.141**：文档与行为对齐，收敛近期多项加固与新功能（本节按现状补记）。
   - **上游 weight 加权轮询**：上游选择排序 key = 实测延迟 `eff_lat / max(1.0, weight)`；`weight` 默认 1，范围 0–1000、支持小数（<1 按 1 计）。前端上游行「高级选项」列已加权重输入框。

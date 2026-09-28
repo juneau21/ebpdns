@@ -189,6 +189,9 @@ def _save_cache(cfg, config_path, cache):
     """原子写缓存快照到磁盘（tmp + fsync + rename）。
     v1.9.83: 改用 json.dump 直写文件, 避免在内存中构建完整 JSON 字符串+bytes,
     65536 条缓存时瞬时峰值省 ~15MB (验证: json.dumps+encode 119.6MB → json.dump 104.2MB)。"""
+    # v1.9.143: 缓存持久化总开关关闭时直接跳过(周期保存/退出保存统一在此 gate)。
+    if not cfg.get("cache_persist", True):
+        return 0
     path = _default_cache_file(cfg, config_path)
     # R38 P3-1: tmp 提到 try 外, 与 save_config/save_local_rules/_save_subs 同型,
     # 便于 except 分支清理残留 .tmp
@@ -220,6 +223,9 @@ def _save_cache(cfg, config_path, cache):
 
 def _load_cache(cfg, config_path, cache):
     """启动时从磁盘载入缓存（过滤已过期条目）。返回载入条数。"""
+    # v1.9.143: 持久化总开关关闭时不载入磁盘缓存。
+    if not cfg.get("cache_persist", True):
+        return 0
     path = _default_cache_file(cfg, config_path)
     try:
         if not os.path.isfile(path):
@@ -493,7 +499,9 @@ def run(cfg, config_path=None):
             if _save_tick >= _CACHE_SAVE_INTERVAL:
                 _save_tick = 0
                 try:
-                    n = _save_cache(cfg, config_path, app_ctx.resolver.cache)
+                    # v1.9.143: 用 app_ctx.cfg 而非闭包捕获的启动期 cfg, 与 reload 后状态对齐
+                    # (cache_persist 开关 / cache_file 路径在热重载时可能变更)
+                    n = _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
                     if n:
                         log.info("缓存持久化 %d 条 → %s", n, cache_file)
                 except Exception:
@@ -570,8 +578,10 @@ def run(cfg, config_path=None):
     # 再保存持久化缓存(此时 DNS 已停止, 不占用服务中断时间)。
     # R43 P3-1: 上方 join(timeout=2.0) 为 best-effort, 极端慢盘下 sampler 可能仍在途写;
     # 但 _save_cache 已由 _cache_save_lock 互斥, 此处会等待在途写完成再写, 不会并发写同一 tmp。
+    # v1.9.143: 用 app_ctx.cfg 而非闭包捕获的启动期 cfg, 与 reload 后状态对齐
+    # (cache_persist 开关 / cache_file 路径在热重载时可能变更), 与 _fatal_exit 对齐。
     try:
-        _save_cache(cfg, config_path, app_ctx.resolver.cache)
+        _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
     except Exception:
         pass
     # 停止预取/线程池(阻止解释器退出时 join 阻塞)

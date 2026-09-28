@@ -37,6 +37,18 @@ sudo ./load.sh eth0  # 挂载到 eth0
   - 可用 `bpftool map update` 手工回填，或用 libbpf（C）/ bcc（Python）在 daemon 内集成
 - 直答模式下建议将 `/etc/ebpdns/config.json` 的 `kernel_direct` 保持 `true`（语义与遥测一致）
 
+## `map_type` 配置（BPF Map 类型语义标记）
+
+`/etc/ebpdns/config.json` 的 `map_type` 字段对齐 BPF map 类型命名，合法值（保留大写）：
+
+| `map_type` | BPF map 类型 | 适用场景 |
+|---|---|---|
+| `LRU_HASH`（默认） | `BPF_MAP_TYPE_LRU_HASH` | 哈希表 + LRU 自动淘汰，DNS 缓存最通用，本参考实现即此类型 |
+| `LRU` | `BPF_MAP_TYPE_LRU` | 纯 LRU 链表（无哈希，按键遍历语义不同，DNS 缓存一般不用） |
+| `LPM_TRIE` | `BPF_MAP_TYPE_LPM_TRIE` | 最长前缀匹配树，面向按网段路由的 key（如按目的 IP 网段分流） |
+
+> **重要**：当前 daemon 为纯用户态 Python 实现，`map_type` **仅作语义标记与控制台/API 展示**，不改变实际淘汰引擎——淘汰策略由 `cache_policy`（`lru` / `partitioned` / `tinylfu`）决定。仅在把命中真正下沉到本 `bpf/` 内核数据面时，`map_type` 才对应到实际创建的 BPF map 类型。非法值启动时回退默认 `LRU_HASH` 并告警。
+
 ## 卸载
 
 ```bash
