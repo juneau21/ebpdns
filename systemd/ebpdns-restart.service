@@ -8,3 +8,10 @@ Type=oneshot
 # 主进程在 SIGTERM 处理钩子里优雅收尾(先把内存缓存落盘 cache.json 再退出),
 # 随后 systemd 按 Restart=on-failure 策略拉起全新实例。并非"先 reload 再 restart"。
 ExecStart=/bin/systemctl restart ebpdns.service
+# P3-1(R4 审查): oneshot 固定命令路径, 无变量拼接, 但作为 system 级 root 服务仍加
+# 纵深硬化——NoNewPrivileges 防提权, ProtectSystem=strict/ProtectHome/PrivateTmp
+# 进一步收敛文件系统视图(本 unit 只调用 systemctl, 不写任何文件)。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

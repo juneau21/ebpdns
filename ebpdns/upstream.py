@@ -170,9 +170,11 @@ def _cached_udp_addrs(host, timeout=None):
             _addr_cache[host] = (fs, now + _ADDR_CACHE_TTL)
             # 安全上限: 超长运行/大量上游动态添加时防 dict 无限增长
             if len(_addr_cache) > _ADDR_CACHE_MAX:
-                # 简单淘汰: 删除已过期或最旧的条目
+                # R2-NET-P3-4: 一次清光全部已过期项(原实现只清一半过期项, 另一半
+                # 残留至下次访问 miss)。过期条目命中时 hit[1] > now 为 False 本就会
+                # miss 重解析, 清光只提升缓存效率, 不改正确性。
                 expired = [k for k, (_, exp) in _addr_cache.items() if exp <= now]
-                for k in expired[:len(expired) // 2 + 1]:
+                for k in expired:
                     _addr_cache.pop(k, None)
                 if len(_addr_cache) > _ADDR_CACHE_MAX:
                     # 仍超限: 删除前 1/4 最旧项
@@ -389,8 +391,11 @@ def bootstrap_resolve(host, bootstrap_dns="223.5.5.5:53", timeout=3):
         if ip is None:
             ip = _ask(28)
         if ip is not None:
-            with _bootstrap_lock:
-                _bootstrap_cache[host] = (ip, time.monotonic())
+            # R1 P2-1: 原实现直写 _bootstrap_cache[host]=(ip, now), 绕过 _bootstrap_set
+            # 的容量淘汰逻辑(_BOOTSTRAP_CACHE_MAX=256)。bootstrap_resolve_all 启动时并发
+            # 对大量 DoH/DoT 上游调本函数, 直写会让缓存无界增长。改走 _bootstrap_set
+            # 复用容量淘汰(它内部自取 _bootstrap_lock, 此处不再重复加锁)。
+            _bootstrap_set(host, ip)
             return ip
     except Exception as e:
         log.debug("bootstrap resolve failed for %s: %r", host, e)
@@ -488,26 +493,34 @@ def _bootstrap_set(host, ip):
     bootstrap 失效只清坏 IP; 正常解析出的新 IP 必须重建缓存, 否则该上游后续
     每次 DoH/DoT 建连都要再走一次阻塞 getaddrinfo(v1.9.66 引入的残余退化)。
     仅对 hostname 生效, 幂等覆盖旧值。缓存条目为 (ip, monotonic_ts),
-    供 _bootstrap_ip 做 TTL 过期判断。"""
+    供 _bootstrap_ip 做 TTL 过期判断。
+    R12 P3-7: 本函数在 DoH/DoT 已通过 qid/源/长度校验的 happy-path 上被调用,
+    其写回(纯内存 dict 操作)若抛异常(锁/内存等), 原实现会穿透并丢弃一份完全
+    合法响应、关闭连接、返回失败——把缓存写入的可靠性与数据面成功强耦合。改为
+    内部兜底: 任何写回异常仅 debug 记录, 不向外抛, 保证已校验响应正常上交。
+    """
     if not host or not ip or host == ip or not _is_hostname(host):
         return
-    with _bootstrap_lock:
-        _bootstrap_cache[host] = (ip, time.monotonic())
-        # R7 P3-1: 与 _addr_cache 对称的容量上限淘汰, 防 dict 无限增长。
-        if len(_bootstrap_cache) > _BOOTSTRAP_CACHE_MAX:
-            now = time.monotonic()
-            # 先清已过期条目(超 TTL 的陈旧 IP)
-            expired = [k for k, v in _bootstrap_cache.items()
-                       if isinstance(v, tuple) and (now - v[1]) > _BOOTSTRAP_TTL]
-            for k in expired:
-                _bootstrap_cache.pop(k, None)
+    try:
+        with _bootstrap_lock:
+            _bootstrap_cache[host] = (ip, time.monotonic())
+            # R7 P3-1: 与 _addr_cache 对称的容量上限淘汰, 防 dict 无限增长。
             if len(_bootstrap_cache) > _BOOTSTRAP_CACHE_MAX:
-                # 仍超限: 按写入时间戳淘汰最旧的 1/4
-                sorted_items = sorted(
-                    _bootstrap_cache.items(),
-                    key=lambda kv: kv[1][1] if isinstance(kv[1], tuple) else 0)
-                for k, _ in sorted_items[:len(sorted_items) // 4]:
+                now = time.monotonic()
+                # 先清已过期条目(超 TTL 的陈旧 IP)
+                expired = [k for k, v in _bootstrap_cache.items()
+                           if isinstance(v, tuple) and (now - v[1]) > _BOOTSTRAP_TTL]
+                for k in expired:
                     _bootstrap_cache.pop(k, None)
+                if len(_bootstrap_cache) > _BOOTSTRAP_CACHE_MAX:
+                    # 仍超限: 按写入时间戳淘汰最旧的 1/4
+                    sorted_items = sorted(
+                        _bootstrap_cache.items(),
+                        key=lambda kv: kv[1][1] if isinstance(kv[1], tuple) else 0)
+                    for k, _ in sorted_items[:len(sorted_items) // 4]:
+                        _bootstrap_cache.pop(k, None)
+    except Exception as e:
+        log.debug("_bootstrap_set 写回缓存失败(已忽略, 不影响数据面): %r", e)
 
 
 def _resolve_host_once(host, timeout=None):
@@ -806,7 +819,7 @@ def discard_upstream_conns(up):
     _pool.discard((proto, host, port, path))
 
 
-def _doh_tls_wrap(raw, host, port, deadline, connect_addr, strict_cert=False):
+def _doh_tls_wrap(raw, host, port, deadline, connect_addr, strict_cert=True):
     """DoH TLS 握手: 严格校验; 与 _dot_conn 对称地对 IP 字面量 + 仅 DNS SAN
     证书做 ssl.CertificateError → check_hostname=False 降级重试(仅一次)。
 
@@ -815,7 +828,10 @@ def _doh_tls_wrap(raw, host, port, deadline, connect_addr, strict_cert=False):
     _ebpdns_degraded=True, 防止入连接池复用(R3-N2/R4 P2-2: 池 release 见到该
     标记即直接 close 不入队)。hostname 上游证书必须严格匹配, 不降级。
     R8 P2-1: 新增 strict_cert kill switch(与 dot_strict_cert 对等)。True 时
-    IP 字面量证书 SAN 校验失败也不降级, 直接抛出。默认 False 保持兼容。
+    IP 字面量证书 SAN 校验失败也不降级, 直接抛出。
+    P2-1(v1.9.146): 默认值从 False 改为 True(is not False 模式), 消除未来
+    新增调用点遗漏 strict_cert 参数时静默允许降级的 footgun。仅显式传 False
+    才允许降级重试。
 
     成功返回 ssock; 失败抛异常, 调用方负责关闭传入的 raw(降级路径内已自行
     close raw 并新建 raw2, 调用方再 close 为幂等无害)。
@@ -837,8 +853,10 @@ def _doh_tls_wrap(raw, host, port, deadline, connect_addr, strict_cert=False):
                 host, port)
             raise
         # R8 P2-1: doh_strict_cert kill switch —— 与 dot_strict_cert 对等。
-        # True 时 IP 字面量证书 SAN 校验失败也不降级, 直接抛出。默认 False 保持兼容。
-        if strict_cert:
+        # True/None/缺失时 IP 字面量证书 SAN 校验失败也不降级, 直接抛出。
+        # P2-1(v1.9.146): 改为 is not False 判定, 与 _doh_query 入口
+        # (up.get("doh_strict_cert") is not False) 对称; 仅显式 False 才降级。
+        if strict_cert is not False:
             log.warning(
                 "DoH 上游 %s:%s doh_strict_cert=True, 证书主机名/SAN 校验失败"
                 "且 kill switch 开启, 不降级直接报错。",
@@ -880,7 +898,7 @@ def _doh_tls_wrap(raw, host, port, deadline, connect_addr, strict_cert=False):
         return ssock2
 
 
-def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=False):
+def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=True):
     """创建 DoH HTTPS 连接。
 
     若 hostname 已通过 bootstrap 预解析为 IP，用 IP 连接 + SNI=hostname，
@@ -922,12 +940,25 @@ def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=False):
             except Exception:
                 pass
             raise
+        except ssl.SSLError:
+            # R1 P1-2: 非 CertificateError 的 TLS 握手错误(handshake_failure/
+            # EOF during handshake/protocol version mismatch 等)是 TLS 层偶发抖动——
+            # TCP 已成功 connect 到 bootstrap IP, 说明 IP 可达且正确, 握手失败不代表
+            # IP 失效。原实现落入下方 except Exception 被误判为"bootstrap IP 已坏"
+            # 清空好缓存, 下次建连退化到阻塞 getaddrinfo 放大冷启动延迟。这里与 QUIC
+            # established 策略(quic_upstream.py:375-391)对齐: TLS 握手类错误不清
+            # bootstrap 缓存, 仅关闭 socket 重抛。
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise
         except Exception:
             try:
                 raw.close()
             except Exception:
                 pass
-            # TCP/TLS 传输层失败(非证书问题): bootstrap IP 可能已失效
+            # TCP 传输层失败(已排除证书/握手类问题): bootstrap IP 可能已失效
             # (CDN 调度/IP 变更) → 失效缓存, 下次回退系统解析。
             _bootstrap_invalidate(host)
             raise
@@ -1010,6 +1041,10 @@ def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=False):
     # R12 P3-1: 本最终 fallback 路径绕过 _doh_tls_wrap, 其内部 connect() 遇
     # hostname CertificateError 时无 warning 日志, 与 _doh_tls_wrap 路径不对称。
     # 包装 connect() 以补齐对称 warning(hostname 证书不匹配是真正的安全问题)。
+    # P2-7: connect() 成功后从已建立的 socket 提取对端 IP, 挂 pending bootstrap
+    # 供首次成功查询后回写缓存(_doh_query line 1139 处处理), 避免冷启动 + DNS
+    # 不稳定场景下每次都走阻塞 getaddrinfo 慢路径。安全方向不变(仍用默认严格
+    # TLS context), 仅补缓存写回。
     _orig_connect = conn.connect
     def _fallback_connect():
         try:
@@ -1021,6 +1056,27 @@ def _doh_conn(host, port, timeout, bp_ip=None, strict_cert=False):
                 "SAN 是否包含该域名。",
                 host, port)
             raise
+        # R12 P3-6: 建连成功后按真实剩余 deadline 二次刷新 socket 超时。conn 在
+        # 构造时(:1032)按 deadline-now 设过一次 timeout, 但 _orig_connect()(含
+        # 阻塞 getaddrinfo + TCP 建连 + TLS 握手)已消耗部分预算; 若不刷新, 后续
+        # conn.request/getresponse 的 read 会以建连时刻的旧超时等待, 比真实剩余
+        # 多阻塞"建连耗时"。与主路径(_doh_query:1133)及重试路径(:1230)的
+        # settimeout 二次重置对称。下限 0.001s 与全文件一致。
+        try:
+            _s = getattr(conn, 'sock', None)
+            if _s is not None:
+                _s.settimeout(max(0.001, deadline - time.monotonic()))
+        except Exception:
+            pass
+        # P2-7: 提取对端 IP 挂 pending bootstrap, 首次成功查询后回写缓存
+        try:
+            s = getattr(conn, 'sock', None)
+            if s is not None:
+                peername = s.getpeername()
+                if peername and peername[0] != host:
+                    conn._ebpdns_pending_bootstrap = peername[0]
+        except Exception:
+            pass
     conn.connect = _fallback_connect
     return conn
 
@@ -1060,7 +1116,12 @@ def _doh_query(up, query_bytes, timeout_ms):
         headers = dict(_DOH_HEADERS)
         headers["Host"] = host
     else:
-        headers = _DOH_HEADERS
+        # R12 P3-2: 无 bootstrap-IP 路径统一 dict() 拷贝, 与上方分支对称。
+        # 原实现直接共享模块级 _DOH_HEADERS dict 引用, 隐式依赖 http.client
+        # _send_request 永不原地改 headers 这一跨版本实现细节; 一旦 CPython 改
+        # 内部去重逻辑或未来调用方在 headers 上赋值, 裸引用会污染模块级常量
+        # 影响所有线程。拷贝成本极低, 消除只读耦合。
+        headers = dict(_DOH_HEADERS)
 
     def _remaining():
         return deadline - time.monotonic()
@@ -1114,7 +1175,12 @@ def _doh_query(up, query_bytes, timeout_ms):
             # R7 P3-5: 子串匹配转小写, 兼容大写/混合大小写的 Content-Type(如
             # "Application/DNS-Message")。
             ctype = resp.getheader("Content-Type", "")
-            if resp.status != 200 or not body or len(body) > 65535 or "application/dns-message" not in ctype.lower():
+            # R2-NET-P2-2: 补最小 DNS 报文头长度下限 len(body)<12 fail-closed, 与
+            # bootstrap/probe_ip 的 12 字节 DNS 头下限对齐, 并与 DoH3(:675)/DoQ(:622)
+            # 的结构校验对称。原条件仅判 not body, 1~11 字节非空 body 会越过
+            # len(body)>=2 的 qid 短路(1 字节跳过 qid / 2~11 字节无 question 段)被
+            # 当作成功响应返回。
+            if resp.status != 200 or not body or len(body) < 12 or len(body) > 65535 or "application/dns-message" not in ctype.lower():
                 if "application/dns-message" not in ctype.lower():
                     log.debug("DoH unexpected Content-Type: %r", ctype)
                 try:
@@ -1123,9 +1189,29 @@ def _doh_query(up, query_bytes, timeout_ms):
                     pass
                 _pool.release(entry, None)
                 return False, None
+            # R1 P1-1: DoH 响应 qid 校验, 与 DoT(_dot_query)/DoQ(quic)/DoH3(quic)
+            # 同型。连接池 keep-alive 复用时, 中间盒/恶意服务器可能在连接上多塞一段与
+            # 本请求无关的合法 DNS 报文(HTTP 响应走私)。_leftover 只能发现"字节残留",
+            # 无法识别"残留恰好构成合法 dns-message 且 Content-Type 正确"。这里补
+            # upstream 层 defense-in-depth: 响应 qid 必须与请求 qid 一致, 否则关闭连接
+            # 不归还池(协议错位连接即弃, 与降级连接同策略)。
+            if len(body) >= 2 and body[:2] != query_bytes[:2]:
+                log.debug("DoH stream response qid mismatch (up=%s)", up.get("id"))
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _pool.release(entry, None)
+                return False, None
             # v1.9.80: 上游要求 close 时不复用, 关闭后放回 None(下次新建)
             # UP-MED-01: 响应残留未读字节(_leftover>0)时同样不复用, 防协议错位。
-            if getattr(resp, "will_close", False) or _leftover > 0:
+            # R12 P3-3: chunked 编码响应读完即关连接不回池。_leftover 只能发现
+            # Content-Length 模式下的字节残留; chunked 模式 resp.length=None →
+            # _leftover 恒为 0, 若违规服务器在 last-chunk 之后多发字节, 这些残留
+            # 落在 socket 接收缓冲却不被 resp.length 反映, 连接回池复用后下次
+            # getresponse() 会把残留误当新响应头 → HTTP 帧错位。chunked 响应保守
+            # 不回池(合规 DoH 服务器均用 Content-Length, 实际触发面极小)。
+            if getattr(resp, "will_close", False) or _leftover > 0 or getattr(resp, "chunked", False):
                 try:
                     conn.close()
                 except Exception:
@@ -1183,7 +1269,8 @@ def _doh_query(up, query_bytes, timeout_ms):
                 # P3-5: 同首路径, 校验 Content-Type
                 # R7 P3-5: 子串匹配转小写, 兼容大写/混合大小写。
                 ctype = resp.getheader("Content-Type", "")
-                if resp.status != 200 or not body or len(body) > 65535 or "application/dns-message" not in ctype.lower():
+                # R2-NET-P2-2: 同首路径补 len(body)<12 下限, 保持协议对称。
+                if resp.status != 200 or not body or len(body) < 12 or len(body) > 65535 or "application/dns-message" not in ctype.lower():
                     if "application/dns-message" not in ctype.lower():
                         log.debug("DoH retry unexpected Content-Type: %r", ctype)
                     try:
@@ -1192,9 +1279,20 @@ def _doh_query(up, query_bytes, timeout_ms):
                         pass
                     _pool.release(entry, None)
                     return False, None
+                # R1 P1-1: 同首路径, 重试响应也做 qid 校验, 保持协议对称。
+                if len(body) >= 2 and body[:2] != query_bytes[:2]:
+                    log.debug("DoH retry stream response qid mismatch (up=%s)", up.get("id"))
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _pool.release(entry, None)
+                    return False, None
                 # v1.9.80: will_close 时不复用
                 # UP-MED-01: 有残留未读字节时同样关闭不归还。
-                if getattr(resp, "will_close", False) or _leftover > 0:
+                # R12 P3-3: 同首路径, chunked 响应读完即关连接不回池, 防 last-chunk
+                # 之后残留字节被下次 getresponse() 误当新响应头。
+                if getattr(resp, "will_close", False) or _leftover > 0 or getattr(resp, "chunked", False):
                     try:
                         conn.close()
                     except Exception:
@@ -1239,7 +1337,7 @@ def _doh_query(up, query_bytes, timeout_ms):
         return False, None
 
 
-def _dot_conn(host, port, timeout, strict_cert=False):
+def _dot_conn(host, port, timeout, strict_cert=True):
     """创建 DoT TLS 连接。
 
     若 hostname 已通过 bootstrap 预解析为 IP，用 IP 连接 + SNI=hostname，
@@ -1359,12 +1457,23 @@ def _dot_conn(host, port, timeout, strict_cert=False):
         except Exception:
             pass
         raise
+    except ssl.SSLError:
+        # R1 P2-2: 与 DoH _doh_conn(R1 P1-2)同型——非 CertificateError 的 TLS 握手
+        # 错误(handshake_failure/EOF/protocol version mismatch)是 TLS 层偶发抖动,
+        # TCP 已成功 connect 到 bootstrap IP, 说明 IP 可达且正确, 握手失败不代表 IP
+        # 失效。原实现落入下方 except Exception 被误判为"bootstrap IP 已坏"清空好
+        # 缓存。这里对齐 QUIC established 策略: TLS 握手类错误不清 bootstrap 缓存。
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
     except Exception:
         try:
             sock.close()
         except Exception:
             pass
-        # TCP/TLS 传输层失败(非证书问题): bootstrap IP 可能已失效(CDN 调度/IP 变更)
+        # TCP 传输层失败(已排除证书/握手类问题): bootstrap IP 可能已失效(CDN 调度/IP 变更)
         if ip and ip != host:
             _bootstrap_invalidate(host)
         raise
@@ -1418,8 +1527,25 @@ def _dot_query(up, query_bytes, timeout_ms):
             if remaining <= 0:
                 return None
             sock.settimeout(max(0.001, remaining))
-            chunk = sock.recv(4096)
+            # R12 P3-9: 显式捕 socket.timeout 干净 return None, 与循环顶部
+            # remaining<=0(:1495)同语义, 也与 UDP 热路径(:1908)对称。原实现 recv
+            # 超时(OSError 子类)穿透到 _dot_query 外层 except OSError, 落入其
+            # close+新建 TLS 连接重试分支; 因超时已按剩余 deadline 设定, 预算必然
+            # 耗尽, 该重建是纯浪费(一次 TCP 建连+TLS 握手)。此处直接返回 None,
+            # 由调用方按"预算耗尽"短路 return False, 不再触发多余重建。
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                return None
             if not chunk:
+                # P1-2: recv 返回 b"" 表示对端关闭(TLS alert 后正常 FIN 或 TCP RST
+                # 在 SSL 层也可能表现为空)。当前统一返回 None 由上层新建连接重试
+                # (安全方向)。此处补 debug 日志标注对端关闭, 便于运维区分
+                # "上游重启"与"证书问题"——证书类故障(如 AlertBadCertificate)会在
+                # _dot_conn 握手阶段即抛 CertificateError 并打 warning, 不会走到
+                # 本 recv 路径; 走到这里的空 EOF 通常是服务端 idle timeout 半关闭。
+                log.debug("DoT %s:%s 对端连接关闭(EOF), 触发新建连接重试",
+                          host, port)
                 return None
             buf.extend(chunk)
             # 接收缓冲上限: 防止畸形/恶意上游无限累积 chunk 导致内存爆炸。
@@ -1459,6 +1585,16 @@ def _dot_query(up, query_bytes, timeout_ms):
                 # 防止把别的查询的应答误当作本次结果返回。合法 DoT 服务器严格一问
                 # 一答(RFC 7858), qid 恒匹配, 本检查为纵深防御。
                 if len(msg) >= 2 and bytes(msg[0:2]) != query_bytes[0:2]:
+                    buf = rest
+                    if not buf:
+                        break
+                    continue
+                # R2-NET-P2-1: 补最小 DNS 报文头长度下限(len<12 fail-closed), 与
+                # 明文 TCP(check_0x20 对短响应 fail-closed)/bootstrap _ask(:331)/
+                # probe_ip(:2099)/DoH3/DoQ 对称。DoT 无 0x20 校验, 缺此下限则
+                # 长度前缀声明为 N(2<=N<=11)、qid 恰好匹配的畸形帧会被当作成功
+                # 响应上交。短帧丢弃并继续读后续帧(与 qid 不匹配处理同型)。
+                if len(msg) < 12:
                     buf = rest
                     if not buf:
                         break
@@ -1639,7 +1775,7 @@ def _udp_query(up, query_bytes, timeout_ms):
         # 用带 TTL 的解析缓存拿到 IP 集合, 避免 miss 热路径阻塞 getaddrinfo。
         # R5 P2-1: 传入剩余预算做硬截断, 超时返回空集(不校验源, 靠 qid 兜底)。
         ips = _cached_udp_addrs(host, timeout=max(0.001, deadline - time.monotonic()))
-        expect_ips = set(ips)
+        expect_ips = set()
         if ips:
             # v1.9.74 P1-3: 直接向已解析出的 IP sendto, 不再把 hostname 交给
             # sendto(其会走系统解析/行为不确定); expect_ips 仍用于响应源 IP 校验。
@@ -1648,14 +1784,27 @@ def _udp_query(up, query_bytes, timeout_ms):
             # 先到的合法响应获胜; 单 IP 保持原逻辑。
             if len(ips) > 1:
                 multi_targets = list(ips)[:2]
+                # R1 P2-4: 只向前两个 IP 发包, expect_ips 必须收窄为实际发送集合。
+                # 原实现 expect_ips=set(ips) 包含全部解析 IP, 导致来自第 3+ 个未发包
+                # IP 的伪造响应也能通过源地址校验(on-path 攻击者伪造未发包 IP 源 +
+                # 猜 qid 即可注入投毒)。源地址校验语义应为"只接受实际发包目标"。
+                expect_ips = set(multi_targets)
             else:
                 send_addr = (next(iter(ips)), port)
+                expect_ips = set(ips)
     # R7 P1-1: 冷缓存 getaddrinfo 硬截断超时后 ips 为空, send_addr 仍为 hostname。
     # 此时若继续 sendto(hostname) 会触发同步无超时 getaddrinfo(~10s 阻塞),
     # 且 expect_ips 为空导致源 IP 校验被跳过。直接返回 False 让上层 resolver
     # 切换备用上游, 不再阻塞在 hostname 上。
     if _is_hostname(host) and not expect_ips:
         return False, None
+
+    # P2-4: 本次查询是否已计过一次 0x20 失配。多目标路径(两个 socket 并行)
+    # 和单目标路径(同一查询收到多个伪造包)都可能多次调用 _response_ok;
+    # 对 _0x20_misses 的读-改-写必须每查询最多一次, 否则一次查询贡献 2+ 次
+    # 失配会加速误降级(从 3 次连续查询失配变为 2 次查询即可触发)。真实响应
+    # 到达时仍清零(证明上游正常), 不受此标志影响。
+    _x20_miss_counted = [False]
 
     def _response_ok(data, src):
         """校验一条 UDP 响应是否可接受: 源 IP/端口 + qid + 0x20 大小写。
@@ -1664,6 +1813,21 @@ def _udp_query(up, query_bytes, timeout_ms):
         if expect_ips and src[0] not in expect_ips:
             return False
         if port and src[1] != port:
+            return False
+        # R4-NET-P3-1: 显式 len<12 长度下限, 与 DoT:1555/DoH:1158/DoQ:652/
+        # DoH3:701/bootstrap:333/probe_ip:2117 对称。正常时短报文由 check_0x20→
+        # extract_qname None fail-closed 兜底, 但 0x20 自适应降级后该隐式下限消失,
+        # 2~11 字节短报文(qid+源 IP 匹配)会被当 ok=True 上交。此处无条件 fail-closed,
+        # 不受 0x20 降级状态影响, 闭合唯一一条无显式长度下限的 UDP 热路径。
+        if len(data) < 12:
+            return False
+        # R12 P3-11: 显式拒绝 12 字节纯 header-only(QDCOUNT==0 且 ANCOUNT==0)。
+        # 0x20 未降级时 check_0x20→extract_qname(qd<1→None) 已 fail-closed; 但
+        # 0x20 自适应降级后该校验被跳过, 恰好 12B、qid 与源 IP 匹配的"无 question
+        # 段畸形响应"会被当合法 NOERROR 上交。合法响应恒 echo 我们查询的 question
+        # (QDCOUNT==1), QDCOUNT==0 本身即结构异常, 与 ANCOUNT==0 同时成立时判为
+        # header-only 畸形帧拒绝。纵深防御, 不受 0x20 降级态影响(fail-safe)。
+        if data[4:6] == b"\x00\x00" and data[6:8] == b"\x00\x00":
             return False
         if qid is not None and len(data) >= 2:
             rid = struct.unpack(">H", data[:2])[0]
@@ -1682,17 +1846,22 @@ def _udp_query(up, query_bytes, timeout_ms):
         with _0x20_lock:
             x20_off = up_id in _0x20_disabled
             if not x20_off and _is_mismatch:
-                # 锁内先读旧值再 +1 (read-modify-write 整体原子)
-                _0x20_misses[up_id] = _0x20_misses.get(up_id, 0) + 1
-                if _0x20_misses[up_id] >= _0x20_FAIL_LIMIT and up_id not in _0x20_disabled:
-                    _0x20_disabled.add(up_id)
-                    _0x20_DISABLED_SINCE[up_id] = time.monotonic()
-                    log.warning("上游 %s(%s) 连续 %d 次 0x20 大小写失配, 自动关闭 0x20 校验"
-                                "(疑似规范化大小写上游, %.0fs 后自动重试)",
-                                up.get("name"), up_id,
-                                _0x20_FAIL_LIMIT, _0x20_RECOVER_S)
+                # P2-4: 每次查询最多计一次失配(多 socket/多伪造包不重复 +1)
+                if not _x20_miss_counted[0]:
+                    # 锁内先读旧值再 +1 (read-modify-write 整体原子)
+                    _0x20_misses[up_id] = _0x20_misses.get(up_id, 0) + 1
+                    _x20_miss_counted[0] = True
+                    if _0x20_misses[up_id] >= _0x20_FAIL_LIMIT and up_id not in _0x20_disabled:
+                        _0x20_disabled.add(up_id)
+                        _0x20_DISABLED_SINCE[up_id] = time.monotonic()
+                        log.warning("上游 %s(%s) 连续 %d 次 0x20 大小写失配, 自动关闭 0x20 校验"
+                                    "(疑似规范化大小写上游, %.0fs 后自动重试)",
+                                    up.get("name"), up_id,
+                                    _0x20_FAIL_LIMIT, _0x20_RECOVER_S)
             else:
-                # 本查询收到 0x20 校验通过(或已降级)的响应 → 锁内清零连续失配计数
+                # 本查询收到 0x20 校验通过(或已降级)的响应 → 锁内清零连续失配计数。
+                # 即使本次查询已计过伪造包(_x20_miss_counted=True), 真实响应仍证明
+                # 上游返回了合法数据, 清零连续失配计数。
                 _0x20_misses[up_id] = 0
             # R26 P3-2: 把"丢弃决策"也并入同一把锁内, 关闭读 x20_off 与决策间窗口。
             if _is_mismatch and not x20_off:
@@ -1805,6 +1974,11 @@ def _tcp_query(up, query_bytes, timeout_ms):
     # 全部调用方(upstream.py: query_upstream、resolver.py: TCP 回退)均只走明文
     # TCP。删除不会被触发的 TLS 分支与 use_tls 形参, 避免保留半吊子 TLS 策略。
     host, port = _host_port(up)
+    # R12 P3-1: 取 up_id 以读取共享 0x20 降级态(_0x20_disabled)。UDP 热路径
+    # 对规范化大小写上游连续失配降级后, 其 TC=1/大包走 TCP 回退时同样是规范化
+    # 响应; 若此处仍恒开 check_0x20 会把已降级上游的 TCP 大包系统性误拒(回退
+    # 直失败)。与 UDP 路径共享同一降级集合后, 注释(:1988-1998)的承重论证成立。
+    up_id = up.get("id", "")
     # P2-19: 总 deadline 在建连前设定, 建连与 I/O 共用同一预算, 避免
     # create_connection(完整 timeout) + I/O deadline(完整 timeout) 叠加导致
     # 总耗时可达配置值 2 倍。
@@ -1845,7 +2019,14 @@ def _tcp_query(up, query_bytes, timeout_ms):
             if remaining <= 0:
                 return False, None
             sock.settimeout(max(0.001, remaining))
-            chunk = sock.recv(4096)
+            # R12 P3-9: 显式捕 socket.timeout 干净返回, 与 UDP 热路径(:1908)对称。
+            # 原实现 recv 超时穿透到外层 except OSError, 多走一次 close+重建路径
+            # (调用方 resolver 据此重建 TCP 连接), 预算耗尽本应直接失败却多耗一次
+            # 握手。settimeout 已按剩余 deadline 设值, 超时即等价 deadline 到。
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                return False, None
             if not chunk:
                 return False, None
             buf.extend(chunk)
@@ -1866,17 +2047,41 @@ def _tcp_query(up, query_bytes, timeout_ms):
                     # 帧头/帧体不完整, 缓冲已不足以构成完整帧, 回外层 recv 读新数据。
                     break
                 # 明文 TCP 做 0x20 校验(加密 DoT 走独立 _dot_query, 不在此函数)。
-                # R38 P3-3: 此处有意不复制 _udp_query 的 0x20 自适应降级
+                # R38 P3-3: 此处有意不复制 _udp_query 的 0x20 自适应降级状态机
                 # (_0x20_misses 连续 3 次失配后加入 _0x20_disabled)。理由:
                 # (1) 本函数仅为 UDP 失败后的明文 TCP 回退通道, 实际触发面小;
                 # (2) 同上游 UDP/TCP 通常走同一网络路径, 若中间设备规范化 qname
                 #     大小写, UDP 热路径已会累积失配并降级(共享 _0x20_disabled),
-                #     覆盖该上游——此处无条件校验不会长期误丢;
+                #     覆盖该上游——R12 P3-1 修复后此处读取同一降级集合: 已降级上游
+                #     的 TCP 响应(含 TC=1 触发的大包/DNSSEC 回退)不再被恒开校验
+                #     系统性误拒, 注释承重论证与实现一致;
                 # (3) 明文 TCP 是已建立的连接流, 无 UDP 那样的源地址伪造向量,
-                #     0x20 在此仅作纵深防御, 无条件拒绝失配帧失败方向安全
-                #     (丢弃后回退/返回 False, 不上交残缺数据)。
+                #     0x20 在此仅作纵深防御, 未降级时无条件拒绝失配帧失败方向
+                #     安全(丢弃后继续读帧/返回 False, 不上交残缺数据)。
                 # 残余缺口(UDP 被防火墙完全阻断、且 TCP 路径单独存在规范化中间设备)
                 # 为三重罕见场景, 不值得在回退路径再引入一套锁保护的失配计数状态机。
+                # R12 P3-13: 补显式 len<12 长度下限, 与 DoT(_exchange)/DoH/DoQ/
+                # DoH3/UDP 五条路径对称。原实现空帧/2~11B 畸形帧的拒绝 100% 依赖
+                # check_0x20→extract_qname(len<12→None) 的单实现 fail-closed;
+                # 一旦未来重构 dnsmsg.py 把短包改为返回空 qname 而非 None, 明文 TCP
+                # 会静默接受畸形帧而其他路径因有显式下限不受影响。此处显式闭合,
+                # 消除对单实现的隐性依赖(安全方向: 短帧丢弃继续读后续帧)。
+                if len(msg) < 12:
+                    buf = rest
+                    if not buf:
+                        break
+                    continue
+                # R13 P3-A: 补 header-only 结构闸(QDCOUNT==0 且 ANCOUNT==0), 与 UDP
+                # 热路径(:1830)对称。R12 P3-1 让已降级上游跳过 check_0x20 后, 原依赖
+                # extract_qname(qd<1→None)的隐式兜底消失, 恰好 12B、qid 匹配的
+                # "无 question 段畸形响应"会被当合法 NOERROR 上交。合法响应恒 echo
+                # 查询 question(QDCOUNT==1), QDCOUNT==0 本身即结构异常。纵深防御,
+                # 不受 0x20 降级态影响(fail-safe)。
+                if msg[4:6] == b"\x00\x00" and msg[6:8] == b"\x00\x00":
+                    buf = rest
+                    if not buf:
+                        break
+                    continue
                 # v1.9.143 P2-2: 补 qid 比对, 与 DoT 路径(line 1438)及 UDP 四层校验
                 # (源 IP+端口+qid+0x20)对齐。明文 TCP 虽需完成三次握手才能注入(比
                 # UDP 难), 但 on-path 攻击者若能预测/抢到 TCP 序列号并注入一个 qname
@@ -1889,7 +2094,9 @@ def _tcp_query(up, query_bytes, timeout_ms):
                     if not buf:
                         break
                     continue
-                if not dnsmsg.check_0x20(query_bytes, bytes(msg)):
+                # R12 P3-1: 已降级上游(up_id in _0x20_disabled)跳过 0x20 大小写
+                # 校验, 与 UDP 热路径(:1797)共享同一降级态。未降级则恒开校验。
+                if up_id not in _0x20_disabled and not dnsmsg.check_0x20(query_bytes, bytes(msg)):
                     # 被投毒的这一帧丢弃并推进缓冲区到帧尾, 继续读取后续帧。
                     # 原实现 buf 不推进: 下次 recv 追加后 parse_tcp_frame 仍反复解析
                     # 同一帧, 0x20 持续失败, 直至 len(buf)>64KB 才返回 —— 等于白等。
@@ -2005,6 +2212,13 @@ def probe_ip(ip, query_bytes, port=53, timeout_ms=800):
             if len(data) < 12:
                 continue
             if len(data) >= 2 and query_bytes[:2] != data[:2]:
+                continue
+            # P2-6: 补 0x20 qname 大小写校验, 与 _udp_query 四层校验(源IP+端口+qid+0x20)
+            # 对称。on-path 观察者可看到探测查询的明文 qid, 快速返回匹配 qid 的伪造
+            # 响应(不校验 0x20)会使该上游 RTT 被低估而误择优选中。后续真实查询仍走
+            # _udp_query 四层校验会拒绝伪造响应, 不影响数据面正确性; 此处补校验仅
+            # 提升测速择优准确性。
+            if not dnsmsg.check_0x20(query_bytes, data):
                 continue
             return int((time.monotonic() - t0) * 1000)
     except OSError:

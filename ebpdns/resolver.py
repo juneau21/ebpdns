@@ -24,6 +24,20 @@ from . import dnsmsg
 
 # match_rule 缓存哨兵: 区分"未缓存"与"命中 None"(无规则)
 _MISS = object()
+# P2-2(R1): 快路径(唯一 UDP recv 线程)无法确定规则——跳过 re: 正则求值时返回。
+# 与 _MISS/None 区分: None=确定无规则(可缓存); _UNCERTAIN=未求值(不缓存), 让调用方
+# fallthrough 到工作线程做完整规则判定, 避免 recv 线程同步 fut.result(0.5s) 阻塞。
+_UNCERTAIN = object()
+
+# P2-R2-2: 规则热重载清空 _rule_match_cache 后的宽限期(秒)。窗口内 answer_fast
+# 对 _UNCERTAIN(无字典规则、可能命中正则 block)直接答缓存, 避免缓存命中全部突降到
+# worker 线程造成 worker 负载骤增; 窗口外恢复 fail-closed(fallthrough 到 worker
+# 做完整正则判定并回填 _rule_match_cache)。误放仅发生在管理员 PUT 配置后数秒、且
+# 新正则 block 恰好命中已缓存域名的极小概率场景, 风险可控。
+_RULE_GRACE_SEC = 3.0
+# P2-R2-2: 宽限期后后台预热采样的最大域名数(从 DNS 缓存 snapshot 采样热点域名
+# 做一次完整规则判定, 快速重建 _rule_match_cache, 缩短 fallthrough 窗口)。
+_RULE_WARM_MAX = 4000
 
 # 正则匹配超时保护: 防止恶意正则规则(如 (a+)+$)配合长域名导致 ReDoS 阻塞 worker
 _REGEX_TIMEOUT_SEC = 0.5
@@ -350,10 +364,6 @@ class _BoundedExecutor:
         except Exception:
             pass
 
-    @property
-    def _work_queue(self):
-        return self._pool._work_queue
-
 
 def _looks_like_ip(s):
     """粗略判断字符串是否为可读 IP(v4/v6), 用于日志展示过滤 hex 乱码。"""
@@ -454,6 +464,14 @@ class Resolver:
         self._rule_index = ({}, {}, {}, {}, {}, [])
         self._rule_match_cache = OrderedDict()  # domain -> rule/None(哨兵), 规则重建时清空; L7 真 LRU
         self._rule_cache_max = 8192
+        # P2-R2-2: 最近一次规则缓存清空时间(monotonic)与预热去重标记。宽限期内
+        # answer_fast 对 _UNCERTAIN 直接答缓存; 清空后后台采样热点域名预热规则缓存。
+        self._rule_rebuild_ts = 0.0
+        self._rule_warmup_inflight = False
+        # R3-P3-A: check-then-set 去重标记需持锁原子化。原纯 bool 无锁, 两次并发
+        # _spawn_rule_warmup(API reload 与 bg_loop 订阅更新几乎同时)可双双通过检查、
+        # 起多个 rule-warmup 线程各做最多 4000 条规则判定(重复 CPU)。
+        self._rule_warmup_lock = threading.Lock()
         # v1.9.76 2.10: match_rule 缓存普通 dict, 多 worker 线程并发读写(读热路径 +
         # 淘汰迭代)无锁。CPython GIL 下单次 get/set 安全, 但 _cache_rule 的"满则迭代
         # list 半量淘汰"在并发下可能读到中间态/重复淘汰。加锁保护缓存读与写。
@@ -869,20 +887,58 @@ class Resolver:
         qmap = self._build_query_map(d, qtype)
         query_bytes = qmap["default"]
         # ---- 多上游并发 ----
-        results = self._query_parallel(ups, query_bytes, d, qtype, trace, qmap=qmap)
+        # P2-2(V146): 透传 _depth 给 _query_parallel, CNAME 递归层(_depth>0)
+        # 用 submit_drop 避免深层链逐层阻塞信号量。
+        results = self._query_parallel(ups, query_bytes, d, qtype, trace, qmap=qmap, _depth=_depth)
         if counted:
             tel.inc("upstream_queries", len(ups))
-        ok_results = [r for r in results if r.get("answers")]
+        # R3-P1-A: 候选汇总只采用"完整"答案。带 udp_truncated=True 的 answers 是
+        # UDP TC=1 截断应答里的不完整部分答案(大包: DNSSEC/多 A 记录 CDN), 且仅在
+        # 有界 TCP 回退失败后才落到这里。残缺答案集绝不能并入 cand、不能写缓存——
+        # 否则 TTL 内快路径持续给客户端子集且不带 TC=1, 客户端 RFC 语义上不会 TCP 重试。
+        # 无完整答案时下方单独沿用截断应答直答并强制 TC=1、不落缓存。
+        ok_results = [r for r in results if r.get("answers") and not r.get("udp_truncated")]
         # ---- 最快N个全部失败 → 回退剩余上游(仅真失败, NXDOMAIN/NODATA不回退) ----
         if not ok_results and _backup_ups:
             _all_fail = all(not r.get("answers") and r.get("rcode") not in (0, 3) for r in results)
             if _all_fail:
                 trace.append({"tag": "warn", "text": "最快 %d 个上游全部失败 → 回退剩余 %d 个上游" % (len(ups), len(_backup_ups))})
-                _bk = self._query_parallel(_backup_ups, query_bytes, d, qtype, trace, qmap=qmap)
+                _bk = self._query_parallel(_backup_ups, query_bytes, d, qtype, trace, qmap=qmap, _depth=_depth)
                 if counted:
                     tel.inc("upstream_queries", len(_backup_ups))
                 results.extend(_bk)
-                ok_results = [r for r in results if r.get("answers")]
+                ok_results = [r for r in results if r.get("answers") and not r.get("udp_truncated")]
+        # R3-P1-A: 无任何完整答案, 但存在 UDP 截断(TC=1)应答的部分 answers(TCP 回退
+        # 已失败) → 沿用这些部分 answers 直答(优于 SERVFAIL), 强制置 TC=1 让客户端
+        # 自行 TCP 重试拿完整答案, 且绝不写缓存(残缺集合不能被快路径重放)。
+        if not ok_results:
+            _trunc = [r for r in results if r.get("answers") and r.get("udp_truncated")]
+            if _trunc:
+                lat = (time.monotonic() - t0) * 1000
+                _seen = set()
+                _partial = []
+                for r in _trunc:
+                    for a in r["answers"]:
+                        v = a.get("value")
+                        if v in _seen:
+                            continue
+                        _seen.add(v)
+                        _partial.append({"value": v,
+                                         "from": r.get("up_name", "?"),
+                                         "ttl": a.get("ttl", _safe_int(cfg.get("ttl", 300), 300)),
+                                         "type": a.get("type", dnsmsg.type_code(qtype))})
+                tel.push_latency(lat)
+                trace.append({"tag": "warn",
+                              "text": "无完整答案, 沿用 UDP 截断部分应答(%d 条, 强制 TC=1, 不缓存)" % len(_partial)})
+                if not silent:
+                    tel.log(d, qtype, "miss", "截断沿用(TC=1) → %s" % (_partial[0]["value"] if _partial else ""), lat,
+                            client_ip=client_ip,
+                            upstream=" / ".join(r.get("up_name", "?") for r in _trunc[:3]),
+                            answer=_partial[0]["value"] if _partial else "")
+                return self._result(d, qtype, _partial,
+                                    _partial[0]["value"] if _partial else None,
+                                    False, False, None, latency=lat, trace=trace,
+                                    ttl_left=0, rcode=0, truncated=True)
         if not ok_results:
             # 全部无答案 → 区分 NXDOMAIN / NODATA / 真失败
             nx = [r for r in results if r.get("rcode") == 3]
@@ -924,7 +980,11 @@ class Resolver:
                                    client_ip=client_ip, _depth=_depth + 1,
                                    max_upstreams=max_upstreams)
                 sub_ans = sub.get("answers") or []
-                if not sub.get("error") and sub_ans:
+                # R10-P2: 与扁平路径 :900/:1531/:1569 对齐——子递归返回截断部分答案时
+                # (UDP TC=1 且 TCP 回退失败), 不把 CNAME+残缺 A 子集回填父域名缓存,
+                # 也不以 truncated=False 返回(否则客户端 TC=0 不重试, 快路径 TTL 内持续
+                # 重放残缺子集)。落到下方 NODATA 语义继续。
+                if not sub.get("error") and sub_ans and not sub.get("truncated"):
                     # P3/R25: sub_ans 的 dict 与子缓存共享引用(resolve miss 路径
                     # 返回的 answers 即子缓存 _fill_cache 入库的同一批 dict)。
                     # _fill_cache 会就地改写 ttl, 浅拷贝隔离父子, 避免污染子缓存条目。
@@ -945,7 +1005,47 @@ class Resolver:
                     return self._result(d, qtype, answers, answers[-1]["value"],
                                         False, False, None, latency=lat,
                                         trace=trace, ttl_left=answers[-1].get("ttl", 0), rcode=0)
-                # 展开失败(目标无答案/出错): 退回 NODATA 语义继续
+                # R13-P3: CNAME 子链目标 NXDOMAIN 传播。当权威上游返回裸 CNAME(rcode=0)
+                # 而递归目标 tgt 独立查询为 NXDOMAIN(rcode=3)时, 父级 NXDOMAIN 表决(:951,
+                # 递归前执行)不触发, 子链 rcode=3 被丢弃会误落到下方 NODATA 负缓存(rcode=0)。
+                # 标准递归解析器应回传 NXDOMAIN, 此处按 :951-971 同型写 rcode=3 负缓存并返回。
+                if sub.get("rcode") == 3:
+                    lat = (time.monotonic() - t0) * 1000
+                    neg_ttl = self._neg_ttl([sub], rule, cfg)
+                    now_neg = time.time()
+                    self.cache.put(key, {
+                        "domain": d, "qtype": qtype, "answers": [], "chosen": "",
+                        "ttl": neg_ttl, "rcode": 3,
+                        "expires_at": now_neg + neg_ttl,
+                    })
+                    tel.push_latency(lat)
+                    trace.append({"tag": "eng",
+                                  "text": "CNAME 链 %s → %s 目标 NXDOMAIN, 负缓存 %ds" % (d, tgt, neg_ttl)})
+                    if not silent:
+                        tel.log(d, qtype, "miss", "CNAME→NXDOMAIN (负缓存)", lat,
+                                client_ip=client_ip,
+                                upstream=sub.get("chosen", tgt),
+                                answer="")
+                    return self._result(d, qtype, [], None, False, False, None,
+                                        latency=lat, trace=trace, ttl_left=neg_ttl, rcode=3)
+                # 展开失败: 区分"子链截断/出错"(临时故障)与"子链正常返回空答案"(真 NODATA)。
+                # R12-P3-1: 子链因截断(UDP TC=1 且 TCP 回退 400ms 预算内失败)或出错失败时,
+                # 不能落到下方 :1031 的 NODATA 负缓存写入——后台刷新(_do_stale_refresh /
+                # _do_prefetch, force_refresh=True)撞此竞态会原地覆盖一条健康正向记录,
+                # 直至 neg_ttl(≤60s)对外返回 NODATA。截断/出错属临时故障, 直接返回不写缓存:
+                # 截断→truncated=True 让客户端 TCP 重试 / serve-stale 保留旧条目;
+                # 出错→透传 SERVFAIL。仅当子链正常返回空答案(非截断、非 error)时才写 NODATA 负缓存。
+                if sub.get("truncated") or sub.get("error"):
+                    lat = (time.monotonic() - t0) * 1000
+                    trace.append({"tag": "warn",
+                                  "text": "CNAME 子链 %s → %s 截断/出错, 不写 NODATA 负缓存" % (d, tgt)})
+                    return self._result(
+                        d, qtype, [], None, False,
+                        bool(sub.get("error")), sub.get("reason"),
+                        latency=lat, trace=trace, ttl_left=0,
+                        rcode=(sub.get("rcode") or 0),
+                        truncated=bool(sub.get("truncated")))
+                # 子链正常返回空答案 → 退回 NODATA 语义继续(可写负缓存)
                 trace.append({"tag": "warn", "text": "CNAME 链展开失败 %s → %s (NODATA)" % (d, tgt)})
             nodata = [r for r in results if r.get("rcode") == 0]
             if nodata:
@@ -1161,8 +1261,21 @@ class Resolver:
         # H1: 快路径缓存命中后复查 block 规则——管理员新增 block 规则后, 已缓存的
         # 被屏蔽域名不能仍由快路径直接返回答案。命中 block 则 fallthrough 到完整路径
         # 走 block 分支(match_rule 有结果缓存, O(1) 热路径开销可接受)。
-        _rule = self.match_rule(domain)
-        if _rule and _rule.get("action") == "block":
+        # P2-2(R1): 传 fast=True——本函数跑在唯一 UDP recv 线程, 规则热重载清空
+        # _rule_match_cache 后, 不能在此同步求值 re: 正则(fut.result(0.5s) 会
+        # head-of-line 阻塞 p99)。fast 模式下字典类规则照常判定; 一旦需要正则求值
+        # 返回 _UNCERTAIN, 此处 fallthrough(返回 None) 到 answer_raw 工作线程做
+        # 完整规则判定(miss 路径本就在 worker 线程, 阻塞可接受), 由其缓存规则结果。
+        _rule = self.match_rule(domain, fast=True)
+        if _rule is _UNCERTAIN:
+            # P2-R2-2: 规则缓存刚清空、可能命中 re: block 规则。宽限期(_RULE_GRACE_SEC)
+            # 内直接答缓存, 避免缓存命中全部突降 worker 线程造成 worker 负载骤增;
+            # 宽限期外恢复 fail-closed, 降级到完整路径做正则判定并回填 _rule_match_cache
+            # (worker 路径 resolve 缓存命中复查会完整求值 block 并缓存, 见 :641)。
+            if not self._in_rule_grace():
+                return None
+            # 宽限期内: 落到下方正常答缓存。
+        elif _rule and _rule.get("action") == "block":
             return None
         tel = self.tel
         rcode = c.get("rcode", 0)
@@ -1188,6 +1301,9 @@ class Resolver:
             # 兜底, 客户端发畸形 question 时上游 0x20 校验语义已不成立; 重编码小写是
             # 可接受的降级(与 build_simple_response 的 b"" 兜底一致)。正常包走 raw_query
             # 原样切片路径(:1006), 0x20 大小写完整保留, 不受影响。
+            # P3(V146): 加 DEBUG 日志使兜底触发可观测(畸形 question 包频率), 运维可
+            # 据此判断是否有客户端在发畸形包。
+            log.debug("answer_fast: question 切片失败, 降级重编码(丢失 0x20 大小写) domain=%s", domain)
             # P2-1(v1.9.143): build_response_body → encode_name 对含 U+FFFD/超长标签的
             # 域名会抛 DNSError(持久化恢复路径不校验域名合法性)。原无 try/except, 异常
             # 直穿到 server 层。包裹后失败退化为 b"", 与 build_simple_response 兜底一致。
@@ -1227,19 +1343,22 @@ class Resolver:
                 # 避免每命中一次对同一域名重复 encode_name(~0.6us, GIL 绑定 CPU)。
                 # enc_owner 仅用于无独立 "name" 键的缓存答案(标准 A/AAAA 答案),
                 # 有独立 name 的 CNAME 链 RR 仍走 encode_name(name), 语义不变。
-                eo = self._enc_owner.get(domain)
+                # P2-1(V146): 一次 grab 引用, 后续所有操作基于同一 _ec。reload()
+                # 原子交换引用(新建空 OrderedDict), 本块持旧引用继续操作不会触发
+                # KeyError; 旧 dict 随 GC 回收, 无半清状态。
+                _ec = self._enc_owner
+                eo = _ec.get(domain)
                 if eo is None:
                     eo = dnsmsg.encode_name(domain)  # 与原路径同, 非法域名异常自然上抛
-                    self._enc_owner[domain] = eo
+                    _ec[domain] = eo
                 else:
                     # LRU: 命中时移到 MRU 末尾, 防止热点域名被 FIFO 误逐。
-                    # v1.9.141 P2: reload() 从 API 线程 clear() 本 dict, get() 返回后
-                    # move_to_end 之间存在 clear 窗口 → KeyError。吞掉降级慢路径即可。
+                    # P2-1(V146): 引用交换后无 clear 窗口, move_to_end 不会 KeyError;
+                    # 保留 try/except 作为双保险(理论上已不可达)。
                     try:
-                        self._enc_owner.move_to_end(domain)
+                        _ec.move_to_end(domain)
                     except KeyError:
                         pass
-                _ec = self._enc_owner
                 # v1.9.139: CNAME 链展开的 answers 带 name=tgt, 跨命中复用其线格式编码。
                 # 预编码 distinct name 进同一有界 memo, build_response_body_answers 经
                 # enc_map 命中复用, 避免每次命中重编 CNAME 目标名。容量守卫: 显式 name
@@ -1249,8 +1368,6 @@ class Resolver:
                     nm = a.get("name")
                     if nm:
                         if nm in _ec:
-                            # v1.9.141 P2: in 与 move_to_end 之间也有 clear 窗口,
-                            # try/except 作为竞态兜底(与下方 popitem 防御风格一致)。
                             try:
                                 _ec.move_to_end(nm)
                             except KeyError:
@@ -1266,18 +1383,23 @@ class Resolver:
                             _ec.popitem(last=False)
                         except Exception:
                             break
-                abody = dnsmsg.build_response_body_answers(
+                abody, abody_n = dnsmsg.build_response_body_answers(
                     c["answers"], owner_name=domain, fallback_type=q["qtype"],
-                    _ttl_override=ttl_override, enc_owner=eo, enc_map=_ec)
+                    _ttl_override=ttl_override, enc_owner=eo, enc_map=_ec,
+                    return_count=True)
             else:
                 abody = None
+                abody_n = None
             # v1.9.76 P0-1: 快路径统一走 build_udp_response 做 UDP 截断(>bufsize 逐条
             # 丢尾部置 TC)+ 回显 OPT。TTL 衰减通过 _ttl_override 下推, 截断兜底路径
             # 重编码也用剩余 TTL(原 R-02 传衰减后副本, 现等价语义零拷贝)。
+            # R5-P1: 透传 abody_n(实际成功编码的 RR 数), 修复 an_count 与 abody
+            # 实际 RR 段长度不一致的畸形响应问题。
             resp = dnsmsg.build_udp_response(raw_query, qbytes, c["answers"], 0,
                                              abody=abody, owner_name=domain,
                                              fallback_type=q["qtype"], _edns=_edns,
-                                             _ttl_override=ttl_override)
+                                             _ttl_override=ttl_override,
+                                             abody_count=abody_n)
             chosen = c.get("chosen", "") or (c["answers"][0]["value"] if c.get("answers") else "")
             _up = "serve-stale" if stale else ("内核直答" if kd else "缓存直答")
             _msg = ("serve-stale → %s" if stale else "内核直答 → %s") % chosen
@@ -1329,9 +1451,13 @@ class Resolver:
         # 仅对命中(hit=True)把剩余 TTL 作为 _ttl_override 下推到编码器; miss/新鲜响应
         # 各答案自带正确 TTL, 不覆盖(避免把混合 TTL 的 CNAME 链压平成单一值)。
         ttl_override = res.get("ttl_left") if res.get("hit") else None
+        # R3-P1-A: 上游 UDP 截断且 TCP 回退失败、被迫沿用部分 answers 直答时,
+        # resolve 在结果里置 truncated=True 下推到编码器, 强制应答 TC=1 让客户端
+        # 自行 TCP 重试(该路径不写缓存, 快路径不会重放残缺答案)。
         resp = dnsmsg.build_response(raw_query, domain, qtype, answers, rcode=rcode,
                                      bufsize_cap=self._client_bufsize_cap,
-                                     _ttl_override=ttl_override)
+                                     _ttl_override=ttl_override,
+                                     truncated=bool(res.get("truncated")))
         if resp:
             self.tel.inc("bytes_out", len(resp))
         return resp
@@ -1443,7 +1569,10 @@ class Resolver:
             return False
         qmap = self._build_query_map(d, "A")
         rs = self._query_parallel(ups, qmap["default"], d, "A", trace, qmap=qmap)
-        ok = [r for r in rs if r.get("answers")]
+        # R3-P1-A: 探测回填 A 缓存同样剔除 udp_truncated 部分答案——截断的前缀
+        # 答案不能写缓存(否则双栈判定快路径重放残缺集合)。仅有截断部分答案时按
+        # "无完整答案"处理(下次真实 A 查询走完整解析), 比缓存残缺集安全。
+        ok = [r for r in rs if r.get("answers") and not r.get("udp_truncated")]
         if ok:
             ans, seen = [], set()
             for r in ok:
@@ -1479,7 +1608,9 @@ class Resolver:
         qmap = self._build_query_map(d, "A")
         a_q = qmap["default"]
         rs = self._query_parallel(ups, a_q, d, "A", trace, qmap=qmap)
-        ok = [r for r in rs if r.get("answers")]
+        # R9-P2: 与主路径 :900 / 探测 :1531 对齐——剔除 udp_truncated 部分答案,
+        # 截断的前缀答案不能回填 A 缓存(否则快路径重放残缺集且 TC=0)。
+        ok = [r for r in rs if r.get("answers") and not r.get("udp_truncated")]
         if not ok:
             trace.append({"tag": "warn", "text": "IPv4 回退: 上游也无 A 记录 → 维持 NODATA"})
             return None
@@ -1554,7 +1685,7 @@ class Resolver:
         except (ValueError, TypeError):
             return False  # 非 IP(如 CNAME 目标域名) 不拦截
 
-    def _query_parallel(self, ups, query_bytes, d, qtype, trace, qmap=None):
+    def _query_parallel(self, ups, query_bytes, d, qtype, trace, qmap=None, _depth=0):
         """并发查询多个上游，首个有效应答（NOERROR 且有答案）即返回。
 
         熔断打开的上游会被临时跳过（不参与并发）; 若全部被跳过则兜底全部重试。
@@ -1620,7 +1751,16 @@ class Resolver:
             qb = query_bytes
             if qmap:
                 qb = qmap.get(str(u.get("proto", "udp")).lower(), qmap.get("default", query_bytes))
-            fut2u[pool.submit(query_upstream, u, qb, timeout)] = u
+            # P2-2(V146): CNAME 递归链(_depth>0)使用 submit_drop(队列满则丢弃),
+            # 避免深层 CNAME 链逐层阻塞在信号量 acquire 上叠加占用请求线程。
+            # 递归层丢任务是安全的: 该层 resolve 会走"无答案→NODATA/SERVFAIL"兜底,
+            # 不影响父层已有答案的返回。顶层查询(_depth=0)仍用阻塞 submit 保证不丢。
+            if _depth > 0:
+                _fut = pool.submit_drop(query_upstream, u, qb, timeout)
+            else:
+                _fut = pool.submit(query_upstream, u, qb, timeout)
+            if _fut is not None:
+                fut2u[_fut] = u
         pending = set(fut2u)
         out = []
         # P1-1: wait() 无 timeout 时, 若上游 future 永不完成(如连接池 hang/排队未
@@ -1632,8 +1772,27 @@ class Resolver:
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED,
                                  timeout=_wait_timeout)
+            # P1-1(V146): 先对 done 集合做轻量分类(skip_tcp=True), 避免某条
+            # UDP TC=1 截断应答在 _classify_one 内同步阻塞至多 timeout_ms(默认
+            # 1.5s) 走 TCP 重查, 把同批 done 中其他上游的完整大应答排在 TCP 之后
+            # 才分类, 拖垮"首答即返"。同时记录哪些上游返回了截断应答, 待确认无
+            # 完整答案后再做有界 TCP 回退(短超时), 不阻塞主 wait 循环。
+            truncated_us = []   # (u, udp_ok_fed): 供并发 TCP 回退成功时去重 ok 计数
             for fut in done:
-                out.append(self._classify_one(fut2u[fut], fut, qtype, trace, query_bytes))
+                u = fut2u[fut]
+                # P2-1(R1): 消费 _classify_one 透传的 udp_truncated, 删除原先为读
+                # TC 位对同一 bytes 的第二次全量 parse_message。_udp_truncated 仅在
+                # ok/data/proto==udp 且原始 UDP 应答 TC=1 时为真, 与原
+                # (_ok && _data && proto==udp && parse(_data).truncated) 判定等价。
+                _r = self._classify_one(u, fut, qtype, trace, query_bytes,
+                                        skip_tcp=True)
+                out.append(_r)
+                if _r.get("udp_truncated"):
+                    # R4-P3: 记录该上游 UDP 截断应答分类时是否已喂过 ok(rcode 0/3
+                    # 路径 → _r["ok"]=True, 已 upstream_ok_conn_ok(UDP 实测RTT)+
+                    # cb_ok)。后续并发 TCP 回退成功据此避免对同一逻辑查询双计 ok、
+                    # 混入一条 lat=0 样本。
+                    truncated_us.append((u, bool(_r.get("ok"))))
             if not done:
                 # R2-P2 [P2-1]: wait() 超时未等到任何新完成。不能直接 cancel 丢弃——
                 # 被取消/仍在跑的 future 无人 _classify_one, 上游熔断计数器与遥测会
@@ -1676,13 +1835,133 @@ class Resolver:
                             # 窗口缩到最小); 为这点精度再加锁会把 miss 主路径拖慢, 不值得。
                 pending = set()
                 break
-            if any(r.get("answers") for r in out):
+            # P2-R2-1: 仅当存在"非截断"完整答案时才首答即返。本路径以
+            # skip_tcp=True 分类, udp_truncated=True 的 answers 是 UDP TC=1 截断
+            # 应答里的不完整部分答案(如 8 个 A 记录只装下 2 个 / DNSSEC 链不完整),
+            # 不能当成完整答案立即返回并写入缓存。故带 udp_truncated 的 answers 不
+            # 触发首答即返, 落到下方 truncated_us 有界 TCP 回退获取完整答案; TCP
+            # 回退成功会另行 append 完整答案并 return(该结果无 udp_truncated 键);
+            # TCP 回退失败/无其他完整上游时, 循环走完 return out 沿用截断应答
+            # (优于 SERVFAIL)。TCP 回退块 append 的完整应答字典不带 udp_truncated
+            # 键, r.get("udp_truncated") 为 None → not None=True, 可正常首答即返。
+            if any(r.get("answers") and not r.get("udp_truncated") for r in out):
                 # 有答案 → 首答即返: 其余由后台线程收尾(仅统计)
                 if pending:
                     # #7 透传 query_bytes: 后台 TCP 回退 _tcp_query 需要原始查询报文
                     self._collect_rest_in_background(pending, fut2u, qtype, query_bytes)
                     pending = set()
                 return out
+            # P1-1(V146): 已完成上游均无答案, 但存在 UDP 截断应答。在主循环外做
+            # 有界 TCP 回退(短超时, 默认 400ms), 避免 _classify_one 内同步 TCP 阻塞
+            # 主 wait 循环。若 TCP 回退拿到完整答案则立即返回; 否则继续等待其他上游。
+            # R3-P2-B: 多个上游同时截断时, 原实现 for 循环在请求线程上串行 _tcp_query,
+            # 最坏累计 N×400ms(8 上游=3.2s)尾部延迟叠加。改为把各上游 TCP 回退并发
+            # 提交到 _collect_pool, 共享一个总预算(=min(timeout,400ms))——任一上游拿到
+            # 完整答案即返回, 总等待上界恒为预算而非 N×预算。池满 submit_drop 返回
+            # None 时优雅降级(不强行串行阻塞), 沿用截断应答。
+            if truncated_us:
+                _tcp_to = min(timeout, 400)
+                _deadline = time.monotonic() + _tcp_to / 1000.0
+                _tresults = {}
+                for u, _udp_ok in truncated_us:
+                    _uname = u.get("name") or u.get("id", "?")
+                    trace.append({"tag": "eng", "text": "%-12s UDP 应答截断(TC=1) → 并发 TCP 回退(总预算 %dms)" % (_uname[:12], _tcp_to)})
+                    try:
+                        _f = self._collect_pool.submit_drop(_tcp_query, u, query_bytes, _tcp_to)
+                    except Exception:
+                        _f = None
+                    if _f is not None:
+                        _tresults[_f] = (u, _udp_ok)
+                _best = None  # (u, _uid, _uname, _tans, _dlen, _udp_ok)
+                _early_return = False  # R5-P2-3: 原始上游在 TCP 回退等待期间给出完整答案
+                _pending_f = set(_tresults)
+                # R5-P2-3: 同时 watch 原始 pending futures。原实现只 wait TCP futures,
+                # 期间若某原始上游完成了完整(非截断)答案, 要等到 TCP 回退全部失败
+                # 后下一轮主循环 wait 才能发现, p99 延迟劣化一个 TCP 回退预算(~400ms)。
+                while (_pending_f or pending) and _best is None and not _early_return:
+                    _remain = _deadline - time.monotonic()
+                    if _remain <= 0:
+                        break
+                    _done, _still = wait(_pending_f | pending, return_when=FIRST_COMPLETED,
+                                         timeout=_remain)
+                    # 区分 TCP 回退 future 与原始上游 future
+                    _tcp_done = {f for f in _done if f in _tresults}
+                    _orig_done = _done - _tcp_done
+                    _pending_f -= _tcp_done
+                    pending -= _orig_done
+                    # 先处理原始上游: 若给出非截断完整答案, 立即返回(取消 TCP 回退,
+                    # 剩余 future 交后台收集)。
+                    # R6-N1(P2-1): 先把整批 _orig_done 全部分类完再决定 early_return,
+                    # 不要边遍历边 break。R5-P2-3 原实现拿到第一个完整答案即 break,
+                    # 同批其余已完成 future(连接失败/NODATA)既未喂遥测又已在上方
+                    # :1845 从 pending 移除, 成为孤儿——失败上游 _cb_fail 不累积,
+                    # 熔断保护在截断响应场景下被削弱。分类完整批后再退出。
+                    for _f in _orig_done:
+                        u = fut2u.get(_f)
+                        if u is None:
+                            continue
+                        try:
+                            _r = self._classify_one(u, _f, qtype, trace, query_bytes,
+                                                    skip_tcp=True)
+                        except Exception:
+                            continue
+                        out.append(_r)
+                        if _r.get("answers") and not _r.get("udp_truncated"):
+                            _early_return = True
+                    if _early_return:
+                        break
+                    for _f in _tcp_done:
+                        u, _udp_ok = _tresults[_f]
+                        _uname = u.get("name") or u.get("id", "?")
+                        _uid = u.get("id") or u.get("name") or "?"
+                        try:
+                            _tok, _tdata = _f.result()
+                        except Exception:
+                            _tok, _tdata = False, None
+                        if not (_tok and _tdata):
+                            continue
+                        try:
+                            _tparsed = dnsmsg.parse_message(_tdata)
+                        except Exception:
+                            _tparsed = None
+                        if _tparsed is None or _tparsed.get("rcode") not in (0, 3):
+                            continue
+                        _tans = self._extract_answers(_tparsed, qtype)
+                        if _tans:
+                            _best = (u, _uid, _uname, _tans, len(_tdata), _udp_ok)
+                            break
+                # 取消预算内仍未完成的回退任务(已超时/仍在跑), 避免占用 collect pool
+                for _f in _tresults:
+                    if not _f.done():
+                        try:
+                            _f.cancel()
+                        except Exception:
+                            pass
+                if _early_return:
+                    # R5-P2-3: 原始上游在 TCP 回退等待期间给出完整答案, 直接返回 out。
+                    if pending:
+                        self._collect_rest_in_background(pending, fut2u, qtype, query_bytes)
+                        pending = set()
+                    return out
+                if _best is not None:
+                    u, _uid, _uname, _tans, _dlen, _udp_ok = _best
+                    # R4-P3: UDP 截断应答已在主循环 skip_tcp 分类(:1736→:1951)喂过
+                    # 一次 upstream_ok_conn_ok(lat=UDP 实测 RTT)+ cb_ok。TCP 回退
+                    # 成功是同一逻辑查询的补全, 不再重复喂 ok——否则一次查询对同一
+                    # 上游双计成功, 且混入一条 lat=0 样本稀释平均延迟。仅当 UDP 分类
+                    # 走了 fail 路径(rcode!=0 的截断, 罕见)时才在此补喂一次 ok。
+                    if not _udp_ok:
+                        self.tel.upstream_ok_conn_ok(_uid, self._conn_key(u), 0)
+                        self._cb_ok(_uid)
+                    trace.append({"tag": "ok", "text": "%-12s TCP 回退成功, 应答 %d bytes" % (_uname[:12], _dlen)})
+                    out.append({"ok": True, "up_name": _uname, "lat": 0,
+                                "proto": str(u.get("proto", "udp")).lower(),
+                                "rcode": 0, "answers": _tans})
+                    if pending:
+                        self._collect_rest_in_background(pending, fut2u, qtype, query_bytes)
+                        pending = set()
+                    return out
+                trace.append({"tag": "warn", "text": "并发 TCP 回退未拿到完整应答, 沿用截断应答"})
             # v1.9.76 2.1: NXDOMAIN 多数表决。首个 NXDOMAIN 即返可能被单个撒谎/故障
             # 上游误导(域名其实存在)。需 >=nxdomain_quorum(默认 2)个上游一致 NXDOMAIN
             # 才提前返回; 否则继续等其他上游答案/超时。nxdomain_quorum=1 恢复旧行为。
@@ -1729,17 +2008,32 @@ class Resolver:
             lat = result[2] if len(result) > 2 else 0
         except Exception:
             ok, data, lat = False, None, timeout
+        # P2-1(R1): 透传 UDP 截断(TC)标志。本函数内部已对 data 做一次全量
+        # parse_message, 主 wait 循环原先为读 truncated 位又对同一 bytes 第二次
+        # parse_message(每条 UDP done 应答重复走 question/answer/authority/
+        # additional 四段, 大包场景 CPU 放大 ~1x)。此处捕获后随返回字典透传,
+        # 调用方直接取用, 删除第二次解析。在下方 TCP 回退(可能用 tcp_data 替换
+        # parsed)之前捕获原始 UDP 应答的 TC 位。
+        _udp_truncated = False
         if ok and data:
             try:
                 parsed = dnsmsg.parse_message(data)
             except Exception:
                 parsed = None
+            if str(u.get("proto", "udp")).lower() == "udp" and parsed is not None:
+                _udp_truncated = bool(parsed.get("truncated"))
             # ---- UDP 截断(TC=1)自动 TCP 回退: 大响应(如 DNSSEC/大量A记录)UDP 装不下时,
             # 上游返回 truncated 标志, 自动切 TCP 重查同一上游获取完整应答 ----
             # R2-P1: skip_tcp(轻量/主线程路径)跳过阻塞的 _tcp_query, 避免主线程 I/O。
             if (not skip_tcp and parsed is not None and parsed.get("truncated")
                     and str(u.get("proto", "udp")).lower() == "udp"):
                 trace.append({"tag": "eng", "text": "%-12s UDP 应答截断(TC=1) → TCP 回退重查" % _uname[:12]})
+                # R5-P2-4: 保存 TCP 回退前的 UDP parsed(合法 rcode=0 截断应答)。
+                # 若 TCP 回退拿到数据但 parse_message 抛异常(parsed=None), 不能
+                # 让 parsed=None 走到下方 fail 路径误喂 cb_fail——UDP 应答本身合法,
+                # 上游可达, 仅 TCP 响应数据格式非法(极罕见)。回退用 UDP parsed
+                # 分类(喂 ok, 保留 udp_truncated=True), 不误熔断正常上游。
+                _udp_parsed = parsed
                 try:
                     tcp_ok, tcp_data = _tcp_query(u, query_bytes, timeout)
                 except Exception:
@@ -1749,7 +2043,26 @@ class Resolver:
                         parsed = dnsmsg.parse_message(tcp_data)
                     except Exception:
                         parsed = None
-                    trace.append({"tag": "ok", "text": "%-12s TCP 回退成功, 应答 %d bytes" % (_uname[:12], len(tcp_data))})
+                    # R6-N2(P2-2): R5-P2-4 只在 parsed=None(parse 异常)时回退 UDP
+                    # 截断结果。但 TCP 查询成功且 parse 成功、只是 rcode≠0
+                    # (SERVFAIL=2/REFUSED=5)时仍落到下方 fail 路径误喂 _cb_fail——
+                    # 而 UDP 原始应答是 rcode=0 的合法截断响应, 上游其实可达。设计
+                    # 原则"UDP 应答合法、上游可达, 仅 TCP 侧异常时不误熔断"同样适用
+                    # 于 TCP rcode≠0。回退用 _udp_parsed 分类(喂 ok, 保留
+                    # udp_truncated=True)。rcode∈{0,3} 才视为 TCP 侧有效应答。
+                    if parsed is None or parsed.get("rcode") not in (0, 3):
+                        _rc = None if parsed is None else parsed.get("rcode")
+                        trace.append({"tag": "warn", "text":
+                            "%-12s TCP 回退 rcode=%s, 沿用 UDP 截断应答" % (_uname[:12], _rc)})
+                        parsed = _udp_parsed
+                    else:
+                        # R4-P3-1: TCP 回退成功且完整应答已成功 parse 并替换 parsed,
+                        # udp_truncated 必须复位为 False——否则返回字典仍标
+                        # udp_truncated=True, "已拿到完整答案"的结果被错误标记为截断
+                        # 应答, 数据契约不一致(该 skip_tcp=False 路径结果仅喂遥测/熔断,
+                        # 不进 out/缓存/客户端, 无功能影响, 此处仅澄清契约)。
+                        _udp_truncated = False
+                        trace.append({"tag": "ok", "text": "%-12s TCP 回退成功, 应答 %d bytes" % (_uname[:12], len(tcp_data))})
                 else:
                     trace.append({"tag": "warn", "text": "%-12s TCP 回退失败, 沿用截断应答" % _uname[:12]})
             if parsed is not None:
@@ -1764,7 +2077,8 @@ class Resolver:
                             trace.append({"tag": "ans", "text": "%-12s %s  %dms" % (_uname[:12], a["value"], lat)})
                         return {"ok": True, "up_name": _uname, "lat": lat,
                                 "proto": str(u.get("proto", "udp")).lower(),
-                                "rcode": 0, "answers": ans}
+                                "rcode": 0, "answers": ans,
+                                "udp_truncated": _udp_truncated}
                     # 无目标类型答案: 若应答含 CNAME 链 → 交给 CNAME 跟踪展开
                     if parsed.get("answers"):
                         _cns = [a for a in parsed.get("answers", []) if a["type"] == dnsmsg.TYPE_CNAME]
@@ -1774,7 +2088,8 @@ class Resolver:
                             trace.append({"tag": "ans", "text": "%-12s CNAME 链 → %s (%dms)" % (
                                 _uname[:12], _cns[0].get("rdata", ""), lat)})
                             return {"ok": True, "up_name": _uname, "lat": lat,
-                                    "rcode": 0, "answers": [], "cnames": [
+                                    "rcode": 0, "answers": [], "udp_truncated": _udp_truncated,
+                                    "cnames": [
                                         (str(_cns[0].get("rdata", "")).rstrip(".").lower(),
                                          max(1, int(_cns[0].get("ttl", 300))))]}
                     # NOERROR 但无目标答案 = NODATA
@@ -1783,18 +2098,21 @@ class Resolver:
                     trace.append({"tag": "ans-fail", "text": "%-12s 无该类型记录 (NODATA) %dms" % (_uname[:12], lat)})
                     return {"ok": True, "up_name": _uname, "lat": lat,
                             "rcode": 0, "answers": [], "nodata": True,
+                            "udp_truncated": _udp_truncated,
                             "neg_ttl": self._soa_minimum(parsed)}
                 if rcode == 3:
                     self.tel.upstream_ok_conn_ok(_uid, self._conn_key(u), lat)
                     self._cb_ok(_uid)
                     trace.append({"tag": "ans-fail", "text": "%-12s NXDOMAIN (域名不存在) %dms" % (_uname[:12], lat)})
                     return {"ok": True, "up_name": _uname, "lat": lat,
-                            "rcode": 3, "answers": [], "neg_ttl": self._soa_minimum(parsed)}
+                            "rcode": 3, "answers": [], "udp_truncated": _udp_truncated,
+                            "neg_ttl": self._soa_minimum(parsed)}
             # rcode 其它（如 SERVFAIL/REFUSED）视为失败
         self.tel.upstream_fail_conn_fail(_uid, self._conn_key(u))
         self._cb_fail(_uid)
         trace.append({"tag": "ans-fail", "text": "%-12s 查询失败 / 超时 (%dms)" % (_uname[:12], lat)})
-        return {"ok": False, "up_name": _uname, "lat": lat, "rcode": None, "answers": []}
+        return {"ok": False, "up_name": _uname, "lat": lat, "rcode": None, "answers": [],
+                "udp_truncated": _udp_truncated}
 
     def _collect_rest_in_background(self, pending, fut2u, qtype, query_bytes=None):
         """后台收集未完成上游的结果：仅用于遥测统计, 不阻塞客户端。
@@ -2119,6 +2437,16 @@ class Resolver:
             if fut is None:
                 with self._prefetch_lock:
                     self._stale_refreshing.discard(key)
+                return
+            # R5-P2-2: done_callback 兜底清理。pool.shutdown(cancel_futures=True)
+            # 会取消 pending future, 此时 _do_stale_refresh 函数体不执行, finally 块
+            # 不跑, key 永远残留在 _stale_refreshing 中, 后续 stale 请求被永久跳过。
+            # callback 在 future 因任何原因结束(完成/异常/取消)时都触发, discard
+            # 是幂等的——正常路径 finally 已 discard, callback 再 discard 无副作用。
+            def _cleanup_stale(_f, _k=key):
+                with self._prefetch_lock:
+                    self._stale_refreshing.discard(_k)
+            fut.add_done_callback(_cleanup_stale)
         except Exception as e:
             log.warning("提交 stale 刷新异常 %s %s: %r", d, qtype, e)
             with self._prefetch_lock:
@@ -2215,7 +2543,10 @@ class Resolver:
             except Exception as e:
                 # 关键后台循环异常必须可见(否则预取静默失效)
                 log.error("预取扫描异常: %r", e)
-            time.sleep(self._prefetch_interval)
+            # R5-P2-1: 用 Event.wait 替代 time.sleep, shutdown() set() 后立即唤醒,
+            # 与 _bg_loop 的 wait(10) 退出语义对齐。原 time.sleep 不可中断,
+            # prefetch_interval 被热重载为较大值时 join(timeout=2.0) 超时。
+            self._prefetch_stop.wait(self._prefetch_interval)
 
     def _scan_prefetch(self):
         cfg = self.cfg
@@ -2322,6 +2653,21 @@ class Resolver:
                 pool.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
+        # P1-2(V146): best-effort drain 遥测/收集池(_collect_pool, _prefetch_pool)。
+        # 这些池中的在途任务可能正在向 telemetry/events 写数据, 直接 os._exit 会
+        # 丢失最后几行日志和未刷出的遥测样本。在独立 daemon 线程中对这两个小池
+        # 做 shutdown(wait=True), join 带 1.0s 超时——既给在途任务收尾窗口, 又不
+        # 阻塞退出超过 1s(慢 DoH 查询仍由 cancel_futures + 硬退兜底)。
+        import threading as _th_drain
+        for _dp in (self._collect_pool, self._prefetch_pool):
+            try:
+                _t = _th_drain.Thread(
+                    target=lambda p=_dp: p.shutdown(wait=True),
+                    name="pool-drain", daemon=True)
+                _t.start()
+                _t.join(timeout=1.0)
+            except Exception:
+                pass
         # R4-P3-2/R5/P3-4 -> v1.9.9x 修复: ReDoS 保护池已下沉为实例属性
         # self._regex_pool(原模块级单例)。worker 为非 daemon 线程, Python 退出时
         # threading._shutdown 会 join 所有非 daemon 线程; 若 ReDoS 正则仍在运行
@@ -2411,6 +2757,20 @@ class Resolver:
                  "tinylfu" if is_tinylfu else "lru", policy, cap)
         return True
 
+    @staticmethod
+    def _parts_signature(parts):
+        """P3-R2-2: 把 cache_partitions 配置归一化为可比较签名(与 PartitionedCache
+        构造时的归一化逻辑同型: 权重钳 >=0、按总和归一、排序后取小数位)。仅用于
+        reload 检测分区比例是否变化, 避免每次 reload 误重建缓存。"""
+        if not parts:
+            return ()
+        try:
+            p = {g: max(0.0, _safe_float(v, 0.0)) for g, v in dict(parts).items()}
+        except Exception:
+            return ()
+        total = sum(p.values()) or 1.0
+        return tuple(sorted((str(g), round(v / total, 6)) for g, v in p.items()))
+
     def reload(self, new_cfg, config_path=None):
         """热重载: 替换运行配置并重建受影响资源, 不重启进程。
 
@@ -2448,6 +2808,40 @@ class Resolver:
                 changed.append("cache_size %d→%d" % (old_cap, new_cap))
         except Exception:
             pass
+        # P3-R2-2: cache_partitions 分区比例热重载。原仅调 cache.capacity setter
+        # 调整各分区容量比例, 不改变分区集合/权重本身(PartitionedCache._parts 在
+        # __init__ 固化, capacity setter 只按既有 _parts 重分配)。此处检测分区配置
+        # 归一化签名是否变化, 变化时重建 PartitionedCache(与 switch_cache_policy 同型),
+        # 使新分区比例即时生效, 无需重启。仅对 PartitionedCache 生效(TinyLFU 无分区)。
+        try:
+            if isinstance(self.cache, PartitionedCache):
+                old_sig = self._parts_signature(old_cfg.get("cache_partitions"))
+                new_sig = self._parts_signature(new_cfg.get("cache_partitions"))
+                if old_sig != new_sig:
+                    _cap = self.cache.capacity
+                    _old_cache = self.cache
+                    # R3-P2-A: 先离线构建新分区缓存并迁移存活条目, 再原子替换引用。
+                    # 原实现直接 new PartitionedCache(...) = 全新空缓存, 改一次分区
+                    # 权重(常见调优)就静默全量 flush, 高峰期命中率骤降至 ~0(缓存雪崩)。
+                    # serialize() 只导出未过期条目; restore() 按原 group 路由(已删除
+                    # 分组回退 default), 新分组自然从空开始。迁移后命中率不骤降。
+                    _new_cache = PartitionedCache(_cap, new_cfg.get("cache_partitions"))
+                    try:
+                        _new_cache.stale_window = _safe_int(new_cfg.get("stale_ttl", 3600), 3600) if new_cfg.get("serve_stale", False) else 0
+                    except Exception:
+                        pass
+                    _moved = 0
+                    try:
+                        _entries = _old_cache.serialize()
+                        if _entries:
+                            _new_cache.restore(_entries)
+                            _moved = len(_entries)
+                    except Exception as e:
+                        log.warning("cache_partitions 热重建迁移条目失败(新缓存为空): %r", e)
+                    self.cache = _new_cache
+                    changed.append("cache_partitions 分区比例已重建 (容量 %d, 迁移 %d 条存活条目)" % (_cap, _moved))
+        except Exception as e:
+            log.warning("cache_partitions 热重载重建失败: %r", e)
         # v1.9.74 P1-2: 热重载同步 serve-stale 窗口到缓存层
         try:
             self.cache.stale_window = _safe_int(new_cfg.get("stale_ttl", 3600), 3600) if new_cfg.get("serve_stale", False) else 0
@@ -2455,6 +2849,17 @@ class Resolver:
             pass
         # 热重载同步客户端 bufsize 上限
         self._client_bufsize_cap = _safe_int(new_cfg.get("edns_client_max_size", 1232), 1232)
+        # P3-1(R1): _prefetch_interval 原先仅在 __init__ 赋值, reload 全程未更新,
+        # 导致 PUT /api/config 改 prefetch_interval 后预取扫描节奏仍固定 1.0s, 只能
+        # 重启进程生效。此处同步: 下限 0.1s(防配置过小把预取循环变成忙轮询), 默认
+        # 1.0s。_prefetch_loop 每轮 time.sleep(self._prefetch_interval), 下一轮即生效。
+        try:
+            _new_pi = max(0.1, _safe_float(new_cfg.get("prefetch_interval", 1.0), 1.0))
+            if abs(_new_pi - self._prefetch_interval) > 1e-6:
+                changed.append("prefetch_interval %.2f→%.2fs" % (self._prefetch_interval, _new_pi))
+                self._prefetch_interval = _new_pi
+        except Exception:
+            pass
         # 缓存策略切换(lru <-> tinylfu): 以实际缓存对象类型与目标策略比对重建,
         # 不依赖 cfg 新旧字符串(因 PUT 可能已先改 cfg)
         new_p = str(new_cfg.get("cache_policy", "lru")).lower()
@@ -2509,7 +2914,119 @@ class Resolver:
             log.error("热重载 0x20 状态清理失败: %r", e)
         # 防御性清理 owner-name 编码 memo: encode_name 是纯函数(旧条目编码结果始终
         # 正确), 但 reload 重建规则索引/缓存策略时一并清空以保持状态一致性。
-        self._enc_owner.clear()
+        # P2-1(V146): 改为原子引用交换(新建空 OrderedDict 替换旧引用), 而非
+        # clear()。热路径 answer_fast 在无锁下读 self._enc_owner, clear() 与
+        # get()/move_to_end() 之间存在窗口导致 KeyError(原靠 try/except 吞)。
+        # 引用交换后, 已 grab 旧引用的线程继续操作旧 dict(无半清状态), 新线程
+        # 看到空 dict; 旧 dict 随 GC 回收, 彻底消除竞态且无热路径锁开销。
+        self._enc_owner = OrderedDict()
+        return changed
+
+    def refresh_derived_state_after_save(self, old_cfg):
+        """PUT /api/config 保存成功后刷新 resolver 派生态。
+
+        与 reload() 的区别: 不做 cfg 整体引用替换(已由调用方在锁内完成)、
+        不重建规则索引(调用方已在锁外 rebuild)、不切缓存策略(调用方已处理)、
+        不调 cache.capacity(调用方已设)。仅刷新 reload() 内由配置字段派生、
+        但 PUT 路径此前遗漏的运行态:
+          - _ecs_key (edns_client_subnet) + 缓存清空
+          - PartitionedCache 分区权重重建 (cache_partitions)
+          - cache.stale_window (serve_stale/stale_ttl)
+          - _client_bufsize_cap (edns_client_max_size)
+          - _prefetch_interval (prefetch_interval)
+          - 熔断器/0x20/_enc_owner 清理
+        返回变更描述 list。"""
+        changed = []
+        new_cfg = self.cfg
+        # --- ECS key 重算 (与 reload() 同逻辑) ---
+        try:
+            new_ecs_key = self._normalize_ecs_key(new_cfg)
+        except Exception:
+            new_ecs_key = self._ecs_key
+        _old_ecs = self._ecs_key
+        if new_ecs_key != _old_ecs:
+            self._ecs_key = new_ecs_key
+            try:
+                self.cache.clear()
+                changed.append("ecs_key 变化(%r→%r), 缓存已清空" % (_old_ecs, self._ecs_key))
+            except Exception as e:
+                log.warning("ECS 变化后清空缓存失败: %r", e)
+        # --- cache_partitions 分区权重重建 (与 reload() 同逻辑) ---
+        try:
+            if isinstance(self.cache, PartitionedCache):
+                old_sig = self._parts_signature(old_cfg.get("cache_partitions"))
+                new_sig = self._parts_signature(new_cfg.get("cache_partitions"))
+                if old_sig != new_sig:
+                    _cap = self.cache.capacity
+                    _old_cache = self.cache
+                    _new_cache = PartitionedCache(_cap, new_cfg.get("cache_partitions"))
+                    try:
+                        _new_cache.stale_window = _safe_int(
+                            new_cfg.get("stale_ttl", 3600), 3600
+                        ) if new_cfg.get("serve_stale", False) else 0
+                    except Exception:
+                        pass
+                    _moved = 0
+                    try:
+                        _entries = _old_cache.serialize()
+                        if _entries:
+                            _new_cache.restore(_entries)
+                            _moved = len(_entries)
+                    except Exception as e:
+                        log.warning("cache_partitions 热重建迁移条目失败: %r", e)
+                    self.cache = _new_cache
+                    changed.append("cache_partitions 分区权重已重建 (容量 %d, 迁移 %d 条)" % (_cap, _moved))
+        except Exception as e:
+            log.warning("cache_partitions 热重载重建失败: %r", e)
+        # --- serve_stale / stale_ttl → cache.stale_window ---
+        try:
+            self.cache.stale_window = _safe_int(
+                new_cfg.get("stale_ttl", 3600), 3600
+            ) if new_cfg.get("serve_stale", False) else 0
+        except Exception:
+            pass
+        # --- edns_client_max_size → _client_bufsize_cap ---
+        try:
+            self._client_bufsize_cap = _safe_int(new_cfg.get("edns_client_max_size", 1232), 1232)
+        except Exception:
+            pass
+        # --- prefetch_interval ---
+        try:
+            _new_pi = max(0.1, _safe_float(new_cfg.get("prefetch_interval", 1.0), 1.0))
+            if abs(_new_pi - self._prefetch_interval) > 1e-6:
+                changed.append("prefetch_interval %.2f→%.2fs" % (self._prefetch_interval, _new_pi))
+                self._prefetch_interval = _new_pi
+        except Exception:
+            pass
+        # --- 熔断器 / 0x20 / _enc_owner 清理 (与 reload() 同逻辑) ---
+        try:
+            alive = set()
+            alive_ids = set()
+            for u in (new_cfg.get("upstreams") or []):
+                alive.add(u.get("id") or u.get("name") or "?")
+                alive_ids.add(u.get("id", ""))
+            with self._cb_lock:
+                dead = [k for k in self._cb if k not in alive]
+                for k in dead:
+                    del self._cb[k]
+            if dead:
+                changed.append("熔断器清理已删除上游 %d 条" % len(dead))
+        except Exception as e:
+            log.error("派生态刷新: 熔断器清理失败: %r", e)
+        try:
+            from . import upstream as _up_mod
+            alive_ids = {u.get("id", "") for u in (new_cfg.get("upstreams") or [])}
+            with _up_mod._0x20_lock:
+                dead_x20 = [k for k in _up_mod._0x20_misses if k not in alive_ids]
+                for k in dead_x20:
+                    _up_mod._0x20_misses.pop(k, None)
+                    _up_mod._0x20_DISABLED_SINCE.pop(k, None)
+                dead_x20_disabled = [k for k in _up_mod._0x20_disabled if k not in alive_ids]
+                for k in dead_x20_disabled:
+                    _up_mod._0x20_disabled.discard(k)
+        except Exception as e:
+            log.error("派生态刷新: 0x20 清理失败: %r", e)
+        self._enc_owner = OrderedDict()
         return changed
 
     # ---------------- 周期任务: 健康检查 + 订阅自动更新 ---------------- #
@@ -2566,27 +3083,38 @@ class Resolver:
         # v1.9.142: 多上游探测改为并发(原串行在有慢/不可达境外上游时逐个等超时,
         # 一轮健康检查可耗时数十秒、周期漂移并长期占用后台线程)。所有探测同时发起,
         # 一轮耗时收敛到约单次超时; query_upstream 各路径线程安全(QUIC 复用同一常驻连接)。
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=min(8, len(ups2))) as _hcex:
-            _futs = {_hcex.submit(query_upstream, u, qbytes, timeout): u for u in ups2}
-            for _fut in as_completed(_futs):
-                u = _futs[_fut]
-                # P2-1: 与 _classify_one 对齐, 漏写 id 时回退 name, 防 KeyError
-                _uid = u.get("id") or u.get("name") or "?"
-                _uname = u.get("name") or u.get("id", "?")
-                try:
-                    ok, _data, _lat, _e = _fut.result()
-                except Exception as e:
-                    self._cb_fail(_uid)
-                    # R7/P2-2: 与同函数其他日志对齐, name 缺失时回退 id。
-                    log.debug("健康检查异常 %s: %r", _uname, e)
-                    continue
-                if ok:
-                    self._cb_ok(_uid)
-                    log.debug("健康检查 OK  %s (%s)", _uname, u.get("addr"))
-                else:
-                    self._cb_fail(_uid)
-                    log.info("健康检查失败 %s (%s): %s", _uname, u.get("addr"), _e or "无应答")
+        # P2-3(V146): 复用常驻 _probe_pool(16 worker)替代每轮新建 ThreadPoolExecutor,
+        # 避免每 30s 线程创建/销毁抖动。submit_drop 队列满则丢(健康检查可丢, 下轮再探)。
+        from concurrent.futures import wait as _cf_wait, as_completed as _cf_as_completed
+        _futs = {}
+        for u in ups2:
+            _f = self._probe_pool.submit_drop(query_upstream, u, qbytes, timeout)
+            if _f is not None:
+                _futs[_f] = u
+        if not _futs:
+            return
+        # 等待所有探测完成(带单次超时上限 + 0.5s 余量兜底, 防 pool 异常悬挂)
+        _cf_wait(set(_futs), timeout=timeout / 1000.0 + 0.5)
+        for _fut in _futs:
+            if not _fut.done():
+                continue
+            u = _futs[_fut]
+            # P2-1: 与 _classify_one 对齐, 漏写 id 时回退 name, 防 KeyError
+            _uid = u.get("id") or u.get("name") or "?"
+            _uname = u.get("name") or u.get("id", "?")
+            try:
+                ok, _data, _lat, _e = _fut.result()
+            except Exception as e:
+                self._cb_fail(_uid)
+                # R7/P2-2: 与同函数其他日志对齐, name 缺失时回退 id。
+                log.debug("健康检查异常 %s: %r", _uname, e)
+                continue
+            if ok:
+                self._cb_ok(_uid)
+                log.debug("健康检查 OK  %s (%s)", _uname, u.get("addr"))
+            else:
+                self._cb_fail(_uid)
+                log.info("健康检查失败 %s (%s): %s", _uname, u.get("addr"), _e or "无应答")
 
     def _fetch_sub_text(self, url, timeout=20):
         """拉取订阅文本(共享实现): SSRF 初始+每跳重定向校验, 16MB 流式上限。"""
@@ -2788,6 +3316,11 @@ class Resolver:
         # v1.9.81: 持锁 clear() 而非替换对象, 避免 _cache_rule 写入旧 dict 后丢失
         with self._rule_cache_lock:
             self._rule_match_cache.clear()
+        # P2-R2-2: 记录清空时刻, answer_fast 据此进入宽限期(_UNCERTAIN 直接答缓存,
+        # 避免缓存命中全部突降 worker); 同时后台采样 DNS 缓存热点域名预热规则缓存,
+        # 缩短宽限期后的 fallthrough 窗口。
+        self._rule_rebuild_ts = time.monotonic()
+        self._spawn_rule_warmup()
         # 检测是否有 group 分流规则: 无则 _ckey 直接用 default 分区, 跳过 match_rule
         old_has_group = getattr(self, "_has_group_rules", False)
         self._has_group_rules = any(
@@ -2897,12 +3430,17 @@ class Resolver:
             return ("国内 " if rule.get("group") == "domestic" else "国外 ") + match
         return match
 
-    def match_rule(self, domain):
+    def match_rule(self, domain, fast=False):
         """分流规则匹配(域名级)。优先级:
         精确规则 O(1) 哈希 → 通配规则后缀最长匹配(逐级剥离子域)
         → re: 正则(按序首个命中)。
         性能: 结果按域名缓存(规则不变时结论不变), 重建规则时清空;
-        热路径(缓存命中复查 + miss 分流)避免重复遍历正则。"""
+        热路径(缓存命中复查 + miss 分流)避免重复遍历正则。
+        fast=True: 仅用于唯一 UDP recv 线程的快路径(answer_fast block 复查)。
+        字典类(精确/通配/白名单)规则照常求值; 一旦进入 re: 正则阶段就返回
+        _UNCERTAIN(不写缓存), 让快路径 fallthrough 到 answer_raw 工作线程做完整
+        规则判定——规则热重载清空 _rule_match_cache 后, 不能让 recv 线程同步
+        fut.result(0.5s) 等正则, 否则 head-of-line 阻塞 p99。"""
         n = domain.lower()
         # H-4: 单次解包原子快照——整次匹配看到的是同一份规则索引, 重建期间
         # 不会读到混合状态。解包开销为 O(1)(六个引用), 远小于字典查找本身。
@@ -2958,6 +3496,16 @@ class Resolver:
             if idx == -1:
                 break
             core = core[idx + 1:]
+        # P2-2(R1): recv 线程快路径——进入 re: 正则阶段前早退。字典类(精确/通配/
+        # 白名单)规则已全部 miss; 若根本没有正则类规则(suffix_wild/regex 均空),
+        # 字典查找已是完整判定, 直接返回 None 并缓存(否则会让所有无规则域名无谓
+        # fallthrough 到工作线程)。否则返回 _UNCERTAIN(不写缓存, 避免把"未求值"
+        # 毒化为确定结论), 由调用方 fallthrough 到 answer_raw 工作线程做完整正则判定。
+        if fast:
+            if not suffix_wild and not regex:
+                self._cache_rule(n, None)
+                return None
+            return _UNCERTAIN
         # 中缀/前缀通配(*ac*.com 等): 同一剥离路径按固定后缀定位小组后逐条正则
         core = n
         while core:
@@ -3007,6 +3555,68 @@ class Resolver:
                         break
             cache[n] = rule
 
+    def _in_rule_grace(self):
+        """P2-R2-2: 规则缓存清空后是否仍在宽限期内。宽限期内 answer_fast 对
+        _UNCERTAIN 直接答缓存(避免 worker 突增), 宽限期外 fail-closed 降级 worker。"""
+        try:
+            return (time.monotonic() - self._rule_rebuild_ts) < _RULE_GRACE_SEC
+        except Exception:
+            return False
+
+    def _spawn_rule_warmup(self):
+        """P2-R2-2: 规则缓存清空后后台采样 DNS 缓存热点域名做一次完整规则判定
+        (fast=False), 快速重建 _rule_match_cache, 缩短宽限期后的 worker fallthrough
+        窗口。有界: 最多 _RULE_WARM_MAX 个域名, 正则走共享 _regex_pool(信号量有界),
+        与实时查询共享池但不无限占用; 已有预热在跑则跳过, 避免重复 reload 堆积线程。
+        R3-P3-A: check-then-set 在 _rule_warmup_lock 内原子完成, 并发 reload 不会
+        起多个预热线程。"""
+        try:
+            with self._rule_warmup_lock:
+                if self._rule_warmup_inflight:
+                    return
+                # 空缓存无热点可预热, 直接跳过(初始 __init__ rebuild 场景)
+                if not self.cache or len(self.cache) == 0:
+                    return
+                self._rule_warmup_inflight = True
+            threading.Thread(target=self._rule_warmup_worker,
+                             name="rule-warmup", daemon=True).start()
+        except Exception:
+            with self._rule_warmup_lock:
+                self._rule_warmup_inflight = False
+
+    def _rule_warmup_worker(self):
+        try:
+            keys = self.cache.snapshot_keys()
+        except Exception:
+            keys = []
+        ecs = self._ecs_key or ""
+        seen = set()
+        n = 0
+        for k in keys:
+            if n >= _RULE_WARM_MAX:
+                break
+            try:
+                # key 为 (group, key_d, qtype) 3 元组; key_d 可能带 "ecs|" 前缀。
+                # 剥掉 ECS 前缀还原裸域名再做规则判定(规则按裸域名匹配)。
+                key_d = k[1] if len(k) >= 3 else (k[0] if k else "")
+                dom = str(key_d or "")
+                if ecs and "|" in dom:
+                    dom = dom.split("|", 1)[1]
+                dom = dom.rstrip(".").lower()
+                if not dom or dom in seen:
+                    continue
+                seen.add(dom)
+                n += 1
+                # fast=False 走完整正则求值并 _cache_rule 回填, 与 worker 路径同型。
+                self.match_rule(dom, fast=False)
+            except Exception:
+                continue
+        try:
+            with self._rule_warmup_lock:
+                self._rule_warmup_inflight = False
+        except Exception:
+            pass
+
     def _guess_type(self, value, qtype):
         value = str(value or "")  # 类型兜底: config.json 手改写入数字等非字符串时避免 value.strip() 抛 AttributeError
         v = value.strip()
@@ -3024,12 +3634,12 @@ class Resolver:
         d = (domain or "").strip().rstrip(".").lower()
         return d
 
-    def _result(self, d, qtype, answers, chosen, hit, error, reason, latency, trace, ttl_left, empty=False, rcode=0):
+    def _result(self, d, qtype, answers, chosen, hit, error, reason, latency, trace, ttl_left, empty=False, rcode=0, truncated=False):
         return {
             "domain": d, "qtype": qtype,
             "answers": answers, "chosen": chosen or "",
             "hit": hit, "error": error, "reason": reason,
-            "rcode": rcode,
+            "rcode": rcode, "truncated": truncated,
             "latency": round(latency, 2), "ttl_left": ttl_left,
             "trace": trace, "empty": empty,
         }

@@ -41,10 +41,14 @@ Group=ebpdns
 ExecStart=/opt/ebpdns/bin/ebpdns run --config /etc/ebpdns/config.json
 Restart=on-failure
 RestartSec=5
-# 优雅退出: SIGTERM 后 5s 内未退出则 SIGKILL(正常退出 <10ms, trim 线程 join 超时 2s)。
-# DNS 服务需秒退, 避免 systemd 重启时新实例长时间无法 bind 53 端口。
+# 优雅退出: SIGTERM 后 15s 内未退出则 SIGKILL。
+# P2-2(R4 审查): 原 5s 在大 cache.json(cache_size=131072 热点条目多时数 MB)落盘时偏紧——
+# SIGTERM 钩子要停 socket、等在途解析、把内存 LRU 原子落盘(tmp+fsync+rename)、join
+# 连接池/QUIC 线程。5s 被 SIGKILL 会丢失本次内存最新缓存条目(重启后从旧 cache.json 恢复,
+# 预热窗口变长)并泄漏上游 TCP 连接。15s 窗口对每日 04:30 低峰维护可接受; DNS 秒退诉求
+# 由 RestartSec=5 兜底(新实例仍在旧实例完全退出后才 bind 53)。
 KillSignal=SIGTERM
-TimeoutStopSec=5
+TimeoutStopSec=15
 # v7 P2-3: 安全沙箱硬化。
 #   仅保留 CAP_NET_BIND_SERVICE(绑定 53 端口); 移除 CAP_NET_RAW——代码中无 SOCK_RAW/
 #   AF_PACKET/AF_XDP 实际使用(bpf/ 目录为独立 C 代码, 经 load.sh 单独加载, 不进
@@ -104,6 +108,13 @@ ProcSubset=pid
 #   mprotect(..., PROT_EXEC) 在本内核/glibc 组合下不报 EPERM。若未来引入 JIT 组件(PyPy/
 #   Cython 运行时生成代码/扩展模块自改可执行页)需移除此行, 否则启动即 EPERM/段错误。
 MemoryDenyWriteExecute=yes
+# P3-10(R12): 补两条零副作用纵深硬化。
+#   ProtectClock: 禁止调用 settimeofday/clock_settime/adjtime 改系统时钟。ebpdns 纯 CPython
+#     DNS 解析器, 只 time.time() 读时钟, 从不写; 禁掉收敛"被利用改系统时间影响日志/缓存TTL语义"的攻击面。
+#     (未来若引入 NTP 校准/写系统时间功能需移除此项。)
+#   ProtectHostname: 禁止调用 sethostname 改主机名。服务无主机名需求, 收敛容器/主机名伪造面。
+ProtectClock=yes
+ProtectHostname=yes
 
 [Install]
 WantedBy=multi-user.target

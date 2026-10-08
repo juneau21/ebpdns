@@ -119,7 +119,7 @@ if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
   for _req in bin/ebpdns ebpdns/__init__.py ebpdns/__main__.py ebpdns/cli.py ebpdns/api.py \
               ebpdns/resolver.py ebpdns/server.py ebpdns/cache.py ebpdns/config.py \
               ebpdns/telemetry.py ebpdns/upstream.py ebpdns/dnsmsg.py ebpdns/probe.py \
-              ebpdns/quic_upstream.py web/index.html web/echarts.min.js systemd/ebpdns.service; do
+              ebpdns/quic_upstream.py web/index.html web/echarts.min.js web/favicon.svg systemd/ebpdns.service; do
     if [[ ! -e "${INSTALL_DIR}/${_req}" ]]; then
       echo "错误: 就地安装缺少关键文件 ${INSTALL_DIR}/${_req}, 请确认完整解压部署包后再运行" >&2
       exit 1
@@ -129,6 +129,36 @@ if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
   # 与异地 rsync/cp 分支行为对齐, 避免陈旧字节码随升级残留。
   find "${INSTALL_DIR}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
   find "${INSTALL_DIR}" -name '*.pyc' -delete 2>/dev/null || true
+  # P2-1(R4 审查): 就地升级(SRC_DIR==INSTALL_DIR)无法像异地 rsync --delete 那样
+  # 清理上版本已删除的陈旧 .py。用户把 v1.9.146 解压覆盖到 /opt/ebpdns/ 后, 若新版
+  # 删了 ebpdns/old_module.py, 该文件仍残留——Python 包目录导入虽不主动加载死模块,
+  # 但若代码用 importlib.import_module("ebpdns." + name) 动态枚举会误加载, 且与异地
+  # 升级行为漂移。这里用白名单对齐当前发布包的模块清单, 删除 ebpdns/ 下多余的 .py。
+  # 维护提醒: 新增/删除模块时同步更新此白名单。
+  _whitelist_py="__init__.py __main__.py cli.py api.py resolver.py server.py cache.py config.py telemetry.py upstream.py dnsmsg.py probe.py quic_upstream.py"
+  if [[ -d "${INSTALL_DIR}/ebpdns" ]]; then
+    ( cd "${INSTALL_DIR}/ebpdns" && \
+      for _f in *.py; do
+        [[ -e "$_f" ]] || continue
+        case " $_whitelist_py " in
+          *" $_f "*) : ;;
+          *) echo "[INFO] 就地升级清理上版本残留模块: ebpdns/$_f"; rm -f -- "$_f" ;;
+        esac
+      done )
+  fi
+  # bin/ 下仅保留 ebpdns 入口, 清理任何陈旧可执行文件(与异地 rsync --delete 对齐)。
+  if [[ -d "${INSTALL_DIR}/bin" ]]; then
+    ( cd "${INSTALL_DIR}/bin" && \
+      for _f in *; do
+        [[ -e "$_f" ]] || continue
+        [[ "$_f" == "ebpdns" ]] || { echo "[INFO] 就地升级清理 bin/$_f"; rm -f -- "$_f"; }
+      done )
+  fi
+  # P3-8(R12): 就地分支此前清了 __pycache__/*.pyc/白名单 .py/bin/, 但未像异地 cp 回退路径
+  # (:214 tests/、:218 artifacts/)那样后置清理 tests/ 与 artifacts/ 目录。裸源码就地升级覆盖
+  # 到 /opt/ebpdns 时这两类目录会残留(daemon 不 import, 仅目录残留, 与异地升级口径对齐清除)。
+  find "${INSTALL_DIR}" -type d -name 'tests' -prune -exec rm -rf {} + 2>/dev/null || true
+  find "${INSTALL_DIR}" -type d -name 'artifacts' -prune -exec rm -rf {} + 2>/dev/null || true
 else
   echo "==> 1/4 复制代码到 ${INSTALL_DIR}"
   # P2-26(第九轮审查): 异地安装前, 若发布包附带 SHA256SUMS, 先校验文件完整性。
@@ -146,19 +176,33 @@ else
     # v1.9.90: --delete 重新引入, 但仅按纯代码子目录逐项加 --delete(尾斜杠语义),
     # 清理上一版本已删除的陈旧 .py/入口文件, 避免升级后残留死模块被误导入。
     # 不做整目录 --delete: 用户数据目录是独立的 /etc/ebpdns(rules_local.json/cache.json),
-    # 不在 ${INSTALL_DIR} 内, 天然不受影响; bpf/ 与 etc/(配置模板)按覆盖拷贝, 不加 --delete。
+    # 不在 ${INSTALL_DIR} 内, 天然不受影响。
+    # R5 P3-1: bpf/ 不加 --delete——bpf/ 是真实 XDP 内核旁路 C 源码, 进阶用户会就地
+    # make 出 ebpdns_xdp.o(构建产物)甚至自定义改 .c; 带 --delete 升级会静默清除这些
+    # 不在发布包清单里的文件(与下方 cp 回退路径行为对齐)。etc/(配置模板)保留 --delete,
+    # 清陈旧模板。
     # v1.9.80: rsync 失败必须立即中止(磁盘满/权限不足), 不带 || true。
+    # R6 P3-1: --exclude='artifacts' 与 package.sh 的 ebpdns/artifacts prune 口径对齐,
+    # 防止裸 clone 时审查调试脚本(_r48_test.py 等)被拷入 /opt/ebpdns。
     for _d in bin ebpdns web systemd; do
       rsync -a --delete --ignore-missing-args \
-        --exclude='*.pyc' --exclude='__pycache__' \
+        --exclude='*.pyc' --exclude='__pycache__' --exclude='artifacts' \
         "${SRC_DIR}/${_d}/" "${INSTALL_DIR}/${_d}/"
     done
+    # bpf/: 纯覆盖拷贝, 不加 --delete(见上方 R5 P3-1 注释)
     rsync -a --ignore-missing-args \
+      --exclude='*.pyc' --exclude='__pycache__' \
+      "${SRC_DIR}/bpf/" "${INSTALL_DIR}/bpf/"
+    # etc/(配置模板) + 顶层 README/LICENSE: --delete 仅镜像 etc/ 内部陈旧模板
+    rsync -a --delete --ignore-missing-args \
       --exclude='*.pyc' --exclude='__pycache__' --exclude='tools' \
       --exclude='deploy-test' --exclude='tests' \
-      "${SRC_DIR}/bpf" "${SRC_DIR}/etc" \
-      "${SRC_DIR}/README.md" "${SRC_DIR}/LICENSE" \
-      "${INSTALL_DIR}/"
+      "${SRC_DIR}/etc/" "${INSTALL_DIR}/etc/"
+    # P3-11(R12): 原 `2>/dev/null || true` 静默吞掉 README/LICENSE 拷贝失败(磁盘满/只读挂载)。
+    # 文档非运行时依赖, 缺失不影响 daemon, 故为非致命——改为显式 WARN(与同脚本 chown/chmod
+    # 显式 WARN 风格对齐), 用户不再对文档缺失无感知。
+    cp -f "${SRC_DIR}/README.md" "${SRC_DIR}/LICENSE" "${INSTALL_DIR}/" \
+      || echo "[WARN] README/LICENSE 拷贝失败(不影响运行, 仅文档缺失)"
   else
     # rsync 不可用 → 退回 cp。纯代码子目录(bin/ebpdns/web/systemd)先删旧再拷,
     # 对齐 rsync --delete: 清除上版本已删除的陈旧 .py/入口文件。bpf/etc(模板)按覆盖拷贝。
@@ -170,13 +214,19 @@ else
              "${INSTALL_DIR}"/bpf "${INSTALL_DIR}"/etc "${INSTALL_DIR}"/systemd
     cp -r "${SRC_DIR}"/bin "${SRC_DIR}"/ebpdns "${SRC_DIR}"/web \
           "${SRC_DIR}"/bpf "${SRC_DIR}"/etc "${SRC_DIR}"/systemd "${INSTALL_DIR}/"
-    cp -f "${SRC_DIR}"/README.md "${SRC_DIR}"/LICENSE "${INSTALL_DIR}/" 2>/dev/null || true
+    # P3-11(R12): 同上方 rsync 分支, 移除 `2>/dev/null || true` 静默吞, 拷贝失败显式 WARN(非致命)。
+    cp -f "${SRC_DIR}"/README.md "${SRC_DIR}"/LICENSE "${INSTALL_DIR}/" \
+      || echo "[WARN] README/LICENSE 拷贝失败(不影响运行, 仅文档缺失)"
     # R31 P3-4: rsync 路径有 --exclude(*.pyc / __pycache__ / tests), cp 回退路径无 exclude 能力。
     # 拷贝后置清理构建缓存与测试目录, 避免陈旧 .pyc/__pycache__/tests 进入 /opt/ebpdns,
     # 与 rsync 路径排除项行为对齐。失败(目录不存在等)静默忽略, 不影响主安装流程。
     find "${INSTALL_DIR}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     find "${INSTALL_DIR}" -name '*.pyc' -delete 2>/dev/null || true
     find "${INSTALL_DIR}" -type d -name 'tests' -exec rm -rf {} + 2>/dev/null || true
+    # R7 P3-4: rsync 路径带 --exclude='artifacts'(install.sh:184), cp 回退路径无 exclude 能力,
+    # 后置清理清单补 artifacts/ 目录, 与 rsync exclude 口径对齐——防裸 clone + 无 rsync 极端精简
+    # 环境下把调试/审查脚本(ebpdns/artifacts/*.py)拷入 /opt/ebpdns。-prune 防止递归进已删目录。
+    find "${INSTALL_DIR}" -type d -name 'artifacts' -prune -exec rm -rf {} + 2>/dev/null || true
   fi
 fi
 
@@ -190,7 +240,10 @@ chown -R root:root "${INSTALL_DIR}" 2>/dev/null \
 # 源码包中 index.html 等可能是 600(root:root), chown -R root:root 后 ebpdns 无权读,
 # 会导致控制台静态资源 404。补一条目录 755 / 静态文件 644, 保证 ebpdns(及其它用户)可读。
 chmod 755 "${INSTALL_DIR}/web" 2>/dev/null || true
-chmod 644 "${INSTALL_DIR}/web/"*.{html,js,css,svg,png,ico} 2>/dev/null || true
+# P3-9(R12): 收窄通配到 web/ 实际存在的文件类型。web/ 发布包仅含 index.html / echarts.min.js /
+# favicon.svg(P3-1 新增), 原大括号里的 .css/.png/.ico 永不命中(空 glob 被 || true 静默吞, 死 glob)。
+# 现仅 chmod 真实存在的三类扩展名; favicon.svg 纳入 644 保证 ebpdns 用户可读。
+chmod 644 "${INSTALL_DIR}/web/"*.{html,js,svg} 2>/dev/null || true
 
 # ---------- 2/4 生成配置 ----------
 echo "==> 2/4 生成配置 ${CONF_DIR}/config.json"
@@ -269,6 +322,9 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       || echo "[WARN] 重启 service 拷贝失败, 将无每日内存卫生自动重启(主服务不受影响)"
     cp -f "${SRC_DIR}/systemd/ebpdns-restart.timer" /etc/systemd/system/ \
       || echo "[WARN] 重启 timer 拷贝失败, 将无每日内存卫生自动重启(主服务不受影响)"
+    # P3-N2(R4): restart.service/timer 拷入晚于上方唯一一次 daemon-reload(283),
+    # 补一次 reload 使 disk 上的新 unit 立即被 systemd 识别, 兼容较老 systemd(隐式 reload 不保证)。
+    systemctl daemon-reload || echo "    (daemon-reload 失败, 跳过)"
     # P3-3(第八轮审查): 原 `|| true` 静默吞掉 enable/start 失败。与上方 timer/service 拷贝
     # 的 WARN 风格对齐——启用/启动失败只丢失每日内存卫生自动重启, 主服务不受影响, 故为非致命,
     # 改为显式 WARN, 不再静默。
@@ -276,6 +332,23 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       || echo "[WARN] timer 启用失败, 将无每日内存卫生自动重启(主服务不受影响)"
     systemctl start ebpdns-restart.timer >/dev/null 2>&1 \
       || echo "[WARN] timer 启动失败, 将无每日内存卫生自动重启(主服务不受影响)"
+  fi
+  # R5 P3-2: 升级场景——新 .py 已落 ${INSTALL_DIR}, 但运行中的旧进程仍在内存跑旧字节码。
+  # 检测服务当前 active: 是(升级)→显式 restart 使新代码立即生效, 否则用户照末尾提示
+  # `systemctl start` 对 active 单元是空操作, 误以为升级完成实际跑旧代码;
+  # 否(首次安装)→不擅自拉起服务, 保持由用户按末尾提示手动 start 的原有行为。
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    echo "    检测到 ${SERVICE_NAME} 正在运行(升级场景), 重启以加载新代码(中断 DNS 约 5-10s)..."
+    systemctl restart "${SERVICE_NAME}" \
+      || echo "    [WARN] restart ${SERVICE_NAME} 失败, 请手动执行: sudo systemctl restart ${SERVICE_NAME}"
+    # R6 P3-3: systemctl restart 返回 0 仅表示指令被 systemd 接受, 不代表新进程成功拉起。
+    # 新代码若启动即崩(导入错误/配置不兼容), systemd 会崩溃循环后进入 failed, 此处必须
+    # 复核 active, 否则脚本打印"4/4 完成"而实际 DNS 已停。
+    sleep 3
+    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+      echo "    [ERROR] 重启后 ${SERVICE_NAME} 未进入 active 状态, 新代码可能启动失败," >&2
+      echo "             请检查: sudo journalctl -u ${SERVICE_NAME} -n 50" >&2
+    fi
   fi
 else
   echo "    (未检测到运行中的 systemd, 跳过 daemon-reload/enable; 请手动启动 ebpdns)"

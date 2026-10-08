@@ -209,6 +209,19 @@ def _save_cache(cfg, config_path, cache):
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            # P3(R1-13): rename 后对父目录 fsync, 与 config.save_config 对齐。
+            # 此前只 fsync 文件内容, rename 后到目录项回写前掉电最坏会丢失本次缓存
+            # (旧 cache.json 仍在, 无损坏/无半截文件)。缓存可重建, 严重度低, 但与
+            # save_config 持久化承诺对齐。
+            try:
+                _dd = os.open(os.path.dirname(os.path.abspath(path)) or ".",
+                              os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(_dd)
+                finally:
+                    os.close(_dd)
+            except OSError:
+                pass
             return len(entries)
         except Exception as e:
             # R38 P3-1: 原子写失败时清理残留 .tmp, 与 save_config/save_local_rules 同型
@@ -340,7 +353,10 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                             have.add(s.get("url"))
             except Exception:
                 pass
-            for m in live_cfg.get("rule_subscriptions", []):
+            # v1.9.146 P3-4: 锁外遍历 rule_subscriptions 前做一次浅拷贝快照。
+            # 迭代期间若 PUT /api/config 并发替换该列表, 裸迭代器可能抛
+            # RuntimeError / 跳过重复条目; list() 拷贝保证结构稳定。
+            for m in list(live_cfg.get("rule_subscriptions", [])):
                 url = m.get("url")
                 if not url or url in have:
                     continue
@@ -364,6 +380,7 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                     # R38 P3-1: tmp 提到 try 外, 与 save_config/save_local_rules 同型,
                     # 便于 except 分支清理残留 .tmp
                     tmp = sub_path + ".tmp"
+                    _gen_bumped = False
                     try:
                         with app_ctx._lock:
                             subs = []
@@ -393,7 +410,12 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                                 f.flush()
                                 os.fsync(f.fileno())
                             os.replace(tmp, sub_path)
-                            app_ctx.resolver.rebuild_rule_index()
+                            # R2-06: 与 API 规则写路径一致, 锁内只自增代际; rebuild 移到
+                            # 锁外走 _rebuild_lock 串行 + 代际跳过, 不再绕过代际跟踪直接
+                            # rebuild(此前冷启动 rebuild 与 API rebuild 并发时不被
+                            # _rebuild_lock 约束, 会冗余重建且不参与代际跳过)。
+                            app_ctx._rule_rebuild_gen += 1
+                            _gen_bumped = True
                     except Exception:
                         # R38 P3-1: 原子写失败时清理残留 .tmp, 与 save_config 同型
                         try:
@@ -401,7 +423,13 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                                 os.remove(tmp)
                         except OSError:
                             pass
-                        log.exception("订阅补下载后规则索引重建失败")
+                        log.exception("订阅补下载规则写盘失败")
+                    # R2-06: rebuild 在 app._lock 外执行, 走统一的代际跟踪路径。
+                    if _gen_bumped:
+                        try:
+                            app_ctx.rebuild_rule_index_synced()
+                        except Exception:
+                            log.exception("订阅补下载后规则索引重建失败")
                     log.info("订阅冷启动补下载: %s → %d 条", url, len(items))
                 except Exception as e:
                     log.warning("订阅冷启动补下载失败 %s: %s", url, e)
@@ -426,7 +454,16 @@ def run(cfg, config_path=None):
         try:
             # v1.9.139: 用 app_ctx.cfg 而非闭包捕获的启动期 cfg, 与 reload 后状态对齐
             # (cache_file 路径在 reload 时可能变更)
-            _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
+            # R6-4(P3): _save_cache 内部获取 _cache_save_lock, 若 sampler 线程正持锁
+            # 在慢盘/坏道上做 fsync, 致命路径会无限阻塞。用后台线程 + 5s join 超时兜底:
+            # 超时则放弃本次缓存落盘, 直接 os._exit(1) —— 磁盘同时故障时保住进程退出,
+            # 由 systemd Restart=on-failure 重启; 正常磁盘上 fsync 毫秒级完成, 不影响。
+            _t = threading.Thread(
+                target=_save_cache,
+                args=(app_ctx.cfg, config_path, app_ctx.resolver.cache),
+                daemon=True)
+            _t.start()
+            _t.join(timeout=5.0)
         except Exception:
             pass
         os._exit(1)
@@ -503,7 +540,12 @@ def run(cfg, config_path=None):
                     # (cache_persist 开关 / cache_file 路径在热重载时可能变更)
                     n = _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
                     if n:
-                        log.info("缓存持久化 %d 条 → %s", n, cache_file)
+                        # R3 P2-4: 日志路径改读 app_ctx.cfg 最新值 —— _save_cache 已按
+                        # app_ctx.cfg 落盘, 而旧闭包 cache_file 是启动期快照, 经 PUT
+                        # /api/config 修改 cache_file 后 reload, 日志会打印旧路径,
+                        # 干扰运维排查缓存落盘位置。
+                        log.info("缓存持久化 %d 条 → %s", n,
+                                 app_ctx.cfg.get("cache_file") or cache_file)
                 except Exception:
                     pass
             # 用 wait 代替 sleep: 收到停止事件立即唤醒退出, 无需等待满 1s 才检查。
@@ -580,10 +622,25 @@ def run(cfg, config_path=None):
     # 但 _save_cache 已由 _cache_save_lock 互斥, 此处会等待在途写完成再写, 不会并发写同一 tmp。
     # v1.9.143: 用 app_ctx.cfg 而非闭包捕获的启动期 cfg, 与 reload 后状态对齐
     # (cache_persist 开关 / cache_file 路径在热重载时可能变更), 与 _fatal_exit 对齐。
-    try:
-        _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
-    except Exception:
-        pass
+    # P2(R1-09): 退出时 _save_cache 加超时守卫。cache_size=131072 热点多时, serialize+fsync
+    # 在慢盘/网络盘可达数秒; 叠加前面 dns_server.stop(4 线程 join 各 1s)+sampler join(2s),
+    # 总收尾时间在慢盘场景可逼近或超过 systemd TimeoutStopSec=15s → 被 SIGKILL(result=timeout),
+    # 丢失本次内存最新缓存。此处用后台线程+join(timeout=8s) 兜底: 超时则放弃落盘直接退出
+    # (比被 SIGKILL 强——至少进程干净退出, 下次启动从旧 cache.json 冷启动)。
+    _exit_cache_done = threading.Event()
+    def _exit_save_cache():
+        try:
+            _save_cache(app_ctx.cfg, config_path, app_ctx.resolver.cache)
+        except Exception:
+            pass
+        finally:
+            _exit_cache_done.set()
+    _ect = threading.Thread(target=_exit_save_cache, daemon=True, name="exit-cache-save")
+    _ect.start()
+    _ect.join(timeout=8.0)
+    _ect_timed_out = _ect.is_alive()
+    if _ect_timed_out:
+        log.warning("退出缓存落盘超过 8s, 放弃写盘直接退出(慢盘场景, 本次缓存将丢失)")
     # 停止预取/线程池(阻止解释器退出时 join 阻塞)
     try:
         app_ctx.resolver.shutdown()
@@ -601,18 +658,35 @@ def run(cfg, config_path=None):
     # join 这些 worker 直至 socket 超时叠加(负载期可达数秒~十几秒), 导致
     # systemd stop-sigterm 超时 SIGKILL(result=timeout, 非优雅退出)。
     # 此处优雅收尾(持久化缓存/停 server/停池)已完成, 直接终止进程即可。
-    # P3-3: os._exit 是硬终止, 不跑解释器清理。若收尾期间某 worker 正 _save_cache
-    # 写一半(tmp + fsync + rename), 硬终止会留下 cache.json.tmp 残留(下次启动读
-    # 不到正式文件, 缓存丢失)。退出前清理缓存 tmp, 清理失败不影响退出。
+    # P3-3: os._exit 是硬终止, 不跑解释器清理。退出前清理缓存 tmp, 清理失败不影响退出。
     # M7 修复: 原 glob("*.tmp") 范围过宽, 会连带删除 rules_sub.json.tmp /
     # rules_local.json.tmp——后台订阅下载线程可能正在原子写这两个文件(tmp+rename),
-    # 误删会导致订阅/本地规则回滚到旧版甚至丢失。这里只精确清理 cache.json.tmp
-    # (缓存落盘由 _cache_save_lock + 上方显式 _save_cache 串行, 不存在在途写)。
+    # 误删会导致订阅/本地规则回滚到旧版甚至丢失。这里只精确清理 cache.json.tmp。
+    # R2-05: tmp 清理只在 _ect join 成功(未超时)分支执行。超时分支下 _ect 可能刚
+    # open tmp 正在 write/fsync, 此时 unlink 会把 tmp 目录项摘掉、让 _ect 持孤儿 inode
+    # 继续写并随后 os.replace 抛 FileNotFoundError(被吞), 白做一次 serialize+fsync;
+    # 且注释此前"不存在在途写"的安全论证在超时分支不成立。超时分支直接跳过 tmp 清理
+    # (孤儿 inode 随进程退出回收, cache.json 正式文件不受损, 无残留风险)。
+    if not _ect_timed_out:
+        try:
+            _cache_path = _default_cache_file(cfg, config_path)
+            _cache_tmp = _cache_path + ".tmp"
+            if os.path.isfile(_cache_tmp):
+                os.remove(_cache_tmp)
+        except Exception:
+            pass
+    # P1-2(V146): os._exit 不跑解释器清理, logging 缓冲可能未刷出, 最后几行
+    # warning/error 日志会丢失。在硬退前显式 logging.shutdown() 刷盘。
     try:
-        _cache_path = _default_cache_file(cfg, config_path)
-        _cache_tmp = _cache_path + ".tmp"
-        if os.path.isfile(_cache_tmp):
-            os.remove(_cache_tmp)
+        import logging as _logging
+        _logging.shutdown()
+    except Exception:
+        pass
+    # P1-3(V146): first-probe daemon 线程可能正持锁落盘(save_config 的 tmp+fsync+
+    # rename), os._exit 硬杀会残留 config.json.tmp。给 1s 收尾窗口 join。
+    try:
+        from . import probe as _probe_mod
+        _probe_mod.join_first_probe(timeout=1.0)
     except Exception:
         pass
     # S1 修复: /api/restart 在 systemd 托管时把 restart_exit_code 置 3, 使

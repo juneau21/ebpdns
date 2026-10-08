@@ -317,6 +317,10 @@ def check_0x20(query_bytes, response_data):
     位上必然失配。上游若规范化大小写也会失配 → 该响应被丢弃（视为投毒），
     查询会由其他上游/重试兜底。
     返回 True=通过；False=失配（投毒嫌疑）。
+
+    P2-6(V146): 额外校验响应 header 的 qd 计数必须 ==1。正常 DNS 查询/响应
+    都是单 question(qd=1); 若伪造响应把合法 0x20 qname 放第一条、恶意内容
+    放第二条, extract_qname 只取第一条会通过校验。qd!=1 视为结构异常 fail-closed。
     """
     qn = extract_qname(query_bytes)
     rn = extract_qname(response_data)
@@ -327,6 +331,14 @@ def check_0x20(query_bytes, response_data):
     if rn is None:
         # M5: 响应 question 畸形/与查询不一致无法提取——响应侧结构性异常,
         # 视为缓存投毒嫌疑, fail-closed(拒绝该响应), 而非 fail-open 放行。
+        return False
+    # P2-6(V146): 校验响应 qd==1, 防多 question 绕过 0x20 逐位比较。
+    try:
+        if len(response_data) >= 12:
+            _resp_qd = struct.unpack(">H", response_data[4:6])[0]
+            if _resp_qd != 1:
+                return False
+    except Exception:
         return False
     return qn == rn
 
@@ -821,7 +833,8 @@ def _opt_rr_bytes(query_data):
 
 def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
                        owner_name=None, fallback_type=0, _edns=None, _ttl_override=None,
-                       bufsize_cap=None, enc_owner=None):
+                       bufsize_cap=None, enc_owner=None, force_truncated=False,
+                       abody_count=None):
     """UDP 响应公共拼接函数(v1.9.76 P0-1): 快路径与完整路径统一走这里做
     EDNS bufsize 截断 + 逐条丢弃 + 置 TC。
 
@@ -831,6 +844,10 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
     - abody: 快路径缓存的完整 answer bytes(可选)。未超 bufsize 直接复用,
       零重编码; 超 bufsize 才逐条重编码 chunk 累计长度、丢尾部置 TC。
       resp_body 缓存始终是完整 answers, 截断只在拼接时发生, 不改缓存。
+    - abody_count: R5-P1: abody 中实际成功编码的 RR 数(由
+      build_response_body_answers(return_count=True) 返回)。None 时回退到
+      len(answers)——但 encode_rdata 失败被静默跳过的 RR 不在 abody 中,
+      用 len(answers) 会让响应头 an_count 与实际 RR 段长度不一致。
     - _edns: 可选 (bufsize, opt_bytes) 预计算结果。快路径调用方已用
       _question_edns_info 一遍拿到 qbytes+bufsize+opt, 直接传入避免本函数
       再遍历一次 question/additional 段。
@@ -857,9 +874,15 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
     n_in = len(answers or [])
     answers = (answers or [])[:MAX_ANSWERS]
     can_use_abody = abody is not None and n_in <= MAX_ANSWERS
-    # 无截断快速路径: 完整 abody + OPT 直接放下
+    # 无截断快速路径: 完整 abody + OPT 直接放下。
+    # R3-P1-A: force_truncated=True(上游 UDP 截断、TCP 回退失败, 被迫沿用部分
+    # answers 直答)时, 即使报文装得下也强制置 TC=1, 让客户端自行 TCP 重试拿完整答案。
     if can_use_abody and 12 + len(qbytes) + len(abody) + opt_len <= limit:
-        return (build_response_header(raw_query, rcode, len(answers), False, 1 if opt else 0)
+        # R5-P1: an_count 必须与 abody 中实际 RR 数一致。abody_count 由调用方
+        # 预编码时通过 return_count=True 取得; 未提供时回退 len(answers)(与原
+        # 行为一致, 仅在调用方未升级时存在微小偏差)。
+        _an_count = abody_count if abody_count is not None else len(answers)
+        return (build_response_header(raw_query, rcode, _an_count, force_truncated, 1 if opt else 0)
                 + qbytes + abody + (opt or b""))
     # 逐条累计: 超 bufsize 丢尾部并置 TC(让客户端走 TCP 重试)
     # bytearray(); out.extend(qbytes) 替代 bytearray(qbytes): 语义等价(构造出含
@@ -869,7 +892,7 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
     out = bytearray()
     out.extend(qbytes)
     kept = 0
-    truncated = False
+    truncated = bool(force_truncated)
     if enc_owner is None:
         enc_owner = encode_name(owner_name) if owner_name else b"\x00"
     for a in answers:
@@ -877,6 +900,12 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
                                             fallback_type=fallback_type,
                                             _ttl_override=_ttl_override,
                                             enc_owner=enc_owner)
+        # R5-P1: encode_rdata 失败时 build_response_body_answers 返回 b""(不写
+        # 任何字节)。此时不能计入 kept——否则响应头 an_count 声明 N 条 answer,
+        # 实际 RR 段只有 N-k 条, 客户端按 an_count 读 RR 会错位到 authority/
+        # additional 段或拒收整个响应。chunk 为空直接跳过, 不占长度也不计数。
+        if not chunk:
+            continue
         if 12 + len(out) + len(chunk) + opt_len > limit:
             truncated = True
             break
@@ -900,7 +929,7 @@ def build_simple_response(raw_query, rcode):
 
 
 def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_override=None,
-                                enc_owner=None, enc_map=None):
+                                enc_owner=None, enc_map=None, return_count=False):
     """只构造 answer section bytes(不含 question)。
     v1.9.74 P0-2: 快路径缓存的 resp_body 只缓存 answer 段; question 段每次从
     raw_query 原样切片(extract_question), 既保证 0x20 大小写逐位回显, 又避免把
@@ -911,7 +940,10 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
     [dict(a, ttl=...) for a in answers] 整表拷贝 dict(每命中一次的临时对象)。
     R2: enc_owner 由调用方预编码 owner_name bytes 传入; 截断路径逐条
     build_response_body_answers([a]) 时外层编码一次即可复用, 避免每条 RR 重复
-    encode_name(同一 owner_name)。"""
+    encode_name(同一 owner_name)。
+    R5-P1: return_count=True 时返回 (bytes, n_encoded), 让 build_udp_response
+    快路径用实际成功编码的 RR 数填 an_count(原 len(answers) 会把 encode_rdata
+    失败被静默跳过的 RR 也计数, 导致响应头 an_count 与实际 RR 段长度不一致)。"""
     out = bytearray()
     if enc_owner is None:
         enc_owner = encode_name(owner_name) if owner_name else b"\x00"
@@ -922,8 +954,10 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
     # 后续直接复用 bytes。调用方可传 enc_map(跨命中共享的有界 name->wire memo)
     # 进一步把 CNAME 目标名的编码跨命中复用; 不传则用局部 dict(仅调用内去重)。
     _enc_names = enc_map if enc_map is not None else {}
+    _n_encoded = 0
 
     def _append(a, ttl):
+        nonlocal _n_encoded
         rtype = int(a.get("type", fallback_type) or fallback_type)
         rdata = encode_rdata(rtype, a.get("value", a.get("rdata", "")))
         # rdata 编码失败(如非法 A/AAAA)跳过整条 RR, 不产出畸形应答
@@ -942,6 +976,7 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
             out.extend(enc_owner)
         out.extend(_rr_hdr.pack(rtype, CLASS_IN, ttl, len(rdata)))
         out.extend(rdata)
+        _n_encoded += 1
 
     if _ttl_override is None:
         for a in answers:
@@ -950,7 +985,10 @@ def build_response_body_answers(answers, owner_name=None, fallback_type=0, _ttl_
         ttl = _safe_int(_ttl_override, 300)
         for a in answers:
             _append(a, ttl)
-    return bytes(out)
+    _body = bytes(out)
+    if return_count:
+        return _body, _n_encoded
+    return _body
 
 
 def build_response_body(domain, qtype, answers):
@@ -962,13 +1000,15 @@ def build_response_body(domain, qtype, answers):
 
 
 def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None,
-                   _ttl_override=None):
+                   _ttl_override=None, truncated=False):
     """基于请求报文构造响应。answers: [{value, type, ttl, name?}]。
     v1.9.76 P0-1: 统一走 build_udp_response 做 EDNS bufsize 截断 + 逐条丢弃 + 置 TC,
     并回显 OPT(保留 DO 位)。答案数仍限 MAX_ANSWERS。
     bufsize_cap: 客户端侧 bufsize 上限(防放大), 透传 build_udp_response。
     _ttl_override: M2 缓存命中路径透传剩余 TTL, 与 answer_fast 快路径同型,
-    避免为 TTL 衰减对 answers 整表 dict 拷贝(热路径 GC 压力)。None 时用各答案自身 ttl。"""
+    避免为 TTL 衰减对 answers 整表 dict 拷贝(热路径 GC 压力)。None 时用各答案自身 ttl。
+    truncated: R3-P1-A 强制 TC=1。上游 UDP 截断且 TCP 回退失败、被迫沿用部分 answers
+    直答时置位——让客户端自行 TCP 重试拿完整答案, 残缺答案集不缓存、不固化。"""
     if len(query_data) < 12:
         return None
     answers = (answers or [])[:MAX_ANSWERS]
@@ -977,7 +1017,8 @@ def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None
         qbytes = encode_name(domain) + struct.pack(">HH", qtype, CLASS_IN)
     return build_udp_response(query_data, qbytes, answers, rcode,
                               abody=None, owner_name=domain, fallback_type=qtype,
-                              bufsize_cap=bufsize_cap, _ttl_override=_ttl_override)
+                              bufsize_cap=bufsize_cap, _ttl_override=_ttl_override,
+                              force_truncated=truncated)
 
 
 def build_error_response(query_data, rcode=2):

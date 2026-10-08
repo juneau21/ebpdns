@@ -17,6 +17,41 @@ log = logging.getLogger("ebpdns")
 # 实测用固定域名：选择各上游都能稳定应答的真实域名（测 RTT 足够）
 PROBE_DOMAIN = "www.baidu.com"
 
+# P1-3(V146): 模块级引用 first-probe daemon 线程, 供退出路径 join 收尾。
+# daemon 线程在 SIGTERM/os._exit 时被硬杀, 若正持 app_ctx._lock 落盘
+# (save_config 的 tmp+fsync+rename), 会残留 config.json.tmp。
+# R3-P3-B: 改为 list 跟踪所有在途探针线程。原单引用会被重复 start_first_probe
+# (新增上游后再触发)覆盖, 旧线程句柄丢失, join_first_probe 只 join 最新一个——
+# 旧线程若恰在 save_config 中途被 SIGTERM 硬杀仍会残留 .tmp。
+_first_probe_threads = []
+# R4-P2: R3-P3-B 残留竞态——filter 与 append 之间无锁: ":223 读旧表→列表推导
+# 生成新对象→rebind 全局" 与 ":224 在新对象上 append" 不是原子操作, 两个并发
+# start_first_probe(启动路径 + API add_upstream) 会先后 rebind 到同一份推导
+# 新表, 后写者覆盖先写者, 先到的 append(tA) 句柄丢失, join_first_probe 看不到
+# 该线程, SIGTERM 时若它正在 save_config 的 tmp+fsync+rename 中途被硬杀仍残留
+# .tmp。修复: 模块级锁包住 filter+append(原地切片[:]= 而非 rebind, 避免与读端
+# 竞争), join 取快照时同锁。
+_threads_lock = threading.Lock()
+
+
+def join_first_probe(timeout=1.0):
+    """Best-effort join for all in-flight first-probe daemon threads before exit.
+
+    P1-3(V146): 防止 SIGTERM 硬杀正在 save_config 的落盘线程导致 .tmp 残留。
+    R3-P3-B: 逐个 join 所有在途探针线程(重复 start_first_probe 会起多个)。
+    由 cli.py 在 os._exit 前调用; 线程已结束则立即返回。"""
+    # R4-P2: 快照在 _threads_lock 内取, 与 start_first_probe 的 filter+append
+    # 互斥, 保证列表内容是一致版本(不会读到推导新表 rebind 中途)。join 本身放
+    # 在锁外执行, 避免退出慢路径阻塞并发 start_first_probe。
+    with _threads_lock:
+        snapshot = list(_first_probe_threads)
+    for t in snapshot:
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
+
 
 def _safe_int(v, default=0):
     """R3-P3-2: 安全 int() 转换, 畸形配置值(非数值字符串)不抛 ValueError。
@@ -99,7 +134,9 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
             return u, False, 0
 
     try:
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(ups)))) as pool:
+        # P3-6(V146): 加 thread_name_prefix 便于故障排查时识别线程栈。
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(ups))),
+                                thread_name_prefix="probe-latency") as pool:
             for u, ok, lat in pool.map(do, ups):
                 old = _safe_int(u.get("latency"))   # latency 可为 null(未测/待测); R3-P3-2 防畸形值
                 # 仅成功才标记 latency_measured=True; 失败的保持 False, 下次启动
@@ -190,6 +227,19 @@ def start_first_probe(cfg, config_path=None, app_ctx=None):
     """
     if not _needs_probe(cfg):
         return
+    global _first_probe_threads
     t = threading.Thread(target=lambda: probe_enabled_upstreams(cfg, config_path, app_ctx),
                          name="first-probe", daemon=True)
-    t.start()
+    # R5-P3-1: 先在锁内把线程句柄加入 list, 再 t.start()。原实现 t.start() 在
+    # 锁外、append 之前, 微秒级窗口内线程已运行但 join_first_probe 取快照看不到
+    # 该线程。构造 Thread 对象本身不启动 OS 线程, 锁内 append 后再 start, 消除窗口。
+    # R12-P3-3: t.start() 也移入锁内。原实现 filter(x.is_alive()) 对刚 append
+    # 尚未 start 的新线程返回 False——并发 start_first_probe 在线程 A append(tA)
+    # 后、start() 前拿到锁执行 filter, 会把 tA 当死线程滤掉, 句柄丢失(理论上
+    # SIGTERM 恰在 save_config 中途硬杀残留 .tmp)。构造 Thread 不启动 OS 线程,
+    # 锁内 append 后立即 start; 新线程只碰 app_ctx._lock/config, 不碰 _threads_lock,
+    # 无死锁。
+    with _threads_lock:
+        _first_probe_threads[:] = [x for x in _first_probe_threads if x.is_alive()]
+        _first_probe_threads.append(t)
+        t.start()

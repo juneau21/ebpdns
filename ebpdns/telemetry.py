@@ -123,10 +123,9 @@ class Telemetry:
         return self._qtype_cat_map.get(qtype, "other")
 
     # ---- 上游统计 ----
-    def upstream_stat(self, up_id):
-        with self._lock:
-            return self.per_upstream.setdefault(up_id, {"ok": 0, "fail": 0, "lat_sum": 0, "last": 0})
-
+    # R12 P3-3: 删除 upstream_stat() —— 全库无真实调用方(grep 仅命中本方法定义与一行历史注释),
+    # 且它持锁返回 per_upstream 的活 dict 引用, 未来若有调用方在锁外读写会复刻 R22 P3-1 的
+    # "锁外读 live dict / 相邻自增时刻不一致"问题。读侧统一走 upstream_eff_lat_read()(锁内 dict 拷贝)。
     def upstream_eff_lat_read(self, up_id):
         """加锁读取单上游统计快照(只读, 不 setdefault), 供 resolver 延迟排序用。
         避免锁外 .get() 读到并发 upstream_ok/upstream_fail 的半更新状态。"""
@@ -240,6 +239,27 @@ class Telemetry:
         changed size during iteration (Prometheus /metrics 抓取 500)。"""
         with self._lock:
             return list(self.per_upstream.items())
+
+    def upstreams_snapshot_copy(self):
+        """P3(R1-11): per_upstream 的全量深拷贝。upstreams_snapshot() 返回的
+        (uid, st) 中 st 是 live dict 引用, /metrics 在锁外读 st.get("ok")/fail/
+        lat_sum 时, 虽 CPython 单字段 store 原子不致撕裂, 但 ok 与 fail 可能来自
+        相邻两次 upstream_ok/fail 之间的不同时刻, avg 计算有微小误差。本方法在
+        锁内拷贝每个 st dict, 返回独立副本, 调用方可安全锁外读取。"""
+        with self._lock:
+            return {uid: dict(st) for uid, st in self.per_upstream.items()}
+
+    def conn_stats_snapshot(self):
+        """P3(R1-05): conn_stats 的加锁全量拷贝。供 /metrics 导出连接级指标。
+        返回 {key: {ok, fail, lat_sum, last}} 的独立副本。"""
+        with self._lock:
+            return {k: dict(st) for k, st in self.conn_stats.items()}
+
+    def qtype_dist_snapshot(self):
+        """v1.9.146 P2-1: qtype_dist(A/AAAA/other) 的加锁拷贝。Prometheus /metrics
+        导出查询类型分布前在锁外 dict(self.qtype_dist) 会与 count_qtype 的自增竞态。"""
+        with self._lock:
+            return dict(self.qtype_dist)
 
     def top_domains_snapshot(self, n=10):
         """top_domains.most_common(n) 的加锁拷贝。Counter 整体替换 / 新域名自增

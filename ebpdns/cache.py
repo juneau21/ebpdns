@@ -7,7 +7,10 @@
 
 import threading
 import time
+import logging
 from collections import OrderedDict
+
+log = logging.getLogger("ebpdns")
 
 
 def _safe_int(v, default=0):
@@ -241,13 +244,23 @@ class LRUCache:
         # R7/P2-4: 原裸 float(persist_ttl or 0) + try/except 兜底成 pt=0——冗余吞错。
         # 改用本地 _safe_float(None/畸形串→0.0), 再 max(0,...) 钳负值。
         pt = max(0, _safe_float(persist_ttl, 0.0))
+        # P2-4(V146): 入口上限截断。cache.json 被手改/损坏成百万条时, 原实现先
+        # 一次性构建百万条 OrderedDict 再淘汰到容量, 造成启动内存尖峰与阻塞。
+        # 上限取 max(capacity*4, 65536): 正常持久化缓存不会超过此值(容量×少量
+        # 余量), 超过则视为损坏, 截断到上限并打 warning。
+        _raw_entries = list(entries or [])
+        _restore_cap = max(self._cap * 4, 65536)
+        if len(_raw_entries) > _restore_cap:
+            log.warning("cache.restore: %d 条恢复记录超过上限 %d, 截断(缓存文件可能损坏)",
+                        len(_raw_entries), _restore_cap)
+            _raw_entries = _raw_entries[:_restore_cap]
         # C-01: 先在锁外为每个 shard 构建全新 OrderedDict, 再逐 shard 原子替换引用。
         # 旧实现先逐 shard clear(每清完一个 shard 就释放锁), 另一个线程可能在
         # shard0 已清而 shard1..N 未清时命中 shard0 的 get() → 对调用方表现为
         # "缓存丢失"。改为: 新 maps 在锁外构造完毕后, 逐 shard 持锁替换引用,
         # 读线程要么看到完整旧 map, 要么看到完整新 map, 不存在"半清"中间态。
         new_maps = [OrderedDict() for _ in range(self._SHARDS)]
-        for e in entries or []:
+        for e in _raw_entries:
             try:
                 k = tuple(e.get("key") or [])
                 # 兼容 PartitionedCache 序列化出的 3 元组 [group, domain, qtype]:
@@ -479,13 +492,21 @@ class PartitionedCache:
         for e in entries or []:
             k = e.get("key") or []
             if len(k) == 3:
-                g = k[0] if k[0] in self._caches else "default"
+                g = k[0]
                 kk = (k[1], k[2])
             elif len(k) == 2:
                 g = "default"
                 kk = tuple(k)
             else:
                 continue
+            # R12-P3-2: 与运行期 _split(:389-398) 回退策略对齐——已删除分组回退到
+            # 第一个可用分区, 而非硬编码 "default"。原逻辑 g 为已删自定义组且新配置
+            # 分区不含 "default" 时, g="default" 仍不在 self._caches, :508
+            # self._caches[g] 抛 KeyError 被 :509 except 吞掉, 该组条目恢复时静默丢弃。
+            if g not in self._caches:
+                g = next(iter(self._caches), None)
+                if g is None:
+                    continue
             try:
                 groups.setdefault(g, []).append({**e, "key": list(kk)})
             except Exception:
@@ -600,6 +621,12 @@ class TinyLFUCache:
         self._sketch = _CMSketch()
         self._lock = threading.Lock()
         self._puts = 0
+        # R6-N3(P3): miss 计数, 与 put 的 32 次对齐。原 R5-P3-3 每次三段未命中都
+        # 在持锁态做 ≤12 次 dict 弹出, 冷启动/随机域名洪泛下每次 miss 都触发, 增大
+        # 锁持有时间。改为每 32 次 miss 才扫一次队首过期条目, 回收节奏与 put purge
+        # 对齐, 高 miss 率(缓存击穿)场景锁竞争显著下降, 过期条目回收延迟最多 32 次
+        # miss(有界, 仍远优于无 sweep)。
+        self._misses = 0
         self._stale_window = 0   # v1.9.74 P1-2: >0 保留过期窗口内条目(serve-stale)
         self._repartition_locked()
 
@@ -690,6 +717,22 @@ class TinyLFUCache:
                 self._protected.move_to_end(key)
                 self._sketch.inc(key)
                 return e
+            # R5-P3-3: 三段均未命中时, 顺手从各段队首(LRU)弹出过期条目。原实现
+            # 只在 put() 每 32 次触发 _purge_expired_locked, 低写入域名的过期条目
+            # 在非命中段永久驻留直到 LRU 淘汰或定期 purge。队首扫描最多弹 4 条/段,
+            # 有界开销(12 次 dict 操作), 回收已沉到队首的死条目, 不扫描全表。
+            # R6-N3(P3): 每 32 次 miss 才扫一次(与 put 的 &0x1F 对齐), 避免高 miss
+            # 率下每次未命中都持锁做 dict 弹出。
+            self._misses += 1
+            if self._stale_window <= 0 and (self._misses & 0x1F) == 0:
+                for store in (self._window, self._probation, self._protected):
+                    for _ in range(4):
+                        if not store:
+                            break
+                        _k, _e = next(iter(store.items()))
+                        if _e.get("expires_at", 0) > now:
+                            break
+                        store.pop(_k, None)
             return None
 
     def put(self, key, value, now=None):
@@ -845,6 +888,13 @@ class TinyLFUCache:
         # R7/P2-4: 原裸 float(persist_ttl or 0) + try/except 兜底成 pt=0——冗余吞错。
         # 改用本地 _safe_float(None/畸形串→0.0), 再 max(0,...) 钳负值。
         pt = max(0, _safe_float(persist_ttl, 0.0))
+        # P2-4(V146): 入口上限截断, 与 LRUCache.restore 对齐。
+        _raw_entries = list(entries or [])
+        _restore_cap = max(self._cap * 4, 65536)
+        if len(_raw_entries) > _restore_cap:
+            log.warning("TinyLFU.restore: %d 条恢复记录超过上限 %d, 截断(缓存文件可能损坏)",
+                        len(_raw_entries), _restore_cap)
+            _raw_entries = _raw_entries[:_restore_cap]
         with self._lock:
             self._window.clear()
             self._probation.clear()
@@ -853,7 +903,14 @@ class TinyLFUCache:
             # 会影响新恢复条目的准入决策(已淘汰域名的频率仍偏高, 挤掉真实高频条目)。
             # 与 clear() 方法保持一致, 重新初始化空 sketch。
             self._sketch = _CMSketch()
-            for e in entries or []:
+            # P2-5(V146): 先收集所有有效条目及其剩余 TTL, 按剩余 TTL 降序排列后
+            # 直接灌入 protected 段(高频区)。原实现全部进 window 区(仅 1% 容量),
+            # _evict_locked 首轮就把绝大多数恢复条目从 window 淘汰, 导致重启后
+            # 缓存几乎等于冷启动。按剩余 TTL 排序灌入 protected 后, _evict_locked
+            # 会把超出 prot_cap 的最短 TTL 条目挤到 probation/window, 保留最有价值
+            # (剩余有效期最长)的条目在保护区, 命中率不再骤降。
+            _valid = []
+            for e in _raw_entries:
                 try:
                     k = tuple(e.get("key") or [])
                     # S1(第六份review): TinyLFU 是顶层缓存, 不经 PartitionedCache._split,
@@ -868,14 +925,23 @@ class TinyLFUCache:
                     if pt > 0:
                         e["expires_at"] = now + pt
                         e["ttl"] = pt
+                        _remaining = pt
                     elif "remaining" in e:
                         if e["remaining"] <= 0:
                             continue
-                        e["expires_at"] = now + _safe_float(e.get("remaining", 0.0), 0.0)
-                    elif e.get("expires_at", 0) <= now:
-                        continue
+                        _remaining = _safe_float(e.get("remaining", 0.0), 0.0)
+                        e["expires_at"] = now + _remaining
+                    else:
+                        if e.get("expires_at", 0) <= now:
+                            continue
+                        _remaining = e.get("expires_at", 0) - now
                     e.pop("resp_body", None)
-                    self._window[k] = e
+                    _valid.append((k, e, _remaining))
                 except Exception:
                     continue
+            # 按剩余 TTL 降序: 剩余有效期最长的排后面(MRU 端), _evict_locked 淘汰
+            # 队首(LRU, 最短 TTL)时先丢最不耐用的条目。
+            _valid.sort(key=lambda x: x[2])
+            for k, e, _rem in _valid:
+                self._protected[k] = e
             self._evict_locked()

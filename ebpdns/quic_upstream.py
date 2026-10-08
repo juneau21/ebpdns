@@ -112,6 +112,18 @@ if _HAVE_AIOQUIC:
                     if isinstance(he, HeadersReceived):
                         for k, v in he.headers:
                             if k == b":status":
+                                # R12 P3-10: HTTP/3 响应必须仅含一份 :status 伪头。
+                                # 首次见到后若再次出现 :status(对端协议异常/中间盒
+                                # 注入), 原实现 last-wins 静默覆盖, 容忍了 RFC 禁止
+                                # 行为。改为 fail-safe: 已见过 :status 再遇重复即标记
+                                # truncated=True 并 set done, 由 _doh3_exchange 的
+                                # truncated 判失败路径拒绝(走备用上游), 比静默覆盖
+                                # 更严格可观测。
+                                if st.get("status_seen"):
+                                    st["truncated"] = True
+                                    st["done"].set()
+                                    continue
+                                st["status_seen"] = True
                                 # R38 P3-2: 畸形/非数字 :status 头(中间设备篡改/对端
                                 # 协议错位)会让 int(v) 抛 ValueError, 被外层 except
                                 # Exception 以 debug 吞掉, 但 st["done"] 未置位 →
@@ -184,9 +196,15 @@ if _HAVE_AIOQUIC:
                     if len(st["buf"]) < _MAX_MSG + 2:
                         room = _MAX_MSG + 2 - len(st["buf"])
                         st["buf"].extend(event.data[:room])
-                    if event.end_stream:
-                        if st["n"] < 0 and len(st["buf"]) >= 2:
-                            st["n"] = struct.unpack(">H", bytes(st["buf"][:2]))[0]
+                    # R3-NET-P3-1: 不依赖 end_stream 才解析 2 字节长度前缀。
+                    # 违规服务端推完数据但不发 end_stream 时, 原实现 n 保持 -1,
+                    # 查询挂到外层超时。改为: buf 满 2 字节即解析 n, 收齐 2+n
+                    # 字节即 set done(按声明长度收齐即就绪); end_stream 仍兜底。
+                    if st["n"] < 0 and len(st["buf"]) >= 2:
+                        st["n"] = struct.unpack(">H", bytes(st["buf"][:2]))[0]
+                    if st["n"] >= 0 and len(st["buf"]) >= 2 + st["n"]:
+                        st["done"].set()
+                    elif event.end_stream:
                         st["done"].set()
                     elif len(st["buf"]) >= _MAX_MSG + 2:
                         st["done"].set()
@@ -223,6 +241,16 @@ class _QuicUpstream:
         self._ever_connected = False  # v1.9.76: 是否曾成功建连(首次连接失败也参与退避递增)
         self.reconnects = 0      # 累计重连次数(诊断用)
         self.fail_seq = 0        # 连续查询失败计数(连接级)
+        # R1 P2-3: doq_strict_cert/doh3_strict_cert kill switch, 与 doh_strict_cert/
+        # dot_strict_cert 对等。默认 True(严格): 证书必须含匹配的 DNS/IP SAN。仅显式
+        # 配置 false 才允许关闭主机名/SAN 校验(仍保留证书链校验)。is not False 语义
+        # 与 DoH/DoT 一致(null/缺失/0/"" 均保持严格)。
+        self._strict_cert = up.get(
+            "doq_strict_cert" if self.proto == "doq" else "doh3_strict_cert") is not False
+        self._strict_warned = False  # 降级 warning 仅打印一次, 避免重连循环刷屏
+        # R1 P3-3: 跟踪在途查询 fut, close() 时逐个 cancel, 使上游删除瞬间飞行中的
+        # 查询以 CancelledError 干净收尾(而非依赖 loop.close() 兜底)。
+        self._inflight_futs = set()
     # ---- 线程与 loop ----
     def _ensure_started(self):
         if self._started:
@@ -231,6 +259,16 @@ class _QuicUpstream:
             if self._started:
                 return
             self._loop = asyncio.new_event_loop()
+            # R12 P3-5: 显式标注跨版本依赖 —— asyncio.Event 在调用方线程构造,
+            # 却由 loop 线程 set()/clear()/wait()。此用法成立的前提是 Python 3.10+
+            # 的惰性绑环语义(Event 构造不绑 loop, 首次 await 时绑定到运行中的 loop)。
+            # 本项目运行环境已要求 Python >= 3.10(审查基线 Python 3.12); 若未来部署
+            # 到 3.8/3.9(Event 构造时即绑 loop), wait() 会在错误 loop 注册 waiter
+            # 导致 set() 无法唤醒。is_set() 为 GIL 保护的 bool 读, 跨线程安全。
+            # 评估过"把 Event 创建移入 loop 线程(_maintain 首个 await 前)"的方案:
+            # 会在 _ensure_started 返回与 loop 线程建 Event 之间留下 _conn_ready=None
+            # 窗口, stats()(:757)与 _exchange 的 await 都要额外判空, 改动面与回归
+            # 风险大于收益, 故采用文档化 + 部署要求标注的最小改动。
             self._conn_ready = asyncio.Event()
             self._thread = threading.Thread(
                 target=self._run_loop, name="quic-%s-%s" % (self.proto, self.host), daemon=True)
@@ -311,6 +349,30 @@ class _QuicUpstream:
                 # 启用默认证书校验(不覆盖 verify_mode); server_name 由下方设置
                 if self.host:
                     conf.server_name = self.host
+                # R1 P2-3: doq_strict_cert/doh3_strict_cert kill switch。仅当用户显式
+                # 配置 strict_cert=false 且上游为 IP 字面量(自托管仅含 DNS SAN 证书)时,
+                # 关闭 aioquic 的主机名/SAN 校验(conf.check_hostname=False), 仍保留
+                # verify_mode=CERT_REQUIRED 校验证书链。hostname 上游不受影响, 始终严格
+                # 主机名/SAN 校验(与 DoH/DoT _doh_tls_wrap 的 `if _is_hostname(host): raise`
+                # 同安全不变量)。无此开关时, IP 字面量 + 仅 DNS SAN 证书会被 aioquic 直接
+                # 握手拒绝且永无兜底重建。
+                if not self._strict_cert:
+                    try:
+                        from .upstream import _is_hostname as _quic_is_hostname
+                    except Exception:
+                        _quic_is_hostname = None
+                    if _quic_is_hostname is not None and not _quic_is_hostname(self.host):
+                        try:
+                            conf.check_hostname = False
+                        except Exception:
+                            pass
+                        if not self._strict_warned:
+                            self._strict_warned = True
+                            log.warning(
+                                "QUIC %s/%s strict_cert=false 且上游为 IP 字面量, 已关闭"
+                                "证书主机名/SAN 校验(证书链仍校验)。建议改用 hostname 上游"
+                                "或为服务器配置含 IP SAN 的证书。",
+                                self.proto, self.host)
                 # 复用 bootstrap 预解析的 IP 直连(与 DoH/DoT 同源), 彻底摆脱
                 # 系统 getaddrinfo 依赖; conf.server_name 仍为原始 hostname,
                 # SNI 与证书名校验不受影响。
@@ -325,10 +387,23 @@ class _QuicUpstream:
                 # bootstrap 缓存 IP 直连不受影响。
                 connect_host = self.host
                 try:
-                    from .upstream import _bootstrap_ip
+                    from .upstream import (_bootstrap_ip, _resolve_host_once,
+                                           _is_hostname)
                     bip = _bootstrap_ip(self.host)
                     if bip and bip != self.host:
                         connect_host = bip
+                    elif _is_hostname(self.host):
+                        # R12 P3-12: bootstrap 冷 miss(hostname 且无缓存 IP)时, 原实现
+                        # 把 hostname 直接交给 aioquic connect(), 其内部 getaddrinfo
+                        # 在 loop 线程执行且无硬截断(可阻塞 ~10-20s)。改为先用统一线程
+                        # 池硬截断(_resolve_host_once 内部走 _DNS_RESOLVE_POOL +
+                        # fut.result(timeout))解析一次 IP, 再作为 connect_host。
+                        # 用 run_in_executor 把阻塞解析移出 loop 线程, 不阻塞在途查询
+                        # 协程。解析失败/超时(3s)则回退 hostname 直连(原行为)。
+                        ip = await self._loop.run_in_executor(
+                            None, _resolve_host_once, self.host, 3.0)
+                        if ip:
+                            connect_host = ip
                 except Exception:
                     pass
                 # v1.9.145 P2: 捕获 protocol 实例以便在 except 中读取
@@ -434,22 +509,38 @@ class _QuicUpstream:
                 # 执行会阻塞已排队查询。放到独立 daemon 线程异步回收, 不阻塞事件循环。
                 threading.Thread(target=gc.collect, daemon=True).start()
     def _request_reconnect(self):
-        """连接级失败触发: 置位重建标志并关闭 transport, 让 _maintain 检测并重建。"""
+        """连接级失败触发: 置位重建标志并关闭 transport, 让 _maintain 检测并重建。
+        P1-1: tr.close() 改为通过 loop.call_soon_threadsafe 调度, 从配置/API 线程
+        直接调用 aioquic UDP transport.close() 存在复合状态竞态(write buffer/backlog),
+        GIL 不保护 transport 对象的复合状态。投递到 loop 线程后由 loop 串行执行 close,
+        与 loop 自身的 transport 操作无竞争。"""
         with self._lock:
             self._reconnect_flag = True
             proto = self._protocol
             if proto is not None:
-                try:
-                    tr = getattr(proto, "_transport", None)
-                    if tr is not None and not tr.is_closing():
-                        tr.close()
-                except Exception:
-                    pass
+                tr = getattr(proto, "_transport", None)
+                loop = self._loop
+                if tr is not None and loop is not None:
+                    try:
+                        if not tr.is_closing():
+                            loop.call_soon_threadsafe(tr.close)
+                    except Exception:
+                        pass
 
     def close(self):
         """优雅关闭: 置位退出标志并唤醒维护循环, 释放线程/事件循环/连接对象。
         供上游删除时回收常驻 QUIC 管理器(防 _pool 残留连接与线程)。"""
         self._closing = True
+        # R1 P3-3: 先取消所有在途查询 fut, 使阻塞在 fut.result() 的调用方立即以
+        # CancelledError 干净返回(由 query() 的 except Exception 兜成失败), 而非
+        # 等到 fut.result 超时或依赖 loop.close() 兜底取消。run_coroutine_threadsafe
+        # 返回的是 concurrent.futures.Future, 其 CancelledError 继承自 Exception,
+        # 会被 query() 的通用 except 捕获, 不会向外抛脏异常。
+        for _fut in list(self._inflight_futs):
+            try:
+                _fut.cancel()
+            except Exception:
+                pass
         self._request_reconnect()
         # P2-2: _closing/_reconnect_flag/_protocol 跨线程读写。GIL 下单次赋值原子,
         # 但 loop 线程可能正阻塞在 asyncio.sleep(0.3)/backoff 中, 看不到新置的 _closing。
@@ -466,10 +557,13 @@ class _QuicUpstream:
         # v1.9.84-r2 QUIC-08: 短暂等待维护线程退出(通常在 0.3s 轮询窗口内检测到
         # _closing 即退出); 若正处于 backoff 睡眠(最长 60s)则 join 超时返回,
         # 线程随后自行退出。缩短删除后新旧 _QuicUpstream 并存的窗口。
+        # P2-3: backoff 已拆分为 1s 片(line 430-431), 但刚进入长 backoff(>=16s)
+        # 时仍可能需 ~1s 才检测到 _closing; 2s join 偶尔超时导致 loop/socket fd
+        # 残留。放宽到 5s 覆盖最坏 1s 片 + loop wakeup 延迟, 仍远小于 60s backoff。
         t = self._thread
         if t is not None and t.is_alive():
             try:
-                t.join(timeout=2.0)
+                t.join(timeout=5.0)
             except Exception:
                 pass
         # 线程为 daemon, 维护循环检测到 _closing 后自行退出并关闭 loop
@@ -484,9 +578,31 @@ class _QuicUpstream:
             return False, None, timeout_ms, "aioquic 未安装 (pip install aioquic)"
         self._ensure_started()
         t0 = time.monotonic()
+        # R12 P3-8: 与上方 _closing 检查之间存在微秒级窗口——close() 可能已把
+        # loop 关闭(_run_loop finally 中 loop.close()), 此时 run_coroutine_threadsafe
+        # 会抛 "Event loop is closed" RuntimeError。原实现该异常未在本函数兜成语义化
+        # 失败, 穿透到调用方拿到一串运行时错误文案。此处捕获并返回与 _closing 同型
+        # 的 "upstream closed" 失败(发生在 fut 登记前, 无 fut/fd 残留)。
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 self._exchange(query_bytes, timeout_ms / 1000.0), self._loop)
+        except RuntimeError:
+            return False, None, 0, "upstream closed"
+        # R1 P3-3: 登记在途 fut, close() 时可逐个 cancel; 结束后无论成败都摘除。
+        self._inflight_futs.add(fut)
+        # R2-NET-P3-1: close() 在本函数上方 _closing 检查之后、本 add 之前并发执行
+        # 时, 其 list(self._inflight_futs) 快照(line 498)可能未覆盖此新 fut, 导致
+        # 该 fut 漏登记取消。add 后复核一次 _closing: 若已关闭则自行 cancel, 闭合这
+        # 个微秒级窗口(原最坏靠 fut.result(timeout+0.5) 超时兜底)。close() 在 add 之
+        # 后才快照时本 fut 已在集合内会被其 cancel, 此处再 cancel 为幂等 no-op。
+        if self._closing:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            self._inflight_futs.discard(fut)
+            return False, None, 0, "upstream closed"
+        try:
             ok, data = fut.result(timeout_ms / 1000.0 + 0.5)
             lat = int((time.monotonic() - t0) * 1000)
             return ok, data, lat, (None if ok else "query failed")
@@ -500,6 +616,8 @@ class _QuicUpstream:
             return False, None, int((time.monotonic() - t0) * 1000), "timeout"
         except Exception as e:
             return False, None, int((time.monotonic() - t0) * 1000), str(e)
+        finally:
+            self._inflight_futs.discard(fut)
     async def _exchange(self, query, timeout):
         """单次查询。返回 (ok, data)。
         连接级失败(未就绪/已关闭)才触发重建; 业务失败(超时/非200)不关连接,
@@ -561,6 +679,16 @@ class _QuicUpstream:
             try:
                 await asyncio.wait_for(st["done"].wait(), timeout)
             except (asyncio.TimeoutError, _cf.TimeoutError):
+                # R12 P3-4: 查询超时放弃本流时, 按 RFC 9250 向对端发 RESET_STREAM
+                # (error_code 0x01 = 通用/内部错误), 通知对端释放该流状态。原实现仅
+                # 靠 send 侧 end_stream=True 半关闭 + 60s idle_timeout 回收, 对端在
+                # 我方放弃后可能继续组包并缓存流状态, 残留协议卫生成本。reset_stream
+                # 失败(连接已在关闭中)忽略, 由 finally pop 收尾。
+                try:
+                    proto._quic.reset_stream(sid, 0x01)
+                    proto.transmit()
+                except Exception:
+                    pass
                 return False, None
             if st["n"] <= 0 or st["n"] > _MAX_MSG:
                 return False, None
@@ -570,7 +698,21 @@ class _QuicUpstream:
                 log.warning("DoQ stream %d 收到多余字节(声明 %d, 实际 %d), 截断",
                             sid, st["n"], len(st["buf"]) - 2)
             # v1.9.84 QUIC-07: 直接从 bytearray slice 一次拷贝返回
-            return True, bytes(st["buf"][2:2 + st["n"]])
+            resp = bytes(st["buf"][2:2 + st["n"]])
+            # R3-NET-P2-1: 与 DoT(upstream.py:1555)/DoH(:1158/:1242)对称,
+            # 补齐 12 字节 DNS 报文头下限。原仅判 n<=0(拒绝空帧), 不拒绝
+            # n=1..11 的畸形短帧; 补后 qid 校验(:647)的 len>=2 短路恒为真。
+            if len(resp) < 12:
+                return False, None
+            # P1-4: 与 DoT/UDP/TCP 路径对称, 校验响应 DNS qid 与查询一致。
+            # QUIC stream 隔离虽提供传输层请求/响应绑定, 但行为异常的服务器
+            # 可能在同一 stream 上返回不属于本查询的数据; 补 qid 比对作为
+            # defense-in-depth(与 DoT line 1461 同型)。
+            if len(resp) >= 2 and resp[:2] != query[:2]:
+                log.warning("DoQ stream %d 响应 qid 不匹配(期望 %r, 实际 %r), 拒绝",
+                            sid, query[:2], resp[:2])
+                return False, None
+            return True, resp
         finally:
             proto._doq.pop(sid, None)
     async def _doh3_exchange(self, proto, query, timeout):
@@ -606,7 +748,10 @@ class _QuicUpstream:
                 await asyncio.wait_for(st["done"].wait(), timeout)
             except (asyncio.TimeoutError, _cf.TimeoutError):
                 return False, None
-            if st["status"] != 200 or not st["body"] or st.get("truncated"):
+            # R3-NET-P2-1: 与明文 DoH(:1158/:1242)/DoQ 对称, 补 12 字节 DNS
+            # 报文头下限。原 `not st["body"]` 仅拒空 body, 不拒 1~11 字节畸形短 body;
+            # 补后 qid 校验(:705)的 len>=2 短路恒为真。
+            if st["status"] != 200 or not st["body"] or len(st["body"]) < 12 or st.get("truncated"):
                 return False, None
             # P2-21: 校验 Content-Type 必须为 application/dns-message(RFC 8484/9250),
             # 与明文 DoH 路径(upstream.py)对齐。若头存在但类型不符, 按失败处理。
@@ -620,7 +765,15 @@ class _QuicUpstream:
             if "application/dns-message" not in ctype.lower():
                 log.debug("DoH3 unexpected Content-Type: %r", ctype)
                 return False, None
-            return True, bytes(st["body"])
+            # P1-4: 与 DoQ/DoT 对称, 校验响应 DNS qid。HTTP/3 层虽提供请求/响应
+            # 配对, 但对端在本 stream body 中返回不属于本查询的 DNS 报文时, qid
+            # 不匹配可立即识别(defense-in-depth)。
+            body = bytes(st["body"])
+            if len(body) >= 2 and body[:2] != query[:2]:
+                log.warning("DoH3 stream %d 响应 qid 不匹配(期望 %r, 实际 %r), 拒绝",
+                            sid, query[:2], body[:2])
+                return False, None
+            return True, body
         finally:
             # 查询结束即清理该 stream 状态, 防止长期运行 _streams 无限增长(内存泄漏)
             try:

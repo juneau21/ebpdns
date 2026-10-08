@@ -4,7 +4,9 @@ import copy
 import ipaddress
 import json
 import logging
+import math
 import os
+import re
 import sys
 import time
 
@@ -171,8 +173,18 @@ def save_local_rules(rules, config_path=None):
             # 的规则。save 非热路径, fsync 一次耗时可忽略, 不影响 QPS。
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        # R6 P4-1: 与 save_config 原子路径一致, 此处目录项持久化属已知权衡(见
-        # save_config 内注释); 该文件为本地规则副本, 可由 config 重建, 不强制目录 fsync。
+        # R6-2(P3): 与 save_config/_save_subs/_save_cache 同型, rename 后对父目录
+        # fsync 确保目录项本身落盘。迁移后 cfg["rules"]=[] , rules_local.json 是逐条
+        # 规则的唯一持久化副本, 不再有"从 config 重建"的退路 —— 目录项丢失即规则全丢。
+        try:
+            _dd = os.open(os.path.dirname(os.path.abspath(path)) or ".",
+                          os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(_dd)
+            finally:
+                os.close(_dd)
+        except OSError:
+            pass
         return True
     except Exception as e:
         # R37 P3-1: 原子写失败(如 os.replace 跨设备/只读/磁盘满)时清理残留 .tmp,
@@ -281,7 +293,14 @@ def parse_upstream_addr(raw, proto_sel=None):
             elif _after.startswith(":") and _after[1:].isdigit():
                 port = int(_after[1:])
                 host = host[:_rb + 1]
-            # 其余([v6] 后非法后缀)保持原样, 交由下方畸形拦截
+            elif _after.startswith(":"):
+                # P3(R1-03): [v6] 后有冒号但后缀非纯数字(如 [::1]:53a / [::1]:abc),
+                # 此前保持原样交由下方畸形拦截, 但 count(":")>=3 穿透 count==1 检查,
+                # 落库为死上游(运行时 getaddrinfo 才失败)。此处直接拒绝。
+                return None
+            else:
+                # P3(R1-03): [v6] 后有非空非法后缀(如 [::1]abc), 同样拒绝。
+                return None
     elif host.count(":") <= 1:
         colon = host.rfind(":")
         if colon > 0 and host[colon + 1:].isdigit():
@@ -352,13 +371,15 @@ _NUM_RANGES = {
     # P3-9: 删除从未使用的顶层 "port" 键(顶层配置无 port, port 仅嵌套在上游/api 内,
     # 由 parse_upstream_addr 与 _validate_upstream_dict 分别校验)。
     # v1.9.90: 周期类字段加一周上限(604800=7*86400), 防止手编超大值让健康检查/
-    # 测速/规则订阅形同关闭(永远不再触发)。health_check_interval/rule_sub_interval 单位
-    # 为秒, speed_interval_ms 为毫秒(604800ms≈10min, 测速间隔过长即失去择优意义)。
+    # 测速/规则订阅形同关闭(永远不再触发)。注意单位: health_check_interval/rule_sub_interval/
+    # stale_ttl 为秒(604800s=7天); speed_interval_ms 为**毫秒**(604800ms≈10min, 同一域名
+    # 两次候选 IP 测速的节流间隔, 过长即失去择优意义)——两者上限数值相同但单位不同,
+    # 文档/前端帮助文字不得混为"7 天"。
     "health_check_interval": (0, 604800),
     "max_parallel_upstreams": (1, 16),
     "stale_ttl": (0, 8_640_000),   # 上限 100 天(与前端 UI max / api 校验同口径)
     "persist_ttl": (0, 31_536_000),
-    "speed_interval_ms": (0, 604800),
+    "speed_interval_ms": (0, 604800),   # 毫秒(见上方单位说明), 默认 2000ms≈2s
     "speed_timeout_ms": (1, 60000),
     # 客户端侧 EDNS bufsize 上限: 最小 512(经典 DNS), 最大 65535
     "edns_client_max_size": (512, 65535),
@@ -384,10 +405,14 @@ _ENUM_VALUES = {
 # 合法值对齐 BPF map 类型命名: LRU_HASH(默认)/LRU/LPM_TRIE。
 _MAP_TYPES = frozenset(("LRU_HASH", "LRU", "LPM_TRIE"))
 # 布尔字段
+# v1.9.146 P1-1: percpu 此前不在此表 —— 加载期不校验类型, PUT /api/config 写入路径
+# (_validate_cfg_update 遍历本表归一)也跳过它, 可写入字符串/数组, 运行态
+# `if cfg["percpu"]` 真值语义漂移。纳入后加载期非 bool 回退默认, API 路径 _as_bool 归一。
 _BOOL_KEYS = {
     "prefetch", "serve_stale", "kernel_direct", "speed_test", "fallback",
     "ipv4_first", "ipv6", "edns", "padding", "rebind_protection",
     "ip_speed_check", "dnssec_0x20", "prefer_ipv4", "cache_persist",
+    "percpu",
 }
 
 
@@ -405,11 +430,19 @@ _RULE_SUB_ACTIONS = ("allow", "block", "group", "forceIp")
 # 协议集合对齐(udp/tcp/doh/dot/doh3/doq); 不在此集合的上游配置期跳过, 不进 resolver。
 _UPSTREAM_PROTOCOLS = frozenset(("udp", "tcp", "doh", "dot", "doh3", "doq"))
 
+# R5-1(P2): upstream id 字符集白名单, 与 api.py 写入端(PUT /api/config)同源同一份。
+# 必须可安全用作 telemetry 键 / /metrics 标签值 / REST 路径段, 拒绝空格/@/换行/
+# 控制字符。此前仅写入端校验, 加载端只查"非空字符串"——手编 config.json 含非标 id
+# (如 "my upstre@m")后加载放行, 但 Web 控制台任何保存都会把整组 upstreams 回传并被
+# 写入端 400 拒绝, 自锁到必须手改 config.json。两端口径对齐后, 坏 id 加载期即跳过。
+_UPSTREAM_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
 
 def _validate_upstream_item(item):
     """轻量校验单个 upstreams[] 项(加载期/热重载)。
     检查: 必须是 dict; proto 在 _UPSTREAM_PROTOCOLS 内; port 为 int(非 bool)且
-    1..65535; addr/id 为非空字符串。返回 True=通过, False=非法(调用方跳过)。
+    1..65535; addr/id 为非空字符串且 id 字符集通过 _UPSTREAM_ID_RE(与写入端同源)。
+    返回 True=通过, False=非法(调用方跳过)。
     不抛异常, 不中断启动。与 _validate_rule_subscription_item 同型。"""
     if not isinstance(item, dict):
         return False
@@ -426,6 +459,10 @@ def _validate_upstream_item(item):
         return False
     _id = item.get("id")
     if not isinstance(_id, str) or not _id.strip():
+        return False
+    # R5-1: 与写入端 api._UID_RE 同一份正则。非标 id 加载期即跳过告警,
+    # 避免运行态携带坏 id 导致后续 PUT /api/config 整请求 400 自锁。
+    if not _UPSTREAM_ID_RE.match(_id):
         return False
     return True
 
@@ -558,7 +595,7 @@ def _validate_cfg(cfg):
             if _validate_upstream_item(item):
                 kept_up.append(item)
             else:
-                logging.warning("upstreams[%d] 非法(proto 非枚举/port 越界/addr 或 id 为空), 已跳过: %r", i, item)
+                logging.warning("upstreams[%d] 非法(proto 非枚举/port 越界/addr 或 id 为空/id 字符集不符), 已跳过: %r", i, item)
         cfg["upstreams"] = kept_up
     # P3-1(第八轮): cache_partitions 各分区权重加载期校验。API 写入路径
     # (_validate_cfg_update) 已 400 拒绝非数值权重; 手编 config.json 写入
@@ -581,8 +618,13 @@ def _validate_cfg(cfg):
                                 _ck, sorted(_VALID_CP_KEYS))
                 del _cp[_ck]
         for _ck, _cv in _cp.items():
-            if isinstance(_cv, bool) or not isinstance(_cv, (int, float)) or _cv < 0:
-                logging.warning("cache_partitions[%r] 权重非法(非数字/布尔/负数, got %r), 整个分区配置回退默认",
+            # R3 P2-2: 追加 math.isfinite 校验 —— Python json.loads 默认接受 NaN/
+            # Infinity/-Infinity 字面量, float('nan')<0 与 float('inf')<0 均为 False,
+            # 此前穿透负数检查进入 resolver 加权分区容量分配(NaN 使权重和为 NaN,
+            # 分区比例整体异常)。
+            if (isinstance(_cv, bool) or not isinstance(_cv, (int, float))
+                    or not math.isfinite(_cv) or _cv < 0):
+                logging.warning("cache_partitions[%r] 权重非法(非数字/布尔/NaN/Inf/负数, got %r), 整个分区配置回退默认",
                                 _ck, _cv)
                 cfg["cache_partitions"] = None
                 break

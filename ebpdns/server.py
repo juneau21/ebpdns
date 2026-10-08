@@ -454,10 +454,15 @@ class DNSServer:
                 pass
 
     def _fmt(self, addr):
-        """socket 地址元组 → host:port（IPv6 getsockname 返回 4 元组）。"""
+        """socket 地址元组 → host:port（IPv6 getsockname 返回 4 元组）。
+        R2-07: IPv6 地址加方括号, 否则 ::1:53 与 [::1]:53 规范写法歧义。"""
         if not addr:
             return None
-        return "%s:%d" % (addr[0], addr[1])
+        host = addr[0]
+        # IPv6 字面量含冒号(或带 zone 后缀 scope_id)一律加方括号。
+        if ":" in host:
+            return "[%s]:%d" % (host, addr[1])
+        return "%s:%d" % (host, addr[1])
 
     def endpoints(self):
         return {

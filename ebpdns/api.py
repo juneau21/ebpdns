@@ -3,11 +3,12 @@
 import hmac
 import itertools
 import json
+import copy
+import math
 import os
 import re
 import ssl
 import ipaddress
-import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,13 @@ _PROFILE_LOCK = threading.Lock()
 # 线程内执行会占满 ThreadingHTTPServer 的 256 线程槽位。限制最多 4 个并发下载,
 # 超额在信号量上排队(不消耗线程槽以外的额外资源), 防止突发批量订阅把 API 卡死。
 _SUBSCRIBE_SEM = threading.BoundedSemaphore(4)
+
+# R2-02(R2): socket.setdefaulttimeout() 是进程级全局状态。_sub_url_blocked 在并发
+# 订阅下载(_SUBSCRIBE_SEM 4 并发 + HTTP worker 重定向回调 + cli 冷启动后台线程)下
+# 做 save/restore 会交错: A 读到 None 设 5.0, B 读到 5.0 设 5.0, A 恢复 None,
+# B 恢复 5.0 —— 全局默认 socket 超时被永久留在 5.0s。用专用锁串行化所有
+# _sub_url_blocked 的全局超时收紧段(订阅下载本就低频, 串行化可接受), 消除交错。
+_SUBSCRIBE_DNS_TIMEOUT_LOCK = threading.Lock()
 
 # P3-12: /api/restart 防重入标志。重启是延迟触发(1s 后后台线程 exec/systemctl),
 # 两次连点会派生两个重启线程, 后者可能在前者已 exec 后再执行一次导致异常。
@@ -165,6 +173,13 @@ def _validate_upstream_dict(u):
 # 后续 socket 连接处理, 这里只做字符集白名单。
 _HOST_RE = re.compile(r"^[a-zA-Z0-9._:\[\]-]{1,253}$")
 
+# R4 P3-1: 用户自带 upstream id 字符集白名单。与 _new_id 生成格式
+# (字母+数字+时间戳+hex)对齐, 拒绝空格/Unicode/控制字符, 保证 id 可安全
+# 用作 telemetry 键 / /metrics 标签值 / REST 路径段。
+# R5-1(P2): 正则定义收口到 config._UPSTREAM_ID_RE, 与加载端
+# config._validate_upstream_item 同源, 消除写入端/加载端口径漂移。
+_UID_RE = config_mod._UPSTREAM_ID_RE
+
 
 def _valid_host(host):
     """校验上游 addr 字段字符集: 允许 IPv4/IPv6/主机名字符集, 长度 1-253。"""
@@ -271,6 +286,10 @@ def _validate_rule_dict(r, require_match=False):
         # P2-6: match 字段 4096 字节上限, 防止超大正则/字符串落库膨胀规则索引
         if len(match.encode("utf-8")) > 4096:
             return "match 过长 (上限 4096 字节)"
+        # R6-3(P3): 拒绝控制字符(0x00-0x1f / 0x7f), 防换行注入日志面。
+        # 与上游 addr/url/domain 字段校验强度对齐(DoH url 已拒 ord<0x20 与 0x7f)。
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in match):
+            return "match 不允许包含控制字符"
     elif require_match:
         return "match 不能为空"
     return None
@@ -423,14 +442,27 @@ def _sub_url_blocked(url):
         ips = [ipaddress.ip_address(host)]
     except ValueError:
         ips = []
-        try:
-            for fam, _t, _p, _c, sa in _socket.getaddrinfo(host, parsed.port or 80):
+        # v1.9.146 P2-2: getaddrinfo 是阻塞 C 调用, 无超时。DNS 服务器异常/被投毒/
+        # 慢域名时可挂起数十秒, 占用 HTTP worker(虽在 _SUBSCRIBE_SEM 4 并发内)。
+        # 临时把 socket 默认超时收紧到 5s 再恢复, 避免订阅下载端点在 DNS 故障时
+        # 间接耗尽线程池。getaddrinfo 走 libc 默认解析, 受 setdefaulttimeout 约束。
+        # R2-02: setdefaulttimeout 是进程级全局状态, 多路径并发调用会交错 save/restore
+        # (A 读 None 设 5.0 → B 读 5.0 设 5.0 → A 恢复 None → B 恢复 5.0), 把默认
+        # 超时永久留在 5.0s。用专用锁串行化整段, 消除交错(订阅下载低频, 串行化可接受)。
+        with _SUBSCRIBE_DNS_TIMEOUT_LOCK:
+            _old_to = _socket.getdefaulttimeout()
+            _socket.setdefaulttimeout(5.0)
+            try:
                 try:
-                    ips.append(ipaddress.ip_address(sa[0]))
-                except ValueError:
-                    pass
-        except OSError:
-            return "订阅主机名解析失败", []
+                    for fam, _t, _p, _c, sa in _socket.getaddrinfo(host, parsed.port or 80):
+                        try:
+                            ips.append(ipaddress.ip_address(sa[0]))
+                        except ValueError:
+                            pass
+                except OSError:
+                    return "订阅主机名解析失败", []
+            finally:
+                _socket.setdefaulttimeout(_old_to)
     if not ips:
         return "订阅主机名无可用 IP", []
     for ip in ips:
@@ -608,6 +640,15 @@ class AppContext:
         # (SIGTERM 自然终止)不会触发 on-failure 重启。此属性由 restart() 在 systemd
         # 分支置 3, cli.py 收尾时读取并作为 os._exit 码。
         self.restart_exit_code = 0
+        # P2-4(R1): 规则索引重建串行锁 + 代际计数器。rebuild 读盘+建索引对 10 万规则
+        # 耗时数百 ms, 此前在 app._lock 内同步执行, 阻塞所有写 API。现改为: 文件写盘在
+        # app._lock 内完成, rebuild 在 app._lock 外进行; _rebuild_lock 串行化 rebuild,
+        # 避免并发 rebuild 互相覆盖索引(旧 rebuild 读到旧磁盘态后安装, 覆盖新 rebuild)。
+        # _rule_rebuild_gen 在 app._lock 内每次规则变更递增; _rule_rebuild_last 记录
+        # 已重建到的最新代际, 用于跳过冗余 rebuild。
+        self._rebuild_lock = threading.Lock()
+        self._rule_rebuild_gen = 0
+        self._rule_rebuild_last = 0
 
     def reload(self):
         """热重载入口(H-2): 全程持 self._lock, 与 _api_update_config 串行化,
@@ -632,7 +673,7 @@ class AppContext:
             new_cfg = config_mod.load_config(self.config_path, persist=False)
         except Exception as e:
             log.error("热重载配置加载失败: %r", e)
-            return {"ok": False, "error": "配置加载失败: %s" % e}
+            return {"ok": False, "error": "配置加载失败(详情见服务端日志)"}
         # R9-R3 P1: load_config 在文件存在但解析失败时返回 None(读到空/半截文件)。
         # 此时必须保留当前运行配置, 绝不能采用内置默认(会整套替换上游/监听/缓存)。
         if new_cfg is None:
@@ -708,7 +749,7 @@ class AppContext:
             changed = self.resolver.reload(new_cfg, self.config_path)
         except Exception as e:
             log.error("热重载 resolver 应用失败: %r", e)
-            return {"ok": False, "error": "热重载失败: %s" % e}
+            return {"ok": False, "error": "热重载失败(详情见服务端日志)"}
         # 监听地址变更无法热生效(需要重建 socket), 提示走 /api/restart。
         # R6 P3-3: 此前只比对 listen, 漏了 api.host/api.port —— API socket 同样在
         # 启动时 bind, reload 不重绑, 手编 config.json 改 api.port 后 reload 会让
@@ -766,6 +807,14 @@ class AppContext:
         #   python3 -m ebpdns run --config <绝对路径>
         # 并固定 PYTHONPATH=src 目录 + cwd=src, 保证任意启动方式下重启确定性成功
         # (曾现: execv 继承的空 PYTHONPATH/相对 -c 路径导致 ImportError 后进程退出)。
+        # R2-04: os.execvpe 直接替换进程镜像, 不触发 atexit/SIGTERM/退出 _save_cache,
+        # 此前非 systemd 重启会丢最多 60s(_CACHE_SAVE_INTERVAL)内存缓存。exec 前
+        # best-effort 落盘一次, 与 systemd 路径(走 SIGTERM 优雅收尾含 _save_cache)对齐。
+        try:
+            from .cli import _save_cache as _cli_save_cache
+            _cli_save_cache(self.cfg, self.config_path, self.resolver.cache)
+        except Exception as e:
+            log.warning("重启前缓存落盘失败(忽略, 继续重启): %r", e)
         try:
             import ebpdns as _pkg
             src_dir = os.path.dirname(os.path.dirname(os.path.abspath(_pkg.__file__)))
@@ -779,6 +828,37 @@ class AppContext:
         except Exception as e:
             log.error("服务重启失败: %r", e)
             os._exit(1)
+
+    def rebuild_rule_index_synced(self):
+        """R2-01(R2): 在 _rebuild_lock 内重建规则索引, 入口快照目标代际, 完成只回写
+        快照值——不读 live gen。
+
+        背景(R1 P2-4 引入的回归): 此前在 rebuild 完成时才读 self._rule_rebuild_gen
+        回写 _rule_rebuild_last。若 Write A 的 rebuild 慢(10万规则数百ms), 期间
+        Write B 已 os.replace 新文件并把 gen 从 5 推到 6; A 读完旧 inode 建出旧索引,
+        完成时读到的 live gen 已是 6, 于是 last=6。B 醒来判定 gen(6)<=last(6) 直接
+        跳过——磁盘已是 B 的新规则, 运行索引却是 A 的旧规则, 新规则静默不生效。
+        修复: 进入 _rebuild_lock 时捕获本次目标代际, 完成只回写该快照。A 回写 last=5,
+        B 醒来 6>5 必然重建, 读最新磁盘态。
+        调用方须先在 app._lock 内递增 _rule_rebuild_gen, 再在锁外调用本方法。"""
+        with self._rebuild_lock:
+            target_gen = self._rule_rebuild_gen          # 入口快照本次目标代际
+            if target_gen <= self._rule_rebuild_last:
+                # 已有更新的 rebuild 覆盖了本次(或更早)变更, 无需重复重建。
+                return True, ""
+            t0 = time.monotonic()
+            try:
+                self.resolver.rebuild_rule_index()
+                dt = (time.monotonic() - t0) * 1000.0
+                log.info("rebuild_rule_index took %.2fms", dt)
+                ok, err = True, ""
+            except Exception as e:
+                dt = (time.monotonic() - t0) * 1000.0
+                log.warning("rebuild_rule_index failed (%.2fms): %s", dt, e)
+                ok, err = False, str(e)
+            if ok:
+                self._rule_rebuild_last = target_gen     # 只回写快照, 不回写 live gen
+            return ok, err
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -799,6 +879,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # R2-P2-1 / R2-P3-2: 安全响应头统一收口。
+        # - X-Frame-Options: DENY —— <meta> 里的 frame-ancestors 被浏览器忽略(CSP 规范
+        #   不允许 meta 投递 frame-ancestors), 改由 HTTP 头真正闭合点击劫持。
+        # - X-Content-Type-Options: nosniff —— 防 MIME 嗅探。
+        # - Referrer-Policy: no-referrer —— 不外泄跳转来源。
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -950,7 +1038,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         # 监听全部地址(局域网访问)→ 要求自洽 + host 必须是私网/环回 IP;
         # 否则按配置的 api.host 严格校验
-        lan_mode = configured_host in ("0.0.0.0", "::", "::0", "")
+        # P3(R1-01): 用 ipaddress.is_unspecified 判定未指定地址, 替代硬编码元组。
+        # 展开式 IPv6(如 0:0:0:0:0:0:0:0)不在旧元组内, 被误判为非 lan_mode,
+        # 导致浏览器 Origin 严格相等校验不通过 → 局域网写操作全部 403。
+        try:
+            lan_mode = (configured_host == ""
+                        or ipaddress.ip_address(configured_host).is_unspecified)
+        except ValueError:
+            lan_mode = False
 
         origin = self.headers.get("Origin")
         if origin:
@@ -1109,23 +1204,16 @@ class _Handler(BaseHTTPRequestHandler):
         # 统一按 UTF-8 bytes 比较, 规避 ASCII 限制并保持常量时间语义。
         return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
-    def _rebuild_rule_index_timed(self):
-        """重建规则索引并记录耗时。返回 (ok, err)。
-        P1-6: 失败时返回 (False, str(e)), 关键路径据此返回 500(而非静默吞错回 200)。
-        P2-13: rebuild_rule_index 内部持 resolver._prefetch_lock 读盘+建索引,
-        期间走预取路径的 DNS 查询会短暂阻塞——这是已知性能瓶颈。真正的双缓冲
-        (锁外构建新索引 + 锁内原子替换元组)需 resolver.py 支持, 本层无法实现。
-        此处记录耗时(ms)供运维观测。调用时机: 规则文件已落盘之后。"""
-        t0 = time.monotonic()
-        try:
-            self.app.resolver.rebuild_rule_index()
-            dt = (time.monotonic() - t0) * 1000.0
-            log.info("rebuild_rule_index took %.2fms", dt)
-            return True, ""
-        except Exception as e:
-            dt = (time.monotonic() - t0) * 1000.0
-            log.warning("rebuild_rule_index failed (%.2fms): %s", dt, e)
-            return False, str(e)
+    def _rebuild_rule_index_outside_lock(self):
+        """P2-4(R1): 在 app._lock 外重建规则索引。
+        文件写盘已在 app._lock 内完成(规则文件/订阅文件/config 均已 os.replace 落盘),
+        rebuild 读盘不依赖内存锁, 故可移出 app._lock, 避免 10 万规则时阻塞所有写 API。
+        用独立 _rebuild_lock 串行化 rebuild, 防止并发 rebuild 互相覆盖索引。
+        R2-01: 代际戳快照逻辑下沉到 AppContext.rebuild_rule_index_synced —— 入口快照
+        target_gen、完成只回写快照, 不再在 rebuild 完成时读 live gen(否则慢 rebuild 期间
+        并发第二次写会把 gen 推高, 导致第二个写的 rebuild 被误判冗余跳过, 新规则不生效)。
+        调用方须在 app._lock 内递增 _rule_rebuild_gen 后, 在锁外调用本方法。"""
+        return self.app.rebuild_rule_index_synced()
 
     def _route(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1154,6 +1242,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_static("index.html")
         if path == "/echarts.min.js":
             return self._serve_static("echarts.min.js")
+        # P3-1(R12): 显式 SVG favicon, 消除浏览器默认请求 /favicon.ico 的 404 噪音。
+        # .svg MIME 已在 _STATIC_MIME 映射(image/svg+xml); 走同一 _serve_static 越界保护链。
+        if path == "/favicon.svg":
+            return self._serve_static("favicon.svg")
         if path.startswith("/static/"):
             return self._serve_static(path[len("/static/"):])
 
@@ -1162,10 +1254,11 @@ class _Handler(BaseHTTPRequestHandler):
         # 与显式 method 校验的写端点风格一致, 误调用不再被静默当作正常读。
         if path == "/api/health" and method == "GET":
             tel = self.app.telemetry
+            # v1.9.146 P3-3: /api/health 是 token 豁免的容器探活端点, 不再返回 version
+            # (避免未认证指纹识别已知漏洞版本)。version 仍在需认证的 /api/status 返回。
             return self._send(200, {
                 "status": "ok",
                 "running": True,
-                "version": __version__,
                 "uptime_s": int(time.time() - tel.boot_time),
             })
         if path == "/api/cache/stats" and method == "GET":
@@ -1173,8 +1266,10 @@ class _Handler(BaseHTTPRequestHandler):
             cache = self.app.resolver.cache
             try:
                 summ = cache.summary()
-            except Exception as e:
-                return self._send(500, {"error": "cache stats failed: %s" % e})
+            except Exception:
+                # v1.9.146 P1-2: 不回显 cache 内部结构异常消息
+                log.exception("cache stats summary failed")
+                return self._send(500, {"error": "cache stats failed"})
             try:
                 summ["size"] = cache.size()
             except Exception:
@@ -1222,6 +1317,14 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/rules/") and method in ("PUT", "DELETE"):
             return self._api_rule_op(path[len("/api/rules/"):])
         if path == "/api/reset" and method == "POST":
+            # v1.9.146 P2-7: 清空遥测+缓存会让命中率瞬间归零。此前无请求体确认,
+            # 前端误点即清空。要求显式 {"confirm": true}(CSRF 门控已拦跨站请求,
+            # 此处防的是本机/已授权会话的误触)。
+            body = self._read_json()
+            if body is _SENTINEL:
+                return
+            if not isinstance(body, dict) or body.get("confirm") is not True:
+                return self._send(400, {"error": "需要请求体 {\"confirm\": true} 确认清空遥测与缓存"})
             self.app.telemetry.reset()
             self.app.resolver.cache.clear()
             return self._send(200, {"ok": True})
@@ -1249,6 +1352,10 @@ class _Handler(BaseHTTPRequestHandler):
         app = self.app
         tel = app.telemetry
         cache = app.resolver.cache
+        # v1.9.146 P2-8: 一次性取 cfg 引用, 后续全部用局部 cfg。reload/PUT 在两次
+        # .get() 之间换 self.app.cfg 引用时, 响应会读到"前几字段旧值、后几字段新值"
+        # 的混合态。持有同一 dict 引用则整份响应自洽(哪怕是 reload 前的旧快照)。
+        cfg = app.cfg
         _counters, _rule_hits, _hit_rate, _qps, _avg_lat = tel.counters_snapshot()
         # R35 P3-1: 与 /api/cache/stats 同型包裹 cache.summary(), 失败时回退空 dict,
         # 避免异常穿透 _route → do_GET 导致客户端断连而非 JSON 响应。
@@ -1268,16 +1375,21 @@ class _Handler(BaseHTTPRequestHandler):
             "counters": _counters,
             "rule_hits": _rule_hits,
             "map": _cache_map,
-            "cache_policy": str(self.app.cfg.get("cache_policy", "lru")).lower(),
-            "health_check_interval": int(self.app.cfg.get("health_check_interval", 30) or 0),
-            "rule_sub_interval": int(self.app.cfg.get("rule_sub_interval", 3600) or 0),
-            "cache_file": (app.cfg.get("cache_file") or ""),
+            "cache_policy": str(cfg.get("cache_policy", "lru")).lower(),
+            "health_check_interval": int(cfg.get("health_check_interval", 30) or 0),
+            "rule_sub_interval": int(cfg.get("rule_sub_interval", 3600) or 0),
+            "cache_file": (cfg.get("cache_file") or ""),
             # H-3: 共享容器迭代必须走加锁快照, 否则并发 count_top/upstream_ok
             # 触发 RuntimeError: dictionary changed size during iteration
             "top_domains": tel.top_domains_snapshot(10),
             "top_clients": tel.top_clients_snapshot(10),
             "top_upstreams": sorted(
-                ((u, st.get("ok", 0) + st.get("fail", 0)) for u, st in tel.upstreams_snapshot()),
+                # R3 P2-1: 与 /metrics(R1-11)对齐改用 upstreams_snapshot_copy() 锁内
+                # 深拷贝。旧 upstreams_snapshot() 返回的 st 是 live dict 引用, 锁外两次
+                # st.get("ok")/st.get("fail") 可能跨相邻 upstream_ok/fail 时刻, total 计数
+                # 瞬时不一致导致排序偏差一位。
+                ((u, st.get("ok", 0) + st.get("fail", 0))
+                 for u, st in tel.upstreams_snapshot_copy().items()),
                 key=lambda x: x[1], reverse=True)[:10],
             "config_path": app.config_path,
             "endpoints": app.dns_server.endpoints() if app.dns_server else None,
@@ -1301,19 +1413,21 @@ class _Handler(BaseHTTPRequestHandler):
         # 低级别评审结论: config_snippet 这组字段前端控制台不消费(前端走独立的
         # /api/config), 但外部脚本/API 使用者可能依赖该结构做配置概览, 移除有兼容性
         # 风险, 故保留, 仅在此注释说明"前端不消费, 保留供外部 API 使用"。
+        # v1.9.146 P2-8: 一次性取 cfg 局部引用, 避免连续 .get() 跨 reload 撕裂。
+        cfg = self.app.cfg
         s["config_snippet"] = {
-            "hook": self.app.cfg.get("hook"),
-            "map_type": self.app.cfg.get("map_type"),
-            "kernel_direct": self.app.cfg.get("kernel_direct"),
-            "cache_size": self.app.cfg.get("cache_size"),
-            "ttl": self.app.cfg.get("ttl"),
-            "prefetch": self.app.cfg.get("prefetch"),
-            "speed_test": self.app.cfg.get("speed_test"),
-            "ipv6": self.app.cfg.get("ipv6"),
-            "edns": self.app.cfg.get("edns"),
-            "fallback": self.app.cfg.get("fallback"),
-            "ipv4_first": self.app.cfg.get("ipv4_first"),
-            "percpu": self.app.cfg.get("percpu"),
+            "hook": cfg.get("hook"),
+            "map_type": cfg.get("map_type"),
+            "kernel_direct": cfg.get("kernel_direct"),
+            "cache_size": cfg.get("cache_size"),
+            "ttl": cfg.get("ttl"),
+            "prefetch": cfg.get("prefetch"),
+            "speed_test": cfg.get("speed_test"),
+            "ipv6": cfg.get("ipv6"),
+            "edns": cfg.get("edns"),
+            "fallback": cfg.get("fallback"),
+            "ipv4_first": cfg.get("ipv4_first"),
+            "percpu": cfg.get("percpu"),
         }
         return s
 
@@ -1340,13 +1454,22 @@ class _Handler(BaseHTTPRequestHandler):
         # 协议层非法, 此前会穿透到 resolver 触发 502。在此 400 拒绝。
         if any(len(lbl) > 63 for lbl in domain.split(".")):
             return self._send(400, {"error": "domain label too long (max 63 chars)"})
+        # v1.9.146 P2-4: 字符集白名单 —— 此前只校验长度/标签长度, 未拒绝控制字符/
+        # 空格/分号。含 \n 的 domain 会进入 telemetry.events/manual_history 并被文本
+        # 日志按原文打印(日志注入伪造日志行), 也可能构造畸形 DNS 查询名。与上游 addr
+        # 同型白名单: 仅 [a-zA-Z0-9._-](含 punycode xn-- 前缀与末尾根点)。
+        if not re.fullmatch(r"[a-zA-Z0-9._-]{1,253}", domain):
+            return self._send(400, {"error": "invalid domain characters"})
         # qtype 必须是已知类型名, 未知类型(畸形/拼写错误)直接 400
         if dnsmsg.type_code(qtype) == 0:
             return self._send(400, {"error": "bad qtype: %r" % (qtype,)})
         try:
             res = self.app.resolver.resolve(domain, qtype, silent=False, client_ip="查询控制台")
-        except Exception as e:
-            return self._send(502, {"error": "resolve failed", "detail": str(e)})
+        except Exception:
+            # v1.9.146 P1-2: 不再把 str(e)(socket 错误/上游 IP 端口/内部异常类型)回给
+            # 调用方; 详情只记日志。LAN 暴露且未配 token 时这是侦察信息泄露面。
+            log.exception("manual query resolve failed: domain=%r qtype=%r", domain, qtype)
+            return self._send(502, {"error": "resolve failed"})
         tel = self.app.telemetry
         tel.add_manual_entry({
             "ts": _now_ts(),
@@ -1367,9 +1490,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             results = probe_upstream_latencies(self.app.cfg, self.app.config_path,
                                                force=True, tag="重新测速", app_ctx=self.app)
-        except Exception as e:
-            log.warning("reprobe failed: %r", e)
-            return self._send(502, {"error": "reprobe failed: %s" % e})
+        except Exception:
+            # v1.9.146 P1-2: 不回显 str(e)(内含上游 IP/端口/网络错误), 详情记日志。
+            log.exception("reprobe failed")
+            return self._send(502, {"error": "reprobe failed"})
         return self._send(200, {"ok": True, "results": results})
 
     def _api_profile(self, query):
@@ -1408,6 +1532,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_restart(self):
         """重启 daemon：先返回响应，1 秒后由后台线程触发重启。"""
+        # R1 P2-1: 与 /api/reset 对齐, 要求请求体显式 {"confirm": true}。
+        # 此前前端只靠浏览器 confirm() 对话框兜底, 实际 POST 不带 body, 后端也不校验;
+        # 已获 token 的脚本化调用方(curl/误写脚本/重放)可绕过 JS 确认直接触发重启,
+        # 造成 5-10s DNS 中断。CSRF+Bearer 已挡跨站远程触发, 此处防的是持有凭据的
+        # 程序化误触/重放。
+        body = self._read_json()
+        if body is _SENTINEL:
+            return
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return self._send(400, {"error": "需要请求体 {\"confirm\": true} 确认重启服务"})
         # P3-12: 防重入。重启是延迟触发(1s 后后台 exec/systemctl), 两次连点会
         # 派生两个重启线程, 后者可能在前者已替换进程后再次执行导致异常。
         # 首个请求置位后, 后续请求直接 409。
@@ -1495,10 +1629,51 @@ class _Handler(BaseHTTPRequestHandler):
                 if isinstance(_cv, bool) or not isinstance(_cv, (int, float)):
                     return ("bad cache_partitions: 分区 %r 的权重必须是数字(不能是布尔/字符串) "
                             "(got %r)" % (_ck, _cv))
+                # R3 P2-2: 追加 math.isfinite —— JSON body 经 json.loads 接受 NaN/
+                # Infinity 字面量, 且 nan<0/inf<0 均为 False, 此前穿透下方非负检查
+                # 进入 resolver 加权计算。与加载期 config._validate_cfg 对齐。
+                if not math.isfinite(_cv):
+                    return ("bad cache_partitions: 分区 %r 的权重必须是有限数字(不能是 NaN/Infinity) "
+                            "(got %r)" % (_ck, _cv))
                 # R27 P3-5: 权重必须非负 —— 负权重进入 resolver 加权分区容量分配会导致
                 # 分区容量分配异常。此前只校验为数值(排除 bool), 不校验 >=0。
                 if _cv < 0:
                     return ("bad cache_partitions: 分区 %r 的权重不能为负数 (got %r)" % (_ck, _cv))
+            # v1.9.146 P3-5: 与加载期 config._validate_cfg 对齐 —— 分区键必须 ⊆
+            # {domestic, global, default}。此前 PUT 路径只校验权重数值, 未知键
+            # (如 {"domestic":0.2,"evil":0.8}) 被 deep_merge 落库残留, resolver 忽略
+            # 未知键但配置文件/前端回显与实际生效不一致。非法键直接 400。
+            _VALID_CP_KEYS = frozenset(("domestic", "global", "default"))
+            for _ck in cp.keys():
+                if _ck not in _VALID_CP_KEYS:
+                    return ("bad cache_partitions: 未知分区键 %r (合法: %s)"
+                            % (_ck, sorted(_VALID_CP_KEYS)))
+        # v1.9.146 P1-1: 补齐加载期 config._validate_cfg 有、但 PUT 写入路径遗漏的
+        # 四个字段校验, 消除"手编 config.json 被回退默认, API 写入却立即生效垃圾值"
+        # 的双入口不一致。
+        # map_type: 枚举(保留大小写, 不进 _ENUM_VALUES——该表会 v.lower() 归一)。
+        if "map_type" in data:
+            if data["map_type"] not in config_mod._MAP_TYPES:
+                return "bad map_type: 必须是 %s 之一 (got %r)" % (
+                    sorted(config_mod._MAP_TYPES), data["map_type"])
+        # health_probe_domain: 非空可打印字符串, ≤253。用于健康检查 DNS 查询名,
+        # 拒绝控制字符(日志/查询名注入)与超长串。
+        if "health_probe_domain" in data:
+            _hpd = data["health_probe_domain"]
+            if (_hpd is not None
+                    and (not isinstance(_hpd, str) or not _hpd.strip()
+                         or not _hpd.isprintable() or len(_hpd) > 253)):
+                return ("bad health_probe_domain: 非空可打印字符串 ≤253 "
+                        "(got %r)" % (_hpd,))
+        # bootstrap_dns: 合法 host:port, 端口 1-65535(DoH/DoT hostname 预解析用)。
+        if "bootstrap_dns" in data:
+            _bs = data["bootstrap_dns"]
+            _bs_ok = isinstance(_bs, str) and bool(_bs.strip())
+            if _bs_ok:
+                _bp = config_mod.parse_upstream_addr(_bs)
+                _bs_ok = _bp is not None and 1 <= _bp["port"] <= 65535
+            if not _bs_ok:
+                return "bad bootstrap_dns: 必须是 host:port (got %r)" % (_bs,)
         for k, allowed in config_mod._ENUM_VALUES.items():
             if k not in data:
                 continue
@@ -1544,11 +1719,31 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad upstreams: must be a list"})
         # P2-1(第六轮): 整体覆盖 upstreams[] 时逐项校验 proto 枚举 + port 范围,
         # 与 POST/PUT 单上游对齐。此前只校验"是 list", 手构造 body 可落库死上游。
+        # v1.9.146 P2-3: 与逐条 rules(R27 P3-1)对齐 —— 缺 id 的上游补一个新 id,
+        # 避免落库后 PUT/DELETE /api/upstreams/<id> 按 id 定位 404; 同时查重,
+        # 重复 id 会让 next(...) 只命中第一个, 第二个变孤儿(后续编辑/删除失能)。
         if "upstreams" in data:
+            _seen_uids = set()
             for i, u in enumerate(data["upstreams"]):
                 verr = _validate_upstream_dict(u)
                 if verr:
                     return self._send(400, {"error": "upstreams[%d]: %s" % (i, verr)})
+                if not u.get("id"):
+                    u["id"] = _new_id("u")
+                else:
+                    # R4 P3-1: 用户自带 id 做字符集白名单校验, 与 _new_id 格式对齐。
+                    # 拒绝含空格/Unicode/控制字符的 id, 避免污染 telemetry 键与
+                    # /metrics 标签。自动生成的 _new_id 格式已满足白名单, 无需校验。
+                    _uid = u["id"]
+                    if not isinstance(_uid, str) or not _UID_RE.match(_uid):
+                        return self._send(400, {
+                            "error": "upstreams[%d]: 非法 id %r (仅允许字母数字 _ . : -, 长度1-64)"
+                                     % (i, _uid)})
+                if u["id"] in _seen_uids:
+                    return self._send(400, {
+                        "error": "upstreams[%d]: 重复 id %r (同一列表内 id 必须唯一)"
+                                 % (i, u["id"])})
+                _seen_uids.add(u["id"])
         # P2-1: deep_merge 前对增量 data 做数值范围/枚举/布尔校验, 非法 400 拒绝。
         err = self._validate_cfg_update(data)
         if err:
@@ -1564,6 +1759,11 @@ class _Handler(BaseHTTPRequestHandler):
         # P2-2(第六轮): 内嵌 rules[] 与 rule_subscriptions[] 逐项校验 action 枚举,
         # 与 import/subscribe/单条增改对齐。此前直接落盘可落库永不命中的死规则。
         if isinstance(data_rules, list):
+            # R7 P3-2: 与上游 upstreams[] 的 _seen_uids 查重对齐。此前 bulk rules[]
+            # 只对缺 id 的规则补新 id, 不检查同列表内重复 id; 手构造 body 传两条
+            # 同 id 规则会双双落库, resolver 按 id 建索引时第二条覆盖第一条,
+            # DELETE 命中第一条使第二条变孤儿(后续编辑/删除失能)。
+            _seen_rids = set()
             for i, r in enumerate(data_rules):
                 # R17 P3-3: require_match=True —— bulk rules[] 必须带合法 match,
                 # 拦截 match:null / 缺 match 键 / 非 str 类型的畸形规则入库。
@@ -1587,6 +1787,12 @@ class _Handler(BaseHTTPRequestHandler):
                 # 避免落库后按 id 的 PUT/DELETE 在首次惰性迁移(_local_rules)前 404。
                 if not r.get("id"):
                     r["id"] = _new_id("r")
+                # R7 P3-2: 与上游 _seen_uids 同型查重, 重复 id 返回 400。
+                if r["id"] in _seen_rids:
+                    return self._send(400, {
+                        "error": "rules[%d]: 重复 id %r (同一列表内 id 必须唯一)"
+                                 % (i, r["id"])})
+                _seen_rids.add(r["id"])
         # P2-1(第七轮): rule_subscriptions 与 upstreams 同型守卫——此前漏了 isinstance
         # 检查, 非 list 畸形值(如 string/dict)穿透下方 `isinstance(..., list)` 分支被跳过,
         # 随 deep_merge 污染运行态, resolver 后续遍历触发 AttributeError。
@@ -1622,6 +1828,12 @@ class _Handler(BaseHTTPRequestHandler):
         idx_ok = True
         idx_err = ""
         saved_rules_ok = True   # R2-P1: bool 成功/失败, True=本次无 rules 需保存或已成功
+        policy_warn = None      # R3 P3-1: 缓存策略切换失败原因, 随响应透出(用户可感知)
+        derived_changed = []    # R4 P2: 派生态刷新结果(ECS/stale_window/分区/bufsize), 随响应透出
+        # R5-2(P3): 标量派生态提前到 save_config 之前下发, 需记录旧值供写盘失败回滚。
+        _old_scalar = None      # {ecs_key, stale_window, bufsize, prefetch}
+        _old_ecs = None
+        _new_ecs = None
         try:
             with self.app._lock:
                 old_cfg = self.app.cfg   # 回滚用: 合并失败时还原旧配置引用
@@ -1634,11 +1846,16 @@ class _Handler(BaseHTTPRequestHandler):
                 old_capacity = getattr(old_cache, "capacity", None)
                 self.app.cfg = config_mod.deep_merge(old_cfg, data)
                 # deep_merge 返回新 dict, resolver/DNSServer 持有旧引用。
-                # 必须重绑定, 否则除 cache_size 外的配置(ttl/预取/测速/超时/IPv6/
-                # 规则/上游/fallback/ipv4_first)都不会即时生效, 需重启才生效。
+                # 必须重绑定, 否则 ttl/预取/测速/超时/IPv6/规则/上游/fallback/
+                # ipv4_first 等通过 .get() 读取的标量配置都不会即时生效。
+                # R5-2(P3): 此重绑仅刷新"直接 .get() 读取"的标量; 由 reload() 派生的
+                # 运行态(_ecs_key/stale_window/_client_bufsize_cap/prefetch_interval)
+                # 不再等 save_config 成功后才刷——那会在 fsync 窗口内让并发查询看到
+                # "新 cfg / 旧派生态"(ECS/stale_window/bufsize/prefetch 延迟一个磁盘
+                # I/O 周期生效)。现于下方 cache 对象/容量定型后的同一点(见 R5-2 块)
+                # 立即下发标量派生态, 与 reload() 的元组赋值对齐; 破坏性操作(cache.clear/
+                # 分区重建/熔断器清理)仍留到 save_config 成功后, 失败可回滚标量。
                 self.app.resolver.cfg = self.app.cfg
-                # 同步缓存容量
-                self.app.resolver.cache.capacity = int(self.app.cfg.get("cache_size", 1024))
                 # 缓存策略变更立即重建容器(保存即生效, 不必等 /api/reload)。
                 # switch_cache_policy 按实际对象类型判定, 幂等。
                 new_policy = str(self.app.cfg.get("cache_policy", "lru")).lower()
@@ -1646,11 +1863,66 @@ class _Handler(BaseHTTPRequestHandler):
                     try:
                         self.app.resolver.switch_cache_policy(new_policy)
                     except Exception as e:
+                        # R3 P3-1: 切换失败此前只记 warning, 请求继续走 save_config 返回
+                        # 200, 用户以为已切到新策略、运行态实为旧策略。现: (1) 捕获原因
+                        # 随响应 warning 字段透出; (2) 把内存 cfg["cache_policy"] 回滚为
+                        # old_policy, 保证落盘配置 == 实际运行态一致(重启不会再因 cfg
+                        # 与运行态错位再次切换失败), 用户按 warning 提示稍后重试即可。
+                        policy_warn = "缓存策略切换失败(实际仍保持 %s, 详情见服务端日志)" % old_policy
                         log.warning("switch_cache_policy(%s) failed: %s", new_policy, e)
-                # P1-2: switch_cache_policy 整体替换 cache 对象, 新对象按默认容量初始化,
-                # 不继承上方刚写入的 cache_size。无论是否切换策略, 都要在切换后再按
-                # cache_size 重设一次新 cache 的容量(切换失败时新对象即原对象, 重设幂等)。
+                        try:
+                            self.app.cfg["cache_policy"] = old_policy
+                        except Exception:
+                            pass
+                # v1.9.146 P2-5: 顺序调整为"先切 cache 对象, 再统一按 cache_size 设一次
+                # 容量"。原实现先在旧 cache 上设容量、再 switch 替换对象、再设一次——
+                # 中间存在并发 DNS 查询读到"新 cfg + 旧 cache 对象(容量已按新值调)"的
+                # 组合态窗口。现仅在对象切换完成后设一次容量, 消除该中间写。
+                # (真正的双缓冲需 resolver 层支持, 此处为应用层最小缓解; 残留 ms 级
+                # 窗口内旧 cache 以旧容量服务是正确行为, 不产生错误应答。)
                 self.app.resolver.cache.capacity = int(self.app.cfg.get("cache_size", 1024))
+                # R5-2(P3): 标量类、非破坏性派生态在 cache 对象/容量定型后的同一点立即
+                # 下发, 消除 R4 把 refresh_derived_state_after_save 放在 save_config 之后
+                # 重新引入的"新 cfg / 旧派生态"窗口(详见 REVIEW_R5 R5-2)。与 reload()
+                # 的元组赋值+标量下发对齐: cfg 与 _ecs_key 单条元组发布(GIL 下原子),
+                # 随后 stale_window/_client_bufsize_cap/_prefetch_interval 同步下发。
+                # 破坏性操作(cache.clear / PartitionedCache 重建 / 熔断器/0x20 清理)
+                # 仍留到 save_config 成功后——它们不可回滚, save 失败时下方回滚分支
+                # 仅还原此处记录的标量旧值。
+                try:
+                    _old_ecs = self.app.resolver._ecs_key
+                    try:
+                        _new_ecs = self.app.resolver._normalize_ecs_key(self.app.cfg)
+                    except Exception:
+                        _new_ecs = _old_ecs
+                    _old_scalar = {
+                        "ecs_key": _old_ecs,
+                        "stale_window": getattr(self.app.resolver.cache, "stale_window", None),
+                        "bufsize": self.app.resolver._client_bufsize_cap,
+                        "prefetch": self.app.resolver._prefetch_interval,
+                    }
+                    # 与 reload()(resolver.py:2676)同型: 单条元组赋值发布 cfg+_ecs_key,
+                    # 消除两条相邻属性赋值之间"新 cfg + 旧 _ecs_key"的 bytecode 窗口。
+                    self.app.resolver.cfg, self.app.resolver._ecs_key = self.app.cfg, _new_ecs
+                    try:
+                        self.app.resolver.cache.stale_window = (
+                            int(self.app.cfg.get("stale_ttl", 3600))
+                            if self.app.cfg.get("serve_stale", False) else 0)
+                    except Exception:
+                        pass
+                    try:
+                        self.app.resolver._client_bufsize_cap = int(
+                            self.app.cfg.get("edns_client_max_size", 1232))
+                    except Exception:
+                        pass
+                    try:
+                        _new_pi = max(0.1, float(self.app.cfg.get("prefetch_interval", 1.0)))
+                        self.app.resolver._prefetch_interval = _new_pi
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.warning("R5-2 标量派生态提前下发失败(将由 save 后 refresh 兜底): %r", e)
+                    _old_scalar, _old_ecs, _new_ecs = None, None, None
                 # 上游 diff: 找出"被整条删除"或"proto/addr/port/url 变更"的旧上游。
                 # P2-4: 这些上游的统计/连接池清理必须推迟到 save_config 成功之后再执行。
                 # 若在 save 之前就 pop per_upstream/_cb 并丢连接, 而随后 save_config 抛错,
@@ -1678,32 +1950,89 @@ class _Handler(BaseHTTPRequestHandler):
                         stale_victims.append((o, False))   # 端点变更, 旧连接池 key 失效
                 # 规则可能整体替换 → 重建索引
                 saved = config_mod.save_config(self.app.cfg, self.app.config_path)
+                # P2-1(R1): save_config 写盘失败时立即回滚内存配置, 与单资源 CRUD
+                # (add/del/edit 均回滚)语义一致。此前运行态先生效、仅返回 500 告知
+                # "重启丢失", 但后续一次成功写会把这批未持久化变更静默落盘(用户被警告
+                # "丢失"的变更实际复活)。此处上移检查: 失败即还原 cfg/resolver.cfg/cache
+                # 对象/容量, 不执行后续 rules 写盘与索引重建(磁盘未变, rules_local.json
+                # 保持旧态, 无需回滚)。
+                if saved is False:
+                    self.app.cfg = old_cfg
+                    try:
+                        self.app.resolver.cfg = old_cfg
+                    except Exception:
+                        pass
+                    try:
+                        if old_cache is not None:
+                            if old_capacity is not None:
+                                old_cache.capacity = old_capacity
+                            self.app.resolver.cache = old_cache
+                    except Exception:
+                        pass
+                    # R5-2(P3): 回滚已提前下发的标量派生态, 与 cfg/cache/capacity 回滚
+                    # 同型。此时 resolver.cache 已还原为 old_cache, 直接在其上复位
+                    # stale_window; _ecs_key/_client_bufsize_cap/_prefetch_interval 是
+                    # resolver 自身属性, 一并复位。
+                    try:
+                        if _old_scalar:
+                            self.app.resolver._ecs_key = _old_scalar["ecs_key"]
+                            if _old_scalar.get("stale_window") is not None:
+                                self.app.resolver.cache.stale_window = _old_scalar["stale_window"]
+                            self.app.resolver._client_bufsize_cap = _old_scalar["bufsize"]
+                            self.app.resolver._prefetch_interval = _old_scalar["prefetch"]
+                    except Exception:
+                        pass
+                    return self._send(500, {
+                        "error": "配置写盘失败（已回滚内存变更）",
+                        "ok": False, "saved_to": False, "ignored_keys": dropped})
+                # R5-2(P3): 标量派生态(_ecs_key/stale_window/bufsize/prefetch)已在上方
+                # cache 对象定型后立即下发, 此处仅处理 save_config 成功后才允许做的
+                # 破坏性/清扫操作:
+                #   (1) ECS key 变化 → 清空缓存(不可回滚, 故延迟到写盘成功后);
+                #   (2) PartitionedCache 分区权重重建;
+                #   (3) 熔断器/0x20/_enc_owner 清理。
+                # 注: refresh_derived_state_after_save 内部仍会幂等重设一次标量(值相同),
+                # 且因 _ecs_key 已是新值, 其内部 ECS 变化判定不会重复 clear。
+                _post_notes = []
+                if _old_ecs is not None and _new_ecs is not None and _new_ecs != _old_ecs:
+                    try:
+                        self.app.resolver.cache.clear()
+                        _post_notes.append("ecs_key 变化(%r→%r), 缓存已清空" % (_old_ecs, _new_ecs))
+                    except Exception as e:
+                        log.warning("ECS 变化后清空缓存失败: %r", e)
+                # refresh_derived_state_after_save 内部因 _ecs_key/_prefetch 已提前下发,
+                # 不会再重复报告这两项; 此处补上 prefetch 变更提示, 保持响应信息完整。
+                if _old_scalar is not None:
+                    try:
+                        _old_pi = _old_scalar.get("prefetch")
+                        _cur_pi = self.app.resolver._prefetch_interval
+                        if _old_pi is not None and abs(_cur_pi - _old_pi) > 1e-6:
+                            _post_notes.append("prefetch_interval %.2f→%.2fs" % (_old_pi, _cur_pi))
+                    except Exception:
+                        pass
+                try:
+                    derived_changed = _post_notes + (
+                        self.app.resolver.refresh_derived_state_after_save(old_cfg) or [])
+                except Exception as e:
+                    log.warning("派生态刷新失败(标量配置仍生效): %r", e)
+                    derived_changed = _post_notes
                 # 逐条规则单独持久化(若前端回传了 rules)
                 if isinstance(data_rules, list):
                     # R2-P1: 直接检查 bool 成功/失败, 空规则写成功=True
                     saved_rules_ok = self._save_local_rules(data_rules)
+                # P2-4(R1): 递增规则代际计数器; 实际 rebuild 移到 app._lock 外执行
+                # (见下方 with 块之后), 避免 10 万规则时持全局锁阻塞所有写 API。
+                # R3 P3-3: 仅当本次确有 rules 回传且写盘成功才递增代际。saved_rules_ok
+                # 默认 True, 旧实现只改 cache_size/ttl 等标量配置也递增 gen, 进而在锁外
+                # 触发全量 rebuild(10 万规则数百 ms 无效 I/O)。无 rules 变更时跳过。
+                if isinstance(data_rules, list) and saved_rules_ok:
+                    self.app._rule_rebuild_gen += 1
                 # R2-P2: 只在所有配置(含规则)落盘后重建一次索引。
                 # 旧实现此处先 rebuild 一次(基于"新配置+旧磁盘规则"混合态),
                 # 然后如果有 rules 再 rebuild 一次 —— 第一次结果立即被第二次覆盖,
                 # 10万条规则时阻塞 API/DNS 路径翻倍。移除第一次冗余 rebuild。
-                # P1-6/P2-13: 用带耗时的辅助方法, 失败时记录 idx_ok/idx_err
                 # P3-4(R4): 规则写盘失败时跳过 rebuild —— 磁盘上仍是旧规则, 从旧文件全量
                 # 重建索引是无意义 I/O(10万规则数百ms 且持 app._lock), 与 import/DELETE/PUT 三处对齐。
-                if saved_rules_ok:
-                    idx_ok, idx_err = self._rebuild_rule_index_timed()
-                else:
-                    idx_ok, idx_err = True, ""
-                # R26 P2-1: 与 DELETE 路径(R25 P3-2)对齐 —— save_config 写盘失败时,
-                # 磁盘仍保留旧上游(被整条删除/端点变更的旧上游仍在 config.json 里)。
-                # 此前 stale_victims 清理循环(含 drop_upstream/_cb.pop 清上游级健康/熔断
-                # 统计、drop_conn/discard 清连接)在锁内先跑, 而 `if saved is False` 的 500
-                # 兜底在锁外才判; save 失败时磁盘保留旧上游、但遥测/熔断统计已被清空, 正是
-                # R25 要消除的"磁盘有上游但统计清零"。故先判 saved is False 返回 500, 确认
-                # 删除/变更落盘后再回收, 不执行任何清理。
-                if saved is False:
-                    return self._send(500, {
-                        "error": "配置写盘失败（运行态已生效，重启后将丢失）",
-                        "ok": False, "saved_to": False, "ignored_keys": dropped})
                 # P2-4: save_config 已成功, 配置变更被确认 —— 此刻才回收被删除/变更
                 # 上游的连接池/QUIC 常驻连接; 整条删除才清 per_upstream/_cb 统计。
                 # P2-2: 同时 pop 连接维度 telemetry.conn_stats(此前漏清, 随编辑上游缓慢泄漏)。
@@ -1756,7 +2085,31 @@ class _Handler(BaseHTTPRequestHandler):
                         self.app.resolver.cache = old_cache
                 except Exception:
                     pass
-            return self._send(500, {"error": "apply config failed: %s" % e})
+                # R6-1(P2): 回滚 R5-2 提前下发的标量派生态(_ecs_key/stale_window/
+                # _client_bufsize_cap/_prefetch_interval), 与 saved is False 分支(上方
+                # 1957-1965)同型。generic exception handler 此前只回滚 cfg/cache 对象,
+                # 派生态残留新值会导致回滚后内存状态不一致(缓存 key 命名空间/stale 窗口/
+                # prefetch 频率与旧 cfg 不符)。
+                try:
+                    if _old_scalar:
+                        self.app.resolver._ecs_key = _old_scalar["ecs_key"]
+                        if _old_scalar.get("stale_window") is not None:
+                            self.app.resolver.cache.stale_window = _old_scalar["stale_window"]
+                        self.app.resolver._client_bufsize_cap = _old_scalar["bufsize"]
+                        self.app.resolver._prefetch_interval = _old_scalar["prefetch"]
+                except Exception:
+                    pass
+            # v1.9.146 P1-2: 不把 str(e)(含异常类型/内部路径)回给调用方, 上方已 log.exception。
+            return self._send(500, {"error": "apply config failed"})
+        # P2-4(R1): 规则索引重建移到 app._lock 外执行。文件写盘(config.json + rules_local.json)
+        # 已在锁内完成, rebuild 读盘不依赖内存锁。用 _rebuild_lock 串行化, 避免 10 万规则时
+        # 持全局锁阻塞所有写 API。gen 计数器跳过冗余 rebuild。
+        # R3 P3-3: 与上方 gen 递增同条件 —— 无 rules 回传时磁盘规则未变, 跳过 rebuild。
+        # (rules 写盘失败也跳过: 磁盘仍是旧规则, 全量重建是无意义 I/O。)
+        if isinstance(data_rules, list) and saved_rules_ok:
+            idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
+        else:
+            idx_ok, idx_err = True, ""
         # 新增上游自动实测延迟: 只测启用且未实测过的上游(新添加的), 后台线程不阻塞响应
         try:
             from . import probe
@@ -1772,20 +2125,36 @@ class _Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_probe, daemon=True, name="newup-probe").start()
         except Exception:
             pass
-        # R26 P2-1: `if saved is False` 500 兜底已上移进锁内、stale_victims 清理循环之前
-        # (见上方 with self.app._lock 内); 此处不再重复判。运行态配置已 deep_merge 生效
-        # (在锁内完成), 不回滚; 仅告知前端写盘失败。能走到这里说明 save 已成功。
+        # R26 P2-1 / P2-1(R1): save_config 写盘失败 500 兜底已上移进锁内、stale_victims
+        # 清理循环之前, 并在失败时回滚内存(见上方 with self.app._lock 内)。能走到这里
+        # 说明 save 已成功、内存与磁盘一致。
         # R2-P1: 逐条规则写盘失败 —— 直接检查 bool, 空规则(清空全部)写成功=True
         if isinstance(data_rules, list) and not saved_rules_ok:
-            return self._send(500, {
-                "error": "规则写盘失败（运行态已生效，重启后将丢失）",
-                "ok": False, "ignored_keys": dropped})
+            _fail_resp = {
+                # R12 P3-1: 写盘失败时代际未递增、rebuild 被短路跳过, 新规则既未落盘也未进
+                # 运行态索引 —— 新规则根本未生效。旧文案"运行态已生效，重启后将丢失"与事实相反,
+                # 会误导运维以为规则在线生效。改为准确文案: 本次规则未生效, 其它配置项已保存。
+                "error": "规则写盘失败，本次规则未生效（其它配置项已保存并生效，请重试规则保存）",
+                "ok": False, "ignored_keys": dropped}
+            if policy_warn:
+                _fail_resp["warning"] = policy_warn
+            return self._send(500, _fail_resp)
         # P1-6: 规则索引重建失败(使用旧索引)
+        # R12 P3-2: 异常细节(str(e))已在 rebuild_rule_index_outside_lock 内 log.warning 落日志,
+        # 此处统一回通用文案, 不再把内部异常透传给已认证管理员, 与全文件"异常细节只进日志"纪律一致。
         if not idx_ok:
-            return self._send(500, {
-                "ok": False, "error": "规则索引重建失败", "detail": idx_err,
-                "ignored_keys": dropped})
-        return self._send(200, {"ok": True, "saved_to": saved, "ignored_keys": dropped})
+            _idx_resp = {
+                "ok": False, "error": "规则索引重建失败（详情见服务端日志）",
+                "ignored_keys": dropped}
+            if policy_warn:
+                _idx_resp["warning"] = policy_warn
+            return self._send(500, _idx_resp)
+        _ok_resp = {"ok": True, "saved_to": saved, "ignored_keys": dropped}
+        if policy_warn:
+            _ok_resp["warning"] = policy_warn
+        if derived_changed:
+            _ok_resp["derived_changed"] = derived_changed
+        return self._send(200, _ok_resp)
 
     def _upstreams_with_health(self):
         cfg = self.app.cfg
@@ -1808,9 +2177,9 @@ class _Handler(BaseHTTPRequestHandler):
         # 单条 PUT 已由 R23 P2-1 原子引用交换保证不触发 dict 扩容 RuntimeError。
         ups_snapshot = list(cfg.get("upstreams", []))
         for u in ups_snapshot:
-            # R22 P3-1: upstream_stat() 持锁返回的是 per_upstream 活字典引用, 此处随后
-            # 在锁外连续读 ok/fail/lat_sum/last 四个字段, 会读到并发 upstream_ok/upstream_fail
-            # 的撕裂中间态(纯展示瞬时撕裂, 无功能影响)。改用 upstream_eff_lat_read():
+            # R22 P3-1: 早期若直接持锁返回 per_upstream 活字典引用, 此处随后在锁外连续读
+            # ok/fail/lat_sum/last 四个字段, 会读到并发 upstream_ok/upstream_fail 的撕裂中间态
+            # (纯展示瞬时撕裂, 无功能影响)。改用 upstream_eff_lat_read():
             # 它在 telemetry._lock 内 dict(st) 拷贝出快照后再返回, 与 resolver 延迟排序的
             # 锁内拷贝收口一致。无统计条目返回 None 时给零值默认, 展示路径不 setdefault
             # (避免在只读展示里向 telemetry 写入空条目)。
@@ -1947,19 +2316,28 @@ class _Handler(BaseHTTPRequestHandler):
                 u["name"] = body.get("name") or _default_upstream_name(cfg["upstreams"])
                 cfg["upstreams"].append(u)
                 saved = config_mod.save_config(cfg, self.app.config_path)
-            # 新上游后台实测延迟并写回
-            try:
-                from . import probe
-                threading.Thread(target=probe.probe_upstream_latencies,
-                                 args=(cfg, self.app.config_path),
-                                 kwargs={"force": False, "tag": "新增测速",
-                                         "app_ctx": self.app},
-                                 daemon=True, name="newup-probe").start()
-            except Exception:
-                pass
-            # P1-4: 写盘失败返回 500(运行态已生效, 但重启后丢失)
+                # v1.9.146 P2-6: 写盘失败立即在锁内回滚内存 append, 与 bulk 路径
+                # (old_cfg 还原)同型——否则内存已加该上游而磁盘没有, 连续写操作会让
+                # 内存/磁盘漂移越拉越大, 重启后丢失。
+                if saved is False:
+                    try:
+                        cfg["upstreams"].remove(u)
+                    except ValueError:
+                        pass
+            # 新上游后台实测延迟并写回(仅写盘成功才探针)
+            if saved is not False:
+                try:
+                    from . import probe
+                    threading.Thread(target=probe.probe_upstream_latencies,
+                                     args=(cfg, self.app.config_path),
+                                     kwargs={"force": False, "tag": "新增测速",
+                                             "app_ctx": self.app},
+                                     daemon=True, name="newup-probe").start()
+                except Exception:
+                    pass
+            # P1-4: 写盘失败返回 500(已回滚内存, 与磁盘一致)
             if saved is False:
-                return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+                return self._send(500, {"error": "配置写盘失败（已回滚内存变更）", "ok": False})
             return self._send(200, {"ok": True, "upstream": u, "auto_parsed": True})
         proto = str(body.get("proto") or "udp").lower()
         _default_port = {"udp": 53, "tcp": 53, "doh": 443, "dot": 853, "doq": 853, "doh3": 443}
@@ -2022,19 +2400,26 @@ class _Handler(BaseHTTPRequestHandler):
             u["name"] = body.get("name") or _default_upstream_name(cfg["upstreams"])
             cfg["upstreams"].append(u)
             saved = config_mod.save_config(cfg, self.app.config_path)
-        # 新上游后台实测延迟并写回
-        try:
-            from . import probe
-            threading.Thread(target=probe.probe_upstream_latencies,
-                             args=(cfg, self.app.config_path),
-                             kwargs={"force": False, "tag": "新增测速",
-                                     "app_ctx": self.app},
-                             daemon=True, name="newup-probe").start()
-        except Exception:
-            pass
-        # P1-4: 写盘失败返回 500(运行态已生效, 但重启后丢失)
+            # v1.9.146 P2-6: 写盘失败锁内回滚内存 append(与自动识别分支同型)。
+            if saved is False:
+                try:
+                    cfg["upstreams"].remove(u)
+                except ValueError:
+                    pass
+        # 新上游后台实测延迟并写回(仅写盘成功才探针)
+        if saved is not False:
+            try:
+                from . import probe
+                threading.Thread(target=probe.probe_upstream_latencies,
+                                 args=(cfg, self.app.config_path),
+                                 kwargs={"force": False, "tag": "新增测速",
+                                         "app_ctx": self.app},
+                                 daemon=True, name="newup-probe").start()
+            except Exception:
+                pass
+        # P1-4: 写盘失败返回 500(已回滚内存, 与磁盘一致)
         if saved is False:
-            return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+            return self._send(500, {"error": "配置写盘失败（已回滚内存变更）", "ok": False})
         return self._send(200, {"ok": True, "upstream": u})
 
     def _api_upstream_op(self, up_id):
@@ -2065,9 +2450,15 @@ class _Handler(BaseHTTPRequestHandler):
                 # 磁盘仍保留该上游, 重启后从磁盘恢复; 此前若已 drop_upstream/discard
                 # 连接, 重启后历史遥测统计与连接对象丢失, 造成"磁盘有上游但统计清零"。
                 # 故先判 saved is False 返回 500, 确认删除落盘后再回收。
-                # P1-4: 写盘失败返回 500(运行态已生效, 但重启后丢失)
+                # P1-4: 写盘失败返回 500
                 if saved is False:
-                    return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+                    # v1.9.146 P2-6: 写盘失败锁内把已 pop 的上游插回原位, 与磁盘一致
+                    # (磁盘仍保留该上游)。此前只回 500 但内存已 pop, 连续写操作会漂移。
+                    try:
+                        ups.insert(idx, removed)
+                    except Exception:
+                        pass
+                    return self._send(500, {"error": "配置写盘失败（已回滚内存变更）", "ok": False})
                 # 同步清理该上游的遥测统计 + DoH/DoT 连接池 + QUIC 常驻连接
                 # (防 per_upstream/_pool 残留已删除上游的统计与连接对象/线程)
                 # v1.9.86: 改用持锁 drop_upstream(与 drop_conn 对称), 不再裸 pop
@@ -2199,9 +2590,15 @@ class _Handler(BaseHTTPRequestHandler):
             # 落盘确认之后; 否则 save 失败而旧端点 conn_stats/连接已被回收, 重启后从磁盘
             # 恢复旧端点时连接池为空。影响面小(只清 conn_stats/连接, 不丢上游级
             # per_upstream/_cb 历史统计), 但为一致性先判 saved is False 返回 500 再回收。
-            # P1-4: 写盘失败返回 500(运行态已生效, 但重启后丢失)
+            # P1-4: 写盘失败返回 500
             if saved is False:
-                return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+                # v1.9.146 P2-6: 写盘失败锁内把 ups[idx] 还原为 old_up 快照, 与磁盘
+                # 一致(磁盘仍是旧端点)。此前只回 500 但内存已是 new_up。
+                try:
+                    ups[idx] = old_up
+                except Exception:
+                    pass
+                return self._send(500, {"error": "配置写盘失败（已回滚内存变更）", "ok": False})
             # R15 P2: 端点变更(同 id)只回收旧端点的连接池/conn_stats/QUIC, 保留
             # per_upstream/_cb(上游仍在, 累积健康/熔断统计不丢)。与 reload 端点变更
             # 分支、bulk PUT stale_victims、DELETE 三处已确立的纪律对齐。
@@ -2263,6 +2660,7 @@ class _Handler(BaseHTTPRequestHandler):
         wildcard = _as_bool(body.get("wildcard", True), True)
         # 读改写全程持 app._lock: 并发导入/加规则时, 两线程同时读到旧规则集
         # 各自 append 后落盘会互相覆盖静默丢规则(与上游 CRUD 加锁范式对齐)。
+        rebuild_needed = False
         with self.app._lock:
             rules = self._local_rules()
             existing = {r.get("match") for r in rules}
@@ -2283,20 +2681,26 @@ class _Handler(BaseHTTPRequestHandler):
                 existing.add(m)
                 added += 1
             saved_rules_ok = True
-            idx_ok, idx_err = True, ""
             if added:
                 # R2-P1: 直接检查 bool 成功/失败
                 saved_rules_ok = self._save_local_rules(rules)
-                # P3-1(R3): 写盘失败时跳过 rebuild(从磁盘重载旧索引是无意义 I/O)
-                if saved_rules_ok:
-                    idx_ok, idx_err = self._rebuild_rule_index_timed()
-                else:
-                    idx_ok, idx_err = True, ""
-            if added and not saved_rules_ok:
-                return self._send(500, {"error": "规则写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+                if not saved_rules_ok:
+                    # v1.9.146 P2-6: 写盘失败锁内回滚本次 append 的 added 条规则(磁盘仍为
+                    # 旧规则集)。del rules[-added:] 精确移除本轮新增, 与磁盘一致。
+                    try:
+                        del rules[-added:]
+                    except Exception:
+                        pass
+                    return self._send(500, {"error": "规则写盘失败（已回滚内存变更）", "ok": False})
+                # P2-4(R1): 递增代际, rebuild 移到锁外
+                rebuild_needed = True
+                self.app._rule_rebuild_gen += 1
+        # P2-4(R1): rebuild 在 app._lock 外执行
+        if rebuild_needed:
+            idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
             if not idx_ok:
-                return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
-            return self._send(200, {"added": added, "total": len(rules)})
+                return self._send(500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"})
+        return self._send(200, {"added": added, "total": len(rules)})
 
     def _do_subscribe_download(self, url, action, group, ip):
         """P2-11: 订阅下载公共逻辑(供 _api_subscribe_rules_body 与 _api_subscribe_rules 复用)。
@@ -2309,8 +2713,15 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             with _SUBSCRIBE_SEM:
                 text = self._fetch_sub_text(url)
-        except Exception as e:
-            return 400, {"error": "订阅下载失败: %s" % e}
+        except ValueError as e:
+            # v1.9.146 P1-2: fetch_subscription_text 主动抛出的策略性拒绝
+            # (仅 https:// / SSRF 拦截 / 16MB 上限)均为常量文案, 不含服务器路径/
+            # 内网 IP, 可安全透出给调用方说明被拒原因; 其它异常(网络/socket/磁盘)
+            # 含内部细节, 只记日志并回通用文案。
+            return 400, {"error": str(e)}
+        except Exception:
+            log.exception("订阅下载失败: %s", url)
+            return 400, {"error": "订阅下载失败"}
         domains = _parse_domain_list(text)
         if not domains:
             return 400, {"error": "订阅内容未解析到有效域名"}
@@ -2321,6 +2732,10 @@ class _Handler(BaseHTTPRequestHandler):
         with self.app._lock:
             cfg = self.app.cfg   # 进锁后重新取最新引用
             subs = self._load_subs()
+            # P2-3(R1): 保存旧 subs 深拷贝, 供 config 写盘失败时回滚 rules_sub.json。
+            # 否则 rules_sub.json 已含新订阅明细但 config.json 元信息仍是旧值, 重启后
+            # _load_subs 从 config 元信息回填空 action/group, 与文件明细不一致。
+            old_subs = copy.deepcopy(subs)
             existed = False
             for s in subs:
                 if s.get("url") == url:
@@ -2334,10 +2749,15 @@ class _Handler(BaseHTTPRequestHandler):
                              "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "rules": items})
             ok, err = self._save_subs(subs)
             if not ok:
-                return 500, {"error": "保存订阅文件失败: %s" % err}
+                # v1.9.146 P1-2: err 含绝对路径与 OSError 详情, 不回显; _save_subs 已记日志。
+                log.warning("保存订阅文件失败(已回通用文案): %s", err)
+                return 500, {"error": "保存订阅文件失败"}
             meta = cfg.setdefault("rule_subscriptions", [])
+            # P2-3(R1): 备份旧 meta 条目(或 None=新增), 供 config 写盘失败时回滚内存 cfg。
+            old_meta_entry = None
             for m in meta:
                 if m.get("url") == url:
+                    old_meta_entry = dict(m)
                     m.update({"action": action, "group": group, "ip": ip, "count": len(items),
                               "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
                     break
@@ -2347,11 +2767,42 @@ class _Handler(BaseHTTPRequestHandler):
             # P1-4: 检查配置写盘返回值
             saved = config_mod.save_config(cfg, self.app.config_path)
             if saved is False:
-                return 500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False}
-            # P1-6/P2-13: 带耗时的索引重建
-            idx_ok, idx_err = self._rebuild_rule_index_timed()
+                # P2-3(R1): config.json 写盘失败时回滚 rules_sub.json 到旧内容, 并还原
+                # 内存 cfg 元信息, 避免明细/元信息错位。
+                # R3 P2-3: 回滚写盘返回值此前被忽略 —— 磁盘满/只读时回滚本身失败,
+                # rules_sub.json 保留新明细而 config.json 元信息已回滚, 重启后
+                # _load_subs 读到新明细但元信息为旧值, 明细/元信息错位。检查返回值,
+                # 失败升级 ERROR 并在响应追加 warning 提示运维人工核对。
+                _rb_warn = None
+                try:
+                    _rb_ok, _rb_err = self._save_subs(old_subs)
+                    if not _rb_ok:
+                        _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
+                                    "的一致性(详情见服务端日志)")
+                        log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
+                except Exception as e:
+                    _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
+                    log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
+                if existed and old_meta_entry is not None:
+                    for i, m in enumerate(meta):
+                        if m.get("url") == url:
+                            meta[i] = old_meta_entry
+                            break
+                else:
+                    cfg["rule_subscriptions"] = [m for m in meta if m.get("url") != url]
+                _rb_resp = {"ok": False}
+                if _rb_warn:
+                    _rb_resp["error"] = "配置写盘失败，且回滚 rules_sub.json 也失败，请人工核对 rules_sub.json 与 config.json 的一致性"
+                    _rb_resp["warning"] = _rb_warn
+                else:
+                    _rb_resp["error"] = "配置写盘失败（已回滚订阅明细）"
+                return 500, _rb_resp
+            # P2-4(R1): 递增代际, rebuild 移到锁外执行
+            self.app._rule_rebuild_gen += 1
+        # P2-4(R1): 规则索引重建在 app._lock 外执行
+        idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
         if not idx_ok:
-            return 500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err}
+            return 500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"}
         return 200, {"ok": True, "url": url, "count": len(items), "added": 0 if existed else 1}
 
     def _api_subscribe_rules_body(self, body):
@@ -2440,19 +2891,22 @@ class _Handler(BaseHTTPRequestHandler):
             rules.append(r)
             # R2-P1: 直接检查 bool 成功/失败
             saved_rules_ok = self._save_local_rules(rules)
-            # P1-6/P2-13: 带耗时的索引重建, 失败返回 500
-            # P3-4(R4): 规则写盘失败时跳过 rebuild —— 磁盘上仍是旧规则(未含本次新增),
-            # 从旧文件全量重建索引无意义且持锁数百ms, 与 import/DELETE/PUT/update_config 对齐。
-            if saved_rules_ok:
-                idx_ok, idx_err = self._rebuild_rule_index_timed()
+            if not saved_rules_ok:
+                # v1.9.146 P2-6: 写盘失败锁内 pop 掉刚 append 的 r, 与磁盘一致。
+                try:
+                    rules.pop()
+                except Exception:
+                    pass
             else:
-                idx_ok, idx_err = True, ""
+                # P2-4(R1): 递增代际, rebuild 移到锁外
+                self.app._rule_rebuild_gen += 1
         # R2-P1: 规则写盘失败
         if not saved_rules_ok:
-            return self._send(500, {"error": "规则写盘失败（运行态已生效，重启后将丢失）", "ok": False})
-        # P1-6: 索引重建失败
+            return self._send(500, {"error": "规则写盘失败（已回滚内存变更）", "ok": False})
+        # P2-4(R1): rebuild 在 app._lock 外执行
+        idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
         if not idx_ok:
-            return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
+            return self._send(500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"})
         return self._send(200, {"ok": True, "rule": r})
 
     # ---- 逐条规则(独立文件 rules_local.json, 不写入 config.json) ----
@@ -2481,7 +2935,11 @@ class _Handler(BaseHTTPRequestHandler):
             # P3-4(第八轮)注释勘误: 此前注释称"迁移写盘失败时静默", 与实际不符——
             # 下方 config_mod.save_local_rules 内部失败时仍会 logging.warning(见 config.py),
             # 本 wrapper 只是不再叠加第二层告警(避免同一文件连打两条 WARNING)。
-            self._save_local_rules(rules)
+            # R3 P3-4: 返回值此前被忽略。补 id 后磁盘未更新不构成数据丢失——下次写操作
+            # 会重写自愈, 重启后 _local_rules 也会按 rmig%d 确定性补回相同 id; 但仍记
+            # 一笔 debug, 便于排查"为何 rules_local.json 缺 id"类现场。
+            if not self._save_local_rules(rules):
+                log.debug("惰性补 id 写盘 rules_local.json 失败(后续写操作/重启会自愈)")
         return rules
 
     def _save_local_rules(self, rules):
@@ -2539,6 +2997,18 @@ class _Handler(BaseHTTPRequestHandler):
                 # save 非热路径, 不影响 QPS。
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            # R5-3(P3): 与 config.save_config(config.py:835-843)同型, rename 后对父目录
+            # fsync, 确保目录项(rules_sub.json 新名字)本身落盘。此前只 fsync 文件内容,
+            # 掉电场景下文件内容已写但目录项未刷出, rules_sub.json 可能表现为"丢失"。
+            # save 非热路径, 多一次 fsync 可忽略; tmpfs/网络盘不支持目录 fsync 时静默降级。
+            try:
+                _dd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(_dd)
+                finally:
+                    os.close(_dd)
+            except OSError:
+                pass
             return True, ""
         except Exception as e:
             # R37 P3-1: 原子写失败(如 os.replace 跨设备/只读/磁盘满)时清理残留 .tmp,
@@ -2621,8 +3091,13 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             with _SUBSCRIBE_SEM:
                 text = self._fetch_sub_text(url)
-        except Exception as e:
-            return self._send(400, {"error": "订阅更新失败: %s" % e})
+        except ValueError as e:
+            # v1.9.146 P1-2: 策略性拒绝(仅 https/SSRF/上限)为安全常量文案, 透出;
+            # 其它异常含内部网络/socket 细节, 只记日志回通用文案。
+            return self._send(400, {"error": str(e)})
+        except Exception:
+            log.exception("订阅更新下载失败: %s", url)
+            return self._send(400, {"error": "订阅更新失败"})
         domains = _parse_domain_list(text)
         if not domains:
             return self._send(400, {"error": "订阅内容未解析到有效域名"})
@@ -2632,26 +3107,57 @@ class _Handler(BaseHTTPRequestHandler):
             target = next((s for s in subs if s.get("url") == url), None)
             if not target:
                 return self._send(404, {"error": "订阅不存在: %s" % url})
+            # P2-3(R1): 备份旧 subs 与旧 meta 条目, 供 config 写盘失败时回滚
+            old_subs = copy.deepcopy(subs)
             # #3 订阅刷新同样保护 re: 规则不被加通配前缀
             target["rules"] = [{"match": ("*." + d if not d.startswith(("*.", "re:")) else d)} for d in domains]
             target["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             ok, err = self._save_subs(subs)
             if not ok:
-                return self._send(500, {"error": "保存订阅文件失败: %s" % err})
+                # v1.9.146 P1-2: err 含绝对路径/OSError, 不回显; _save_subs 已记日志。
+                log.warning("保存订阅文件失败(已回通用文案): %s", err)
+                return self._send(500, {"error": "保存订阅文件失败"})
             cfg = self.app.cfg
+            old_meta_entry = None
             for m in cfg.setdefault("rule_subscriptions", []):
                 if m.get("url") == url:
+                    old_meta_entry = dict(m)
                     m["count"] = len(domains)
                     m["updated_at"] = target["updated_at"]
                     break
             # P1-4: 检查配置写盘返回值
             saved = config_mod.save_config(cfg, self.app.config_path)
             if saved is False:
-                return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
-            # P1-6/P2-13: 带耗时的索引重建
-            idx_ok, idx_err = self._rebuild_rule_index_timed()
+                # P2-3(R1): 回滚 rules_sub.json 与内存 cfg 元信息
+                # R3 P2-3: 检查回滚写盘返回值, 失败升级 ERROR 并随响应 warning 透出。
+                _rb_warn = None
+                try:
+                    _rb_ok, _rb_err = self._save_subs(old_subs)
+                    if not _rb_ok:
+                        _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
+                                    "的一致性(详情见服务端日志)")
+                        log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
+                except Exception as e:
+                    _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
+                    log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
+                if old_meta_entry is not None:
+                    for i, m in enumerate(cfg["rule_subscriptions"]):
+                        if m.get("url") == url:
+                            cfg["rule_subscriptions"][i] = old_meta_entry
+                            break
+                _rb_resp = {"ok": False}
+                if _rb_warn:
+                    _rb_resp["error"] = "配置写盘失败，且回滚 rules_sub.json 也失败，请人工核对 rules_sub.json 与 config.json 的一致性"
+                    _rb_resp["warning"] = _rb_warn
+                else:
+                    _rb_resp["error"] = "配置写盘失败（已回滚订阅明细）"
+                return self._send(500, _rb_resp)
+            # P2-4(R1): 递增代际, rebuild 移到锁外
+            self.app._rule_rebuild_gen += 1
+        # P2-4(R1): rebuild 在 app._lock 外执行
+        idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
         if not idx_ok:
-            return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
+            return self._send(500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"})
         return self._send(200, {"ok": True, "url": url, "count": len(domains)})
 
     def _api_subscribe_delete(self, query):
@@ -2666,22 +3172,48 @@ class _Handler(BaseHTTPRequestHandler):
         with self.app._lock:
             subs = self._load_subs()
             n = len(subs)
+            # P2-3(R1): 备份旧 subs 与旧 meta, 供 config 写盘失败时回滚
+            old_subs = copy.deepcopy(subs)
+            cfg = self.app.cfg
+            old_meta = copy.deepcopy(cfg.get("rule_subscriptions", []))
             subs = [s for s in subs if s.get("url") != url]
             if len(subs) == n:
                 return self._send(404, {"error": "订阅不存在: %s" % url})
             ok, err = self._save_subs(subs)
             if not ok:
-                return self._send(500, {"error": "保存订阅文件失败: %s" % err})
-            cfg = self.app.cfg
+                # v1.9.146 P1-2: err 含绝对路径/OSError, 不回显; _save_subs 已记日志。
+                log.warning("保存订阅文件失败(已回通用文案): %s", err)
+                return self._send(500, {"error": "保存订阅文件失败"})
             cfg["rule_subscriptions"] = [m for m in cfg.get("rule_subscriptions", []) if m.get("url") != url]
             # P1-4: 检查配置写盘返回值
             saved = config_mod.save_config(cfg, self.app.config_path)
             if saved is False:
-                return self._send(500, {"error": "配置写盘失败（运行态已生效，重启后将丢失）", "ok": False})
-            # P1-6/P2-13: 带耗时的索引重建
-            idx_ok, idx_err = self._rebuild_rule_index_timed()
+                # P2-3(R1): 回滚 rules_sub.json 与内存 cfg 元信息
+                # R3 P2-3: 检查回滚写盘返回值, 失败升级 ERROR 并随响应 warning 透出。
+                _rb_warn = None
+                try:
+                    _rb_ok, _rb_err = self._save_subs(old_subs)
+                    if not _rb_ok:
+                        _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
+                                    "的一致性(详情见服务端日志)")
+                        log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
+                except Exception as e:
+                    _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
+                    log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
+                cfg["rule_subscriptions"] = old_meta
+                _rb_resp = {"ok": False}
+                if _rb_warn:
+                    _rb_resp["error"] = "配置写盘失败，且回滚 rules_sub.json 也失败，请人工核对 rules_sub.json 与 config.json 的一致性"
+                    _rb_resp["warning"] = _rb_warn
+                else:
+                    _rb_resp["error"] = "配置写盘失败（已回滚订阅明细）"
+                return self._send(500, _rb_resp)
+            # P2-4(R1): 递增代际, rebuild 移到锁外
+            self.app._rule_rebuild_gen += 1
+        # P2-4(R1): rebuild 在 app._lock 外执行
+        idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
         if not idx_ok:
-            return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
+            return self._send(500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"})
         return self._send(200, {"ok": True, "url": url})
 
     def _api_rule_op(self, rid):
@@ -2697,6 +3229,8 @@ class _Handler(BaseHTTPRequestHandler):
             body = {}
         # 读改写全程持 app._lock: 与 add/import 串行化, 防并发改删规则基于陈旧快照
         # 互相覆盖(同上游 CRUD)。
+        rebuild_needed = False
+        _deleted_rule = None
         with self.app._lock:
             rules = self._local_rules()
             # P0-2: 用 .get("id") 防御——_local_rules 已为迁移规则补 id,
@@ -2705,102 +3239,121 @@ class _Handler(BaseHTTPRequestHandler):
             if idx is None:
                 return self._send(404, {"error": "rule not found"})
             if self.command == "DELETE":
-                rules.pop(idx)
+                popped = rules.pop(idx)
                 # R2-P1: 直接检查 bool 成功/失败(删除后可能为空列表)
                 saved_rules_ok = self._save_local_rules(rules)
-                # P3-1(R3): 写盘失败时跳过 rebuild(从磁盘重载旧索引是无意义 I/O)
-                if saved_rules_ok:
-                    idx_ok, idx_err = self._rebuild_rule_index_timed()
-                else:
-                    idx_ok, idx_err = True, ""
                 if not saved_rules_ok:
-                    return self._send(500, {"error": "规则写盘失败（运行态已生效，重启后将丢失）", "ok": False})
-                if not idx_ok:
-                    return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
-                return self._send(200, {"ok": True})
-            # P3: 字段白名单(与上游 PUT 硬化对齐), 禁止把任意键灌进 rules_local.json;
-            # ttl_min/ttl_max 归一为非负整数; match 不允许清空。
-            _RULE_WHITELIST = {"match", "action", "group", "ip", "ttl_min", "ttl_max"}
-            # P2-1: 先完整校验+归一化(只算到局部 updates/to_pop, 不碰 rules[idx]),
-            # 全部通过后再统一写回 + _save_local_rules。避免边写边校在第 N 个字段非法
-            # 时已 pop/改了前 N-1 个字段, 造成内存 rules 与磁盘分叉。
-            updates = {}
-            to_pop = set()
-            for k, v in body.items():
-                # P2-12: 与上游 PUT 对齐——body 含 id 字段直接 400, 不再静默忽略。
-                if k == "id":
-                    return self._send(400, {"error": "不允许修改规则 id"})
-                if k not in _RULE_WHITELIST:
-                    return self._send(400, {"error": "非法规则字段: %s (允许: %s)" % (
-                        k, ",".join(sorted(_RULE_WHITELIST)))})
-                if v is None:
-                    # R16 P3-2: match 是规则必填键, 不允许以 null 移除/清空——此前
-                    # 通用 null→to_pop 分支让 match:null 绕过下方"match 不能为空"校验,
-                    # 最终 merged 缺 match 键落库成死规则。其余字段(ttl_min/ttl_max 等)
-                    # null 语义仍是移除该字段, 保持原行为。
-                    if k == "match":
-                        return self._send(400, {"error": "match 不能为空"})
-                    # null 语义 = 移除该字段(如规则 ttl_min/ttl_max 留空), 避免 config 残留 null
-                    to_pop.add(k)
-                    continue
-                # R17 P3-2: match 必须为 str 类型——此前用 str(v).strip() 把 int 123
-                # 转成 "123" 穿透校验, 落成 int 死规则(后续字符串匹配永不命中)。
-                # 与 bulk _validate_rule_dict 的 match 类型校验对齐。
-                if k == "match" and not isinstance(v, str):
-                    return self._send(400, {"error": "match 必须是字符串"})
-                if k in ("ttl_min", "ttl_max"):
-                    # P2-17: bool 是 int 子类, int(True)==1 会穿透到合法值。
-                    # 显式拒绝布尔, 与上游 weight/latency 的 bool 校验对齐。
-                    if isinstance(v, bool):
-                        return self._send(400, {"error": "%s 必须是非负整数，不能是布尔值" % k})
+                    # v1.9.146 P2-6: 写盘失败锁内把 popped 插回原位, 与磁盘一致
+                    # (磁盘仍是含该规则的旧文件)。
                     try:
-                        v = max(0, int(v))
-                    except (TypeError, ValueError):
-                        return self._send(400, {"error": "%s 必须是非负整数" % k})
-                if k == "match" and not str(v).strip():
-                    return self._send(400, {"error": "match 不能为空"})
-                # v7 P3-2: match 字段长度上限 4096 字节, 防止超大正则/字符串落库膨胀索引
-                if k == "match" and len(str(v).encode("utf-8")) > 4096:
-                    return self._send(400, {"error": "match 字段过长 (上限 4096 字节)"})
-                # action 枚举校验(与 resolver 分流逻辑一致): 未知 action 静默落库
-                # 后既不分流也不报错, 与上游 PUT 的 proto 枚举硬化对齐。
-                if k == "action" and v not in _RULE_ACTIONS:
-                    return self._send(400, {"error": "非法 action: %r (允许: %s)" % (
-                        v, "/".join(_RULE_ACTIONS))})
-                updates[k] = v
-            # F2: 应用前按合并后的最终规则态校验(action 枚举 + forceIp 时 ip 格式),
-            # 覆盖"只改 ip"或"只把 action 改成 forceIp"的部分更新场景。
-            merged = {k: v for k, v in rules[idx].items() if k not in to_pop}
-            merged.update(updates)
-            verr = _validate_rule_dict(merged)
-            if verr:
-                return self._send(400, {"error": verr})
-            # P3-5(R4-F5): 非法正则编译失败静默落库。match 以 re: 开头时预编译正则,
-            # 编译失败直接 400, 避免落库一条永不命中且报错难以定位的死规则。
-            # R28 P2-1: 抽取为 _check_rule_regex 公共函数, 与单条 POST/bulk 路径共用。
-            _merr = _check_rule_regex(merged.get("match", ""))
-            if _merr:
-                return self._send(400, {"error": _merr})
-            # P3-6(R4-F6): ttl_min > ttl_max 无校验。两者都提供时检查顺序, 非法直接 400。
-            _tmin = merged.get("ttl_min")
-            _tmax = merged.get("ttl_max")
-            if _tmin is not None and _tmax is not None and _tmin > _tmax:
-                return self._send(400, {"error": "ttl_min 不能大于 ttl_max"})
-            for k in to_pop:
-                rules[idx].pop(k, None)
-            rules[idx].update(updates)
-            # R2-P1: 直接检查 bool 成功/失败
-            saved_rules_ok = self._save_local_rules(rules)
-            # P3-1(R3): 写盘失败时跳过 rebuild(从磁盘重载旧索引是无意义 I/O)
-            if saved_rules_ok:
-                idx_ok, idx_err = self._rebuild_rule_index_timed()
+                        rules.insert(idx, popped)
+                    except Exception:
+                        pass
+                    return self._send(500, {"error": "规则写盘失败（已回滚内存变更）", "ok": False})
+                # P2-4(R1): 递增代际, rebuild 移到锁外
+                rebuild_needed = True
+                self.app._rule_rebuild_gen += 1
+                # R9-P2: DELETE 不在锁内 return(否则跳过 with 外的 rebuild 块,
+                # 运行态规则索引残留被删规则)。存 _deleted_rule, 汇到 with 外
+                # 公共 rebuild 块后再发响应。
+                _deleted_rule = popped
             else:
-                idx_ok, idx_err = True, ""
-            if not saved_rules_ok:
-                return self._send(500, {"error": "规则写盘失败（运行态已生效，重启后将丢失）", "ok": False})
+                # P3: 字段白名单(与上游 PUT 硬化对齐), 禁止把任意键灌进 rules_local.json;
+                # ttl_min/ttl_max 归一为非负整数; match 不允许清空。
+                _RULE_WHITELIST = {"match", "action", "group", "ip", "ttl_min", "ttl_max"}
+                # P2-1: 先完整校验+归一化(只算到局部 updates/to_pop, 不碰 rules[idx]),
+                # 全部通过后再统一写回 + _save_local_rules。避免边写边校在第 N 个字段非法
+                # 时已 pop/改了前 N-1 个字段, 造成内存 rules 与磁盘分叉。
+                updates = {}
+                to_pop = set()
+                for k, v in body.items():
+                    # P2-12: 与上游 PUT 对齐——body 含 id 字段直接 400, 不再静默忽略。
+                    if k == "id":
+                        return self._send(400, {"error": "不允许修改规则 id"})
+                    if k not in _RULE_WHITELIST:
+                        return self._send(400, {"error": "非法规则字段: %s (允许: %s)" % (
+                            k, ",".join(sorted(_RULE_WHITELIST)))})
+                    if v is None:
+                        # R16 P3-2: match 是规则必填键, 不允许以 null 移除/清空——此前
+                        # 通用 null→to_pop 分支让 match:null 绕过下方"match 不能为空"校验,
+                        # 最终 merged 缺 match 键落库成死规则。其余字段(ttl_min/ttl_max 等)
+                        # null 语义仍是移除该字段, 保持原行为。
+                        if k == "match":
+                            return self._send(400, {"error": "match 不能为空"})
+                        # null 语义 = 移除该字段(如规则 ttl_min/ttl_max 留空), 避免 config 残留 null
+                        to_pop.add(k)
+                        continue
+                    # R17 P3-2: match 必须为 str 类型——此前用 str(v).strip() 把 int 123
+                    # 转成 "123" 穿透校验, 落成 int 死规则(后续字符串匹配永不命中)。
+                    # 与 bulk _validate_rule_dict 的 match 类型校验对齐。
+                    if k == "match" and not isinstance(v, str):
+                        return self._send(400, {"error": "match 必须是字符串"})
+                    if k in ("ttl_min", "ttl_max"):
+                        # P2-17: bool 是 int 子类, int(True)==1 会穿透到合法值。
+                        # 显式拒绝布尔, 与上游 weight/latency 的 bool 校验对齐。
+                        if isinstance(v, bool):
+                            return self._send(400, {"error": "%s 必须是非负整数，不能是布尔值" % k})
+                        try:
+                            v = max(0, int(v))
+                        except (TypeError, ValueError):
+                            return self._send(400, {"error": "%s 必须是非负整数" % k})
+                    if k == "match" and not str(v).strip():
+                        return self._send(400, {"error": "match 不能为空"})
+                    # v7 P3-2: match 字段长度上限 4096 字节, 防止超大正则/字符串落库膨胀索引
+                    if k == "match" and len(str(v).encode("utf-8")) > 4096:
+                        return self._send(400, {"error": "match 字段过长 (上限 4096 字节)"})
+                    # action 枚举校验(与 resolver 分流逻辑一致): 未知 action 静默落库
+                    # 后既不分流也不报错, 与上游 PUT 的 proto 枚举硬化对齐。
+                    if k == "action" and v not in _RULE_ACTIONS:
+                        return self._send(400, {"error": "非法 action: %r (允许: %s)" % (
+                            v, "/".join(_RULE_ACTIONS))})
+                    updates[k] = v
+                # F2: 应用前按合并后的最终规则态校验(action 枚举 + forceIp 时 ip 格式),
+                # 覆盖"只改 ip"或"只把 action 改成 forceIp"的部分更新场景。
+                merged = {k: v for k, v in rules[idx].items() if k not in to_pop}
+                merged.update(updates)
+                verr = _validate_rule_dict(merged)
+                if verr:
+                    return self._send(400, {"error": verr})
+                # P3-5(R4-F5): 非法正则编译失败静默落库。match 以 re: 开头时预编译正则,
+                # 编译失败直接 400, 避免落库一条永不命中且报错难以定位的死规则。
+                # R28 P2-1: 抽取为 _check_rule_regex 公共函数, 与单条 POST/bulk 路径共用。
+                _merr = _check_rule_regex(merged.get("match", ""))
+                if _merr:
+                    return self._send(400, {"error": _merr})
+                # P3-6(R4-F6): ttl_min > ttl_max 无校验。两者都提供时检查顺序, 非法直接 400。
+                _tmin = merged.get("ttl_min")
+                _tmax = merged.get("ttl_max")
+                if _tmin is not None and _tmax is not None and _tmin > _tmax:
+                    return self._send(400, {"error": "ttl_min 不能大于 ttl_max"})
+                # v1.9.146 P2-6: 变更前快照整份旧规则 dict, 写盘失败时整体还原(磁盘仍为
+                # 旧规则), 与上游 PUT 的 old_up 回滚同型。
+                old_rule = dict(rules[idx])
+                for k in to_pop:
+                    rules[idx].pop(k, None)
+                rules[idx].update(updates)
+                # R2-P1: 直接检查 bool 成功/失败
+                saved_rules_ok = self._save_local_rules(rules)
+                if not saved_rules_ok:
+                    # v1.9.146 P2-6: 写盘失败锁内还原旧规则 dict。
+                    try:
+                        rules[idx] = old_rule
+                    except Exception:
+                        pass
+                    return self._send(500, {"error": "规则写盘失败（已回滚内存变更）", "ok": False})
+                # P2-4(R1): 递增代际, rebuild 移到锁外
+                rebuild_needed = True
+                self.app._rule_rebuild_gen += 1
+        # P2-4(R1): rebuild 在 app._lock 外执行
+        if rebuild_needed:
+            idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
             if not idx_ok:
-                return self._send(500, {"ok": False, "error": "规则索引重建失败", "detail": idx_err})
-            return self._send(200, {"ok": True, "rule": rules[idx]})
+                return self._send(500, {"ok": False, "error": "规则索引重建失败（详情见服务端日志）"})
+        # R9-P2: DELETE/PUT 汇到公共 rebuild 块后分发响应——DELETE 返回被删规则,
+        # PUT 返回更新后规则。rebuild 失败统一在上方 500 返回。
+        if _deleted_rule is not None:
+            return self._send(200, {"ok": True, "rule": _deleted_rule})
+        return self._send(200, {"ok": True, "rule": rules[idx]})
 
     def _logs(self, query):
         """实时查询日志接口, 支持过滤参数:
@@ -2946,19 +3499,75 @@ class _Handler(BaseHTTPRequestHandler):
             "# HELP ebpdns_uptime_seconds 运行秒数",
             "# TYPE ebpdns_uptime_seconds gauge",
             "ebpdns_uptime_seconds %d" % int(time.time() - tel.boot_time),
-            "# HELP ebpdns_rule_hits 规则命中统计",
-            "# TYPE ebpdns_rule_hits gauge",
+            # v1.9.146 P2-1: 此前 counters 中已采集但未导出的运维关键计数器补齐,
+            # 供 Prometheus 告警流量字节数/内核直通/IPv4 回退/rebind 拦截。
+            "# HELP ebpdns_bytes_in_total 入站 DNS 字节数",
+            "# TYPE ebpdns_bytes_in_total counter",
+            "ebpdns_bytes_in_total %d" % c.get("bytes_in", 0),
+            "# HELP ebpdns_bytes_out_total 出站 DNS 字节数",
+            "# TYPE ebpdns_bytes_out_total counter",
+            "ebpdns_bytes_out_total %d" % c.get("bytes_out", 0),
+            "# HELP ebpdns_kernel_direct_total 内核/eBPF 直通应答数",
+            "# TYPE ebpdns_kernel_direct_total counter",
+            "ebpdns_kernel_direct_total %d" % c.get("kernel_direct", 0),
+            "# HELP ebpdns_ipv4_fallback_total IPv6 无连通性回退 IPv4 数",
+            "# TYPE ebpdns_ipv4_fallback_total counter",
+            "ebpdns_ipv4_fallback_total %d" % c.get("ipv4_fallback", 0),
+            "# HELP ebpdns_rebind_blocked_total DNS rebinding 拦截数",
+            "# TYPE ebpdns_rebind_blocked_total counter",
+            "ebpdns_rebind_blocked_total %d" % c.get("rebind_blocked", 0),
+            # v1.9.146 P2-1: UDP 池满丢弃计数(server.py 采集), 此前未导出。
+            "# HELP ebpdns_udp_dropped_total UDP 工作池满丢弃数",
+            "# TYPE ebpdns_udp_dropped_total counter",
+            "ebpdns_udp_dropped_total %d" % (app.dns_server.udp_dropped() if app.dns_server else 0),
+            "# HELP ebpdns_rule_hits 规则命中累计数",
+            # v1.9.146 P3-2: 原为 gauge 但值单调递增, Prometheus rate() 对 gauge 报错。
+            # 修正为 counter(保持指标名不变, 避免破坏既有 dashboard 抓取)。
+            "# TYPE ebpdns_rule_hits counter",
         ]
         for k, v in rh.items():
             lines.append('ebpdns_rule_hits{rule="%s"} %d' % (_pl_escape(k), v))
-        lines.append("# HELP ebpdns_upstream_health 上游健康度(成功次数, 延迟ms)")
-        lines.append("# TYPE ebpdns_upstream_health gauge")
-        # H-1: 加锁快照, 避免并发 setdefault 触发 dict changed size
-        for uid, st in tel.upstreams_snapshot():
+        # v1.9.146 P2-1: 查询类型分布 A/AAAA/other(加锁快照)。
+        _qd = tel.qtype_dist_snapshot()
+        lines.append("# HELP ebpdns_qtype_total 按 qtype 分类的查询数")
+        lines.append("# TYPE ebpdns_qtype_total counter")
+        for _qk in ("A", "AAAA", "other"):
+            lines.append('ebpdns_qtype_total{qtype="%s"} %d' % (_qk, _qd.get(_qk, 0)))
+        # R2-03: ok/fail 是只增不减的累计计数, 此前标 gauge 导致 Prometheus
+        # rate(ebpdns_upstream_health{result="fail"}[5m]) 语义错误(gauge 的 rate 不是
+        # 速率)。与 ebpdns_rule_hits 的修法对齐: ok/fail 改 counter(保留指标名,
+        # 避免破坏既有 dashboard 抓取), avg_latency 拆为独立 gauge 指标。
+        lines.append("# HELP ebpdns_upstream_health 上游健康计数(成功/失败次数)")
+        lines.append("# TYPE ebpdns_upstream_health counter")
+        lines.append("# HELP ebpdns_upstream_latency_ms 上游平均延迟ms")
+        lines.append("# TYPE ebpdns_upstream_latency_ms gauge")
+        # P3(R1-11): 用 upstreams_snapshot_copy() 锁内深拷贝, 避免锁外读 live dict
+        # 引用时 ok/fail 来自相邻两次自增的不同时刻(avg 微小误差)。
+        _ups_snap = tel.upstreams_snapshot_copy()
+        for uid, st in _ups_snap.items():
             ok = st.get("ok", 0)
+            fail = st.get("fail", 0)
             avg = (st.get("lat_sum", 0) / ok) if ok else 0
             lines.append('ebpdns_upstream_health{upstream="%s",result="ok"} %d' % (_pl_escape(uid), ok))
-            lines.append('ebpdns_upstream_health{upstream="%s",result="avg_latency_ms"} %s' % (_pl_escape(uid), round(avg, 2)))
+            # v1.9.146 P2-1: 此前只输出 ok/avg_latency_ms, 不输出 fail —— per_upstream
+            # 已采集 fail 但未暴露, Prometheus 无法告警上游熔断/失败率。
+            lines.append('ebpdns_upstream_health{upstream="%s",result="fail"} %d' % (_pl_escape(uid), fail))
+            lines.append('ebpdns_upstream_latency_ms{upstream="%s"} %s' % (_pl_escape(uid), round(avg, 2)))
+        # P3(R1-05): 导出连接级 conn_stats 指标。多 IP 上游单端点劣化此前无法在
+        # Prometheus 侧告警(conn_stats 已采集但未暴露)。按 proto|addr|port|url 标签拆分。
+        # R2-03: ok/fail 单调递增改 counter, avg_latency 拆为独立 gauge。
+        lines.append("# HELP ebpdns_conn_health 连接级健康计数(成功/失败次数)")
+        lines.append("# TYPE ebpdns_conn_health counter")
+        lines.append("# HELP ebpdns_conn_latency_ms 连接级平均延迟ms")
+        lines.append("# TYPE ebpdns_conn_latency_ms gauge")
+        _conn_snap = tel.conn_stats_snapshot()
+        for ckey, st in _conn_snap.items():
+            cok = st.get("ok", 0)
+            cfail = st.get("fail", 0)
+            cavg = (st.get("lat_sum", 0) / cok) if cok else 0
+            lines.append('ebpdns_conn_health{conn="%s",result="ok"} %d' % (_pl_escape(ckey), cok))
+            lines.append('ebpdns_conn_health{conn="%s",result="fail"} %d' % (_pl_escape(ckey), cfail))
+            lines.append('ebpdns_conn_latency_ms{conn="%s"} %s' % (_pl_escape(ckey), round(cavg, 2)))
         try:
             import resource
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -3005,6 +3614,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
+        # R2-P2-1 / R2-P3-2: 与 _send() 对齐的安全响应头(静态首页/JS 直接由这里下发,
+        # 不经过 _send, 必须单独补)。X-Frame-Options: DENY 真正闭合点击劫持。
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -3127,6 +3741,13 @@ def _parse_domain_list(text):
             rerr = _check_rule_regex(tok)
             if rerr:
                 log.warning("skip invalid re: rule in domain list: %s (%s)", tok, rerr)
+                return
+            # R7 P3-1: 与 R6-3 _validate_rule_dict 的 match 字段控制字符白名单同型。
+            # 批量导入/订阅下载路径此前只过正则编译 + 长度检查, 绕过控制字符校验;
+            # 恶意订阅源可注入含 \x01 等控制字符的正则规则落库(虽为死规则, 但与
+            # R6-3 "统一拒绝 match 字段控制字符" 的设计口径不一致)。
+            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in tok):
+                log.warning("skip rule with control chars in domain list: %r", tok)
                 return
             if tok not in seen:
                 seen.add(tok)

@@ -31,6 +31,7 @@ tar czf "$DISTDIR/ebpdns-python-v${VERSION}.tar.gz" \
     bin/ebpdns \
     web/echarts.min.js \
     web/index.html \
+    web/favicon.svg \
     etc/ebpdns.conf.json \
     etc/rules_local.json \
     bpf/Makefile \
