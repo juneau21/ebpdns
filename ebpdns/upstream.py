@@ -56,6 +56,22 @@ _ADDR_CACHE_MAX = 256   # 安全上限: 上游 hostname 数量有限, 超限淘�
 # 该上游所有查询超时。按上游统计连续失配次数, 连续 3 次后对该上游关闭 0x20
 # 校验(直接接受 qid/源校验通过的响应), 并打日志。
 _0x20_misses = {}       # up_id -> 连续失配次数
+def _is_header_only(data):
+    """R-fix: 是否为"12 字节纯 header-only"(QDCOUNT==0 且 ANCOUNT==0)畸形态。
+
+    合法 DNS 响应恒 echo 我们查询的 question(QDCOUNT==1), 故 QDCOUNT==0 本身即结构
+    异常。UDP(原 R12 P3-11)与明文 TCP(原 R13 P3-A)各自内联实现过该校验, 但 DoH/DoT/
+    DoQ/DoH3 只判 `len >= 12`, 于是同一畸形形状在六条路径上判定不一致 —— 加密路径会把
+    它当成功上交, 下游 parse_message 得到 rcode=0/answers=[], resolver 按 NODATA
+    **写负缓存**, TTL 内该域名对外返回空应答。此处抽出公共判据供四条加密路径复用。"""
+    try:
+        return (len(data) >= 12
+                and bytes(data[4:6]) == b"\x00\x00"
+                and bytes(data[6:8]) == b"\x00\x00")
+    except Exception:
+        return False
+
+
 _0x20_disabled = set()  # up_id 已降级关闭 0x20 校验
 _0x20_DISABLED_SINCE = {}  # v1.9.77 R5: up_id -> 降级时间戳(time.monotonic()), 用于 600s 自恢复
 _0x20_FAIL_LIMIT = 3
@@ -1086,7 +1102,7 @@ def _doh_query(up, query_bytes, timeout_ms):
     path = up.get("url") or DOH_DEFAULT_PATH
     if not path.startswith("/"):
         path = "/" + path
-    # key 含 path: 同一 host:port 不同 DoH 路径(如 NextDNS /4d5525 vs /dns-query)
+    # key 含 path: 同一 host:port 不同 DoH 路径(如 NextDNS /<profile-id> vs /dns-query)
     # 必须独立连接池, 否则复用连接会把请求发到错误路径
     key = ("doh", host, port, path)
     timeout = timeout_ms / 1000.0
@@ -1114,7 +1130,17 @@ def _doh_query(up, query_bytes, timeout_ms):
     bp_ip = _bootstrap_ip(host)
     if bp_ip and bp_ip != host:
         headers = dict(_DOH_HEADERS)
-        headers["Host"] = host
+        # R-fix: Host 头必须带上**非默认端口**。原实现写死 `headers["Host"] = host`,
+        # bootstrap 路径(hostname 上游的常态)下会把 `dns.example.com:8443` 降级为
+        # `Host: dns.example.com` —— 违反 RFC 7230(非默认端口必须出现在 Host 中),
+        # 按 Host/vhost 路由的反代会 404 或路由到错误站点。
+        # http.client 自动生成的 Host 本就带端口, 故这里与之对齐。
+        _port = up.get("port") or 443
+        try:
+            _port = int(_port)
+        except (TypeError, ValueError):
+            _port = 443
+        headers["Host"] = host if _port in (443, 80) else "%s:%d" % (host, _port)
     else:
         # R12 P3-2: 无 bootstrap-IP 路径统一 dict() 拷贝, 与上方分支对称。
         # 原实现直接共享模块级 _DOH_HEADERS dict 引用, 隐式依赖 http.client
@@ -1180,9 +1206,19 @@ def _doh_query(up, query_bytes, timeout_ms):
             # 的结构校验对称。原条件仅判 not body, 1~11 字节非空 body 会越过
             # len(body)>=2 的 qid 短路(1 字节跳过 qid / 2~11 字节无 question 段)被
             # 当作成功响应返回。
-            if resp.status != 200 or not body or len(body) < 12 or len(body) > 65535 or "application/dns-message" not in ctype.lower():
+            # R-fix(短 body): `_leftover > 0` 的真实含义是"声明的 Content-Length 尚未
+            # 读满", 而 HTTPResponse.read(amt) **不会**抛 IncompleteRead(CPython 为
+            # 兼容性刻意不抛), 因此原实现把截断的 body 当成功返回。
+            # 原注释把它解释成"上游多发了字节", 与事实相反(多发字节不体现在 resp.length)。
+            # 两者都该判失败: 截断体解析出的 DNS 报文不可信; 残留字节连接本就不回池。
+            if (resp.status != 200 or not body or len(body) < 12 or len(body) > 65535
+                or "application/dns-message" not in ctype.lower()
+                or _leftover > 0
+                or _is_header_only(body)):
                 if "application/dns-message" not in ctype.lower():
                     log.debug("DoH unexpected Content-Type: %r", ctype)
+                elif _leftover > 0:
+                    log.debug("DoH 响应体未读满(截断), 判失败: leftover=%d", _leftover)
                 try:
                     conn.close()
                 except Exception:
@@ -1270,9 +1306,15 @@ def _doh_query(up, query_bytes, timeout_ms):
                 # R7 P3-5: 子串匹配转小写, 兼容大写/混合大小写。
                 ctype = resp.getheader("Content-Type", "")
                 # R2-NET-P2-2: 同首路径补 len(body)<12 下限, 保持协议对称。
-                if resp.status != 200 or not body or len(body) < 12 or len(body) > 65535 or "application/dns-message" not in ctype.lower():
+                # R-fix: 同样补 _leftover>0(截断体)判失败, 与首路径一致。
+                if (resp.status != 200 or not body or len(body) < 12 or len(body) > 65535
+                or "application/dns-message" not in ctype.lower()
+                or _leftover > 0
+                or _is_header_only(body)):
                     if "application/dns-message" not in ctype.lower():
                         log.debug("DoH retry unexpected Content-Type: %r", ctype)
+                    elif _leftover > 0:
+                        log.debug("DoH retry 响应体未读满(截断), 判失败: leftover=%d", _leftover)
                     try:
                         conn.close()
                     except Exception:
@@ -1594,7 +1636,7 @@ def _dot_query(up, query_bytes, timeout_ms):
                 # probe_ip(:2099)/DoH3/DoQ 对称。DoT 无 0x20 校验, 缺此下限则
                 # 长度前缀声明为 N(2<=N<=11)、qid 恰好匹配的畸形帧会被当作成功
                 # 响应上交。短帧丢弃并继续读后续帧(与 qid 不匹配处理同型)。
-                if len(msg) < 12:
+                if len(msg) < 12 or _is_header_only(msg):
                     buf = rest
                     if not buf:
                         break
@@ -1827,7 +1869,7 @@ def _udp_query(up, query_bytes, timeout_ms):
         # 段畸形响应"会被当合法 NOERROR 上交。合法响应恒 echo 我们查询的 question
         # (QDCOUNT==1), QDCOUNT==0 本身即结构异常, 与 ANCOUNT==0 同时成立时判为
         # header-only 畸形帧拒绝。纵深防御, 不受 0x20 降级态影响(fail-safe)。
-        if data[4:6] == b"\x00\x00" and data[6:8] == b"\x00\x00":
+        if _is_header_only(data):
             return False
         if qid is not None and len(data) >= 2:
             rid = struct.unpack(">H", data[:2])[0]
@@ -2066,7 +2108,7 @@ def _tcp_query(up, query_bytes, timeout_ms):
                 # 一旦未来重构 dnsmsg.py 把短包改为返回空 qname 而非 None, 明文 TCP
                 # 会静默接受畸形帧而其他路径因有显式下限不受影响。此处显式闭合,
                 # 消除对单实现的隐性依赖(安全方向: 短帧丢弃继续读后续帧)。
-                if len(msg) < 12:
+                if len(msg) < 12 or _is_header_only(msg):
                     buf = rest
                     if not buf:
                         break
@@ -2077,7 +2119,7 @@ def _tcp_query(up, query_bytes, timeout_ms):
                 # "无 question 段畸形响应"会被当合法 NOERROR 上交。合法响应恒 echo
                 # 查询 question(QDCOUNT==1), QDCOUNT==0 本身即结构异常。纵深防御,
                 # 不受 0x20 降级态影响(fail-safe)。
-                if msg[4:6] == b"\x00\x00" and msg[6:8] == b"\x00\x00":
+                if _is_header_only(msg):
                     buf = rest
                     if not buf:
                         break
@@ -2167,7 +2209,7 @@ def query_upstream(up, query_bytes, timeout_ms=1500):
     return True, data, lat, None
 
 
-def probe_ip(ip, query_bytes, port=53, timeout_ms=800):
+def probe_ip(ip, query_bytes, port=53, timeout_ms=800, up_id=None, _tried_lower=False):
     """对候选 IP 发起一次快速 UDP DNS 探测（用于测速择优）。返回 RTT ms 或 None。
     v1.9.76 2.8: 按地址族选择 socket(原硬编码 AF_INET, IPv6 候选探测静默失败)。
     v1.9.84 UP-09: 新增 port 参数(原硬编码 53, 非标准端口上游探测必失败)。
@@ -2218,7 +2260,31 @@ def probe_ip(ip, query_bytes, port=53, timeout_ms=800):
             # 响应(不校验 0x20)会使该上游 RTT 被低估而误择优选中。后续真实查询仍走
             # _udp_query 四层校验会拒绝伪造响应, 不影响数据面正确性; 此处补校验仅
             # 提升测速择优准确性。
-            if not dnsmsg.check_0x20(query_bytes, data):
+            # R-fix: 必须尊重该上游的 0x20 自适应降级态。仓库自己已认定"部分上游/
+            # 中间盒会把 qname 规范化为小写", 并为 UDP/TCP 实现了按上游降级
+            # (_0x20_disabled); 但 probe_ip 原先无条件校验, 于是这类上游的候选 IP
+            # 永远拿不到"通过校验"的响应 → 全部被判不可达, _ip_speed_cache 永不写入,
+            # IP 测速择优静默退化为静态估算。up_id 传入时与热路径同口径。
+            if up_id is not None and up_id in _0x20_disabled:
+                pass   # 该上游已降级: 跳过 0x20 校验(仍保留源IP/端口 + qid 校验)
+            elif not dnsmsg.check_0x20(query_bytes, data):
+                # R-fix(自足降级): 调用方(_speed_sort)拿不到 up_id, 无法读
+                # _0x20_disabled。但若收到的响应**只**在 qname 大小写上不匹配
+                # (qid/源地址/源端口都对、qname 仅大小写不同), 基本可断定该上游
+                # 规范化了 qname。此时用**全小写**查询重试一次即可取得通过校验的
+                # 响应 —— 等价于热路径的 0x20 自适应降级, 使这类上游的 IP 测速不再
+                # 静默退化为"全部不可达"。
+                try:
+                    _qn = dnsmsg.extract_qname(query_bytes)
+                    _rn = dnsmsg.extract_qname(data)
+                    _case_only = bool(_qn) and bool(_rn) and _qn.lower() == _rn.lower()
+                except Exception:
+                    _case_only = False
+                if _case_only and not _tried_lower:
+                    _tried_lower = True
+                    return probe_ip(ip, query_bytes.lower(), port=port,
+                                    timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
+                                    up_id=up_id, _tried_lower=True)
                 continue
             return int((time.monotonic() - t0) * 1000)
     except OSError:

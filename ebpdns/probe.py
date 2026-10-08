@@ -144,10 +144,15 @@ def probe_upstream_latencies(cfg, config_path=None, force=False, tag="首次实�
                 u["latency_measured"] = bool(ok)
                 item = {"id": u.get("id"), "name": u.get("name"), "proto": u.get("proto"),
                         "addr": u.get("addr"), "old": old, "new": old, "ok": bool(ok)}
-                if ok and lat > 0:
-                    u["latency"] = lat
-                    item["new"] = lat
-                    log.info("上游 %s(%s) %s延迟 %dms", u.get("name"), u.get("addr"), tag, lat)
+                # R-fix: 成功与否只看 ok, 不再叠加 `lat > 0`。回环/内网上游的实测延迟
+                # 常 <1ms, int(ms) 取整为 0, 原条件 `if ok and lat > 0` 会把**成功**的
+                # 实测判成失败: 既打假的"测速失败"WARNING, 又把 latency 留在默认 5000ms
+                # 而 latency_measured=True, 该上游此后永久排在候选末位且不再复测。
+                if ok:
+                    u["latency"] = max(1, int(lat))
+                    item["new"] = u["latency"]
+                    log.info("上游 %s(%s) %s延迟 %dms", u.get("name"), u.get("addr"), tag,
+                             u["latency"])
                 else:
                     # 禁用上游测速失败属预期(未启用不参与解析), 降级 DEBUG 防噪音;
                     # 启用上游失败才是真告警

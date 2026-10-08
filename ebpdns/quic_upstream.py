@@ -43,8 +43,62 @@ _FAIL_RECONNECT = 3     # 连续查询失败达该次数才触发连接重建
 # we must inspect the protocol's close_event to tell cert failures apart from
 # genuine transport failures (wrong/expired IP).
 _CERT_ALERT_CODES = frozenset({42, 43, 44, 45, 46, 116})
+
+
+def _verify_chain_only(proto):
+    """R-fix: 对已建立的 QUIC 连接做"证书链 + 有效期"校验(不做主机名/SAN 匹配)。
+
+    用途: doq_strict_cert/doh3_strict_cert=false 且上游为 IP 字面量时, aioquic 没有
+    "只关主机名校验"的开关(其 QuicConfiguration 无 check_hostname 字段), 故我们必须
+    把内建校验整体关掉(verify_mode=CERT_NONE)再手工补上链校验, 否则该开关会退化成
+    "完全不校验证书"。
+    返回 (ok, err)。取不到证书时返回 (False, 原因) —— fail-closed。
+    """
+    if not _HAVE_AIOQUIC:
+        return False, "aioquic 未安装"
+    tls = getattr(proto, "_tls", None)
+    cert = getattr(tls, "_peer_certificate", None) if tls is not None else None
+    if cert is None:
+        return False, "未取得对端证书(peer_certificate 为空)"
+    chain = []
+    for attr in ("_peer_certificate_chain", "_peer_certificates"):
+        got = getattr(tls, attr, None)
+        if got:
+            chain = list(got)
+            break
+    # 系统 CA 来源与 aioquic 默认一致(certifi); 取不到则退回 aioquic 默认 cafile 逻辑。
+    cafile = None
+    try:
+        import certifi
+        cafile = certifi.where()
+    except Exception:
+        cafile = None
+    try:
+        from aioquic.tls import verify_certificate
+        # server_name=None => 只校验证书链与有效期, 跳过主机名/IP SAN 匹配
+        verify_certificate(certificate=cert, chain=chain,
+                           server_name=None, cafile=cafile)
+        return True, None
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
 def available():
     return _HAVE_AIOQUIC
+
+
+def _is_header_only(data):
+    """R-fix: 与 upstream._is_header_only 同口径的本地副本(避免模块级循环 import)。
+
+    判据: 长度 >=12 且 QDCOUNT==0 且 ANCOUNT==0 —— 合法 DNS 响应恒 echo 我们查询的
+    question(QDCOUNT==1), 故该形状是畸形帧。DoQ/DoH3 原先只判 len<12, 会把它当成功
+    上交, 下游按 NODATA 写负缓存。"""
+    try:
+        return (len(data) >= 12
+                and bytes(data[4:6]) == b"\x00\x00"
+                and bytes(data[6:8]) == b"\x00\x00")
+    except Exception:
+        return False
 def _host_port(up):
     addr = up.get("addr", "")
     port = int(up.get("port") or (853 if str(up.get("proto", "")).lower() == "doq" else 443))
@@ -347,15 +401,22 @@ class _QuicUpstream:
                 conf = QuicConfiguration(is_client=True, alpn_protocols=[self.alpn],
                                          idle_timeout=60)  # 60s 空闲再断开, 减少频繁重连
                 # 启用默认证书校验(不覆盖 verify_mode); server_name 由下方设置
-                if self.host:
+                # R-fix: 只有 hostname 上游才把 server_name 交给 aioquic 做 SAN 校验。
+                # IP 字面量上游 + strict_cert=false 时, 下面会改为"只校验证书链"。
+                _chain_only = False
+                if self.host and self._strict_cert:
                     conf.server_name = self.host
-                # R1 P2-3: doq_strict_cert/doh3_strict_cert kill switch。仅当用户显式
-                # 配置 strict_cert=false 且上游为 IP 字面量(自托管仅含 DNS SAN 证书)时,
-                # 关闭 aioquic 的主机名/SAN 校验(conf.check_hostname=False), 仍保留
-                # verify_mode=CERT_REQUIRED 校验证书链。hostname 上游不受影响, 始终严格
-                # 主机名/SAN 校验(与 DoH/DoT _doh_tls_wrap 的 `if _is_hostname(host): raise`
-                # 同安全不变量)。无此开关时, IP 字面量 + 仅 DNS SAN 证书会被 aioquic 直接
-                # 握手拒绝且永无兜底重建。
+                # R-fix(重要): 原实现用 `conf.check_hostname = False` 实现
+                # doq_strict_cert/doh3_strict_cert kill switch, 但 **aioquic 1.3.0 的
+                # QuicConfiguration 没有 check_hostname 字段**(实测 dataclass fields
+                # 26 项无此项), 该赋值只是挂了个无人读取的属性; aioquic 在
+                # verify_mode != CERT_NONE 时**无条件**用 server_name 做 SAN/主机名校验。
+                # 结果是: 开关完全不生效(IP 字面量 + 仅 DNS SAN 的自托管证书照旧握手失败),
+                # 而下方日志却宣称"已关闭主机名/SAN 校验"——日志撒谎。
+                # 现改为真正可用的语义: 关闭 aioquic 的内建校验(verify_mode=CERT_NONE),
+                # 并在**握手成功后**自行调用 aioquic.tls.verify_certificate(...,
+                # server_name=None, cafile=<系统 CA>) 只校验证书链/有效期, 不做主机名匹配。
+                # 两种方式最终效果一致(链仍校验, 仅豁免 SAN), 但过程是诚实且可验证的。
                 if not self._strict_cert:
                     try:
                         from .upstream import _is_hostname as _quic_is_hostname
@@ -363,15 +424,19 @@ class _QuicUpstream:
                         _quic_is_hostname = None
                     if _quic_is_hostname is not None and not _quic_is_hostname(self.host):
                         try:
-                            conf.check_hostname = False
+                            import ssl as _ssl
+                            conf.verify_mode = _ssl.CERT_NONE
+                            conf.server_name = None
+                            _chain_only = True
                         except Exception:
-                            pass
-                        if not self._strict_warned:
+                            _chain_only = False
+                        if _chain_only and not self._strict_warned:
                             self._strict_warned = True
                             log.warning(
-                                "QUIC %s/%s strict_cert=false 且上游为 IP 字面量, 已关闭"
-                                "证书主机名/SAN 校验(证书链仍校验)。建议改用 hostname 上游"
-                                "或为服务器配置含 IP SAN 的证书。",
+                                "QUIC %s/%s strict_cert=false 且上游为 IP 字面量: 已豁免"
+                                "证书主机名/SAN 匹配, 证书链与有效期仍由本进程手工校验"
+                                "(aioquic 不支持仅关主机名校验, 故改由手工校验实现)。"
+                                "建议改用 hostname 上游或为服务器配置含 IP SAN 的证书。",
                                 self.proto, self.host)
                 # 复用 bootstrap 预解析的 IP 直连(与 DoH/DoT 同源), 彻底摆脱
                 # 系统 getaddrinfo 依赖; conf.server_name 仍为原始 hostname,
@@ -420,6 +485,23 @@ class _QuicUpstream:
 
                 async with connect(connect_host, self.port, configuration=conf,
                                    create_protocol=_proto_factory) as proto:
+                    # R-fix: strict_cert=false 路径下 aioquic 的内建校验已被关闭,
+                    # 必须在此手工完成"证书链 + 有效期"校验(不做主机名/SAN 匹配),
+                    # 否则该开关会退化成"完全不校验证书"(比原语义更弱)。
+                    # 校验失败按证书错误处理: 断开并让外层按 fail 处理(不静默放行)。
+                    if _chain_only:
+                        try:
+                            _vok, _verr = _verify_chain_only(proto)
+                        except Exception as _ve:
+                            _vok, _verr = False, "%s: %s" % (type(_ve).__name__, _ve)
+                        if not _vok:
+                            log.warning("QUIC %s/%s strict_cert=false 但证书链校验失败: %s",
+                                        self.proto, self.host, _verr)
+                            try:
+                                proto.close()
+                            except Exception:
+                                pass
+                            raise ConnectionError("certificate chain verification failed: %s" % _verr)
                     established = True  # R8 P2-2: 建连成功, 此后异常属传输阶段
                     self._conn_start = time.monotonic()
                     self._ever_connected = True
@@ -679,13 +761,16 @@ class _QuicUpstream:
             try:
                 await asyncio.wait_for(st["done"].wait(), timeout)
             except (asyncio.TimeoutError, _cf.TimeoutError):
-                # R12 P3-4: 查询超时放弃本流时, 按 RFC 9250 向对端发 RESET_STREAM
-                # (error_code 0x01 = 通用/内部错误), 通知对端释放该流状态。原实现仅
+                # R12 P3-4: 查询超时放弃本流时, 按 RFC 9250 §4.3.1 向对端发
+                # RESET_STREAM(error_code 0x03 = DOQ_REQUEST_CANCELLED)。
+                # R-fix: 原用 0x01(DOQ_INTERNAL_ERROR) —— 本端应用超时放弃属"本端取消",
+                # 用 INTERNAL_ERROR 会让对端把它统计成客户端内部错误, 语义不符。
+                # 注: DoH3 路径沿用同一常量, 但 H3 不定义该错误码, 对端仅作流取消处理。
                 # 靠 send 侧 end_stream=True 半关闭 + 60s idle_timeout 回收, 对端在
                 # 我方放弃后可能继续组包并缓存流状态, 残留协议卫生成本。reset_stream
                 # 失败(连接已在关闭中)忽略, 由 finally pop 收尾。
                 try:
-                    proto._quic.reset_stream(sid, 0x01)
+                    proto._quic.reset_stream(sid, 0x03)
                     proto.transmit()
                 except Exception:
                     pass
@@ -751,7 +836,12 @@ class _QuicUpstream:
             # R3-NET-P2-1: 与明文 DoH(:1158/:1242)/DoQ 对称, 补 12 字节 DNS
             # 报文头下限。原 `not st["body"]` 仅拒空 body, 不拒 1~11 字节畸形短 body;
             # 补后 qid 校验(:705)的 len>=2 短路恒为真。
-            if st["status"] != 200 or not st["body"] or len(st["body"]) < 12 or st.get("truncated"):
+            # R-fix: 追加 header-only(QDCOUNT==0 且 ANCOUNT==0)结构闸, 与
+            # upstream._is_header_only 及 UDP/明文 TCP/DoT/DoH 五条路径口径统一。
+            # 仅判 len<12 时, 恰好 12 字节的"无 question 段"畸形响应会被当成功上交,
+            # 下游按 NODATA 写负缓存。
+            if (st["status"] != 200 or not st["body"] or len(st["body"]) < 12
+                    or st.get("truncated") or _is_header_only(st["body"])):
                 return False, None
             # P2-21: 校验 Content-Type 必须为 application/dns-message(RFC 8484/9250),
             # 与明文 DoH 路径(upstream.py)对齐。若头存在但类型不符, 按失败处理。
@@ -784,7 +874,7 @@ _pool = {}
 _pool_lock = threading.Lock()
 def get_quic_upstream(up):
     """按 (proto, host, port, path) 复用常驻连接管理器。
-    key 含 path: 同一 host:port 不同 DoH3 路径(如 NextDNS /4d5525 vs /dns-query)
+    key 含 path: 同一 host:port 不同 DoH3 路径(如 NextDNS /<profile-id> vs /dns-query)
     必须独立连接管理器, 否则连接会发到错误路径。"""
     proto = str(up.get("proto", "")).lower()
     host, port = _host_port(up)

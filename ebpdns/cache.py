@@ -8,6 +8,7 @@
 import threading
 import time
 import logging
+import math
 from collections import OrderedDict
 
 log = logging.getLogger("ebpdns")
@@ -29,13 +30,19 @@ def _safe_int(v, default=0):
 def _safe_float(v, default=0.0):
     """R7/P2-4: 与 resolver._safe_float 同模式(本地副本, 避免循环 import)。
     restore() 内裸 float(persist_ttl or 0) 对畸形串抛 ValueError 被 try/except
-    兜底成 pt=0——冗余且吞错。改 _safe_float: None/无法解析→default, 可解析值保留。"""
+    兜底成 pt=0——冗余且吞错。改 _safe_float: None/无法解析→default, 可解析值保留。
+    R-fix NaN/Infinity: float('nan')/float('inf') 可成功解析, 但 json.load 默认接受
+    `NaN`/`Infinity` 字面量, 故被外部工具写坏的 cache.json 可注入 non-finite 的
+    `remaining`; 由它算出的 expires_at=nan 会让 `expires_at <= now` 恒为 False,
+    该条目变成"永不过期"的缓存答案(且被移到 MRU 端难以回收)。此处与
+    resolver._safe_float / config._validate_cfg 的 math.isfinite 口径统一。"""
     if v is None:
         return default
     try:
-        return float(v)
+        fv = float(v)
     except (TypeError, ValueError):
         return default
+    return fv if math.isfinite(fv) else default
 
 
 class LRUCache:
@@ -44,6 +51,10 @@ class LRUCache:
     消除单锁高并发瓶颈(原单锁在 6 万 QPS 下所有线程串行等待)。"""
 
     _SHARDS = 8
+    # R-fix: 轮转清理每次每分桶抽样检查的条目数。取值权衡: 太小则清扫慢,
+    # 太大则单次持锁时间变长(该分桶上的 get/put 会排队)。64 在高容量下
+    # 单次持锁仍是微秒级, 同时让全表在 _cap/64 次 purge 内被覆盖一遍。
+    _PURGE_SCAN_STEP = 64
 
     def __init__(self, capacity=1024):
         # cache_size=null/None 归一化: 配置显式设为 null 时 cfg.get 返回 None
@@ -69,6 +80,9 @@ class LRUCache:
         # v1.9.74 P1-2: >0 时保留"过期但在 stale_window 内"的条目(serve-stale 兜底),
         # 由 resolver 用 cfg stale_ttl 下发。0 = 旧行为(get/purge 见到过期即删)。
         self._stale_window = 0
+        # R-fix: 轮转清理游标(每分桶一个), 供 _purge_expired_locked 抽样扫全表用,
+        # 解决"队首被长 TTL 条目占住 → 队尾过期条目永不被回收"的盲区。
+        self._purge_cursor = [0] * self._SHARDS
 
     @property
     def stale_window(self):
@@ -170,22 +184,48 @@ class LRUCache:
         return total
 
     def _purge_expired_locked(self, i, now):
-        # LRU 顺序下(OrderedDict: 队首=最久未访问), 过期条目集中在队首。
-        # 只从队首向后扫描到首个未过期条目即停, 避免每 32 次 put 做全表扫描
-        # (高容量下全表扫描在锁内执行会阻塞 get/put 热路径)。
+        # LRU 顺序下(OrderedDict: 队首=最久未访问), 过期条目**通常**集中在队首。
+        # 但实际 TTL 由上游/规则决定, 长 TTL 且久未访问的条目会占住队首, 使队尾的
+        # 短 TTL 过期条目永远扫不到(原实现只在队首 stop, purge 长期返回 0, 过期
+        # 条目持续占用容量 → 有效命中率下降、summary()["used"] 虚高)。
+        # R-fix: 保留"队首连续过期即批量清"的快路径, 另加一个**轮转游标**做抽样
+        # 全表清理 —— 每次只检查全表的一小段(游标步进 _PURGE_SCAN_STEP 条), 均摊
+        # O(1)/次 put, 不引入全表锁内扫描。轮转位置按分桶独立保存。
         # v1.9.74 P1-2: stale_window>0 时, 窗口内的过期条目保留(serve-stale 兜底用),
         # 只清超窗口的死条目。
         cnt = 0
         sw = self._stale_window
-        while self._maps[i]:
-            k, e = next(iter(self._maps[i].items()))
+        m = self._maps[i]
+        while m:
+            k, e = next(iter(m.items()))
             exp = e.get("expires_at", 0)
             if exp > now:
                 break
             if sw and (now - exp) <= sw:
                 break
-            self._maps[i].pop(k, None)
+            m.pop(k, None)
             cnt += 1
+        # 轮转抽样: 从上次位置起顺序检查至多 _PURGE_SCAN_STEP 条, 清掉其中已过期的。
+        # 只做 pop 不做 move_to_end, 故不改变 LRU 语义。
+        n = len(m)
+        if n:
+            pos = self._purge_cursor[i]
+            if pos >= n:
+                pos = 0
+            step = min(self._PURGE_SCAN_STEP, n)
+            keys = list(m.keys())[pos:pos + step]
+            for k in keys:
+                e = m.get(k)
+                if e is None:
+                    continue
+                exp = e.get("expires_at", 0)
+                if exp > now:
+                    continue
+                if sw and (now - exp) <= sw:
+                    continue
+                m.pop(k, None)
+                cnt += 1
+            self._purge_cursor[i] = (pos + step) % n if n else 0
         return cnt
 
     def clear(self):
@@ -599,8 +639,8 @@ class TinyLFUCache:
 
     三段结构(Caffeine 默认比例):
       - window      1%    : 新条目入口(LRU 顺序), 吸收突发流量
-      - protected   约 80%: 命中即晋升的高频区, 受保护不被轻易淘汰
-      - probation   约 20%: 晋升候选区, 真正的淘汰发生在这里
+      - protected   约 60%: 命中即晋升的高频区, 受保护不被轻易淘汰
+      - probation   约 40%: 晋升候选区, 真正的淘汰发生在这里
 
     淘汰链: window 超容 → 队首与 probation 队首比频率(freq), 高者进 probation;
     protected 超容 → 队首挤回 probation; probation 超容 → 丢队首(淘汰)。

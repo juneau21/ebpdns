@@ -236,9 +236,19 @@ chmod +x "${INSTALL_DIR}/bin/ebpdns"
 # 改为显式 WARN(非致命, root 仍可读既有 root 文件), 不再静默。
 chown -R root:root "${INSTALL_DIR}" 2>/dev/null \
   || echo "[WARN] chown ${INSTALL_DIR} 失败(只读挂载/NFS root-squash?), 请人工确认文件属主为 root"
+# v1.9.150 R-fix(Debian 13 实测确认): 收敛**整个**安装目录的可读/可进入权限。
+# 原实现只放宽了 web/(目录 755 + 静态文件 644), 未处理 ebpdns/*.py 与 bin/ebpdns。
+# 若发布包在 umask 077 下解包、或用户从受限介质拷贝(文件 600 root:root), 上面
+# `chown -R root:root` 之后服务用户 ebpdns 既读不到模块、也无法执行入口:
+#   systemd 报 "Failed to execute /opt/ebpdns/bin/ebpdns: Permission denied",
+#   status=203/EXEC, Restart=on-failure 反复重启直到 StartLimitBurst 进入 failed。
+# Debian 13 实测复现: 源码树 go-rwx 后跑 install.sh → 服务起不来, 且**首次安装路径
+# 不做 is-active 复核**, 脚本仍打印"4/4 完成", 运维看到的是"装好了但 53 没有服务"。
+# a+rX 语义: 所有文件可读, 目录可进入, 已带执行位的文件保留可执行 —— 正好覆盖需求。
+chmod -R a+rX "${INSTALL_DIR}" 2>/dev/null \
+  || echo "[WARN] chmod -R a+rX ${INSTALL_DIR} 失败, 请人工确认 ebpdns 用户可读代码与执行入口"
 # M2 修复: 降权后服务以 ebpdns 用户运行, 需读 /opt/ebpdns/web/ 下的静态控制台资源。
-# 源码包中 index.html 等可能是 600(root:root), chown -R root:root 后 ebpdns 无权读,
-# 会导致控制台静态资源 404。补一条目录 755 / 静态文件 644, 保证 ebpdns(及其它用户)可读。
+# (a+rX 已覆盖, 以下保留为显式声明与历史意图说明。)
 chmod 755 "${INSTALL_DIR}/web" 2>/dev/null || true
 # P3-9(R12): 收窄通配到 web/ 实际存在的文件类型。web/ 发布包仅含 index.html / echarts.min.js /
 # favicon.svg(P3-1 新增), 原大括号里的 .css/.png/.ico 永不命中(空 glob 被 || true 静默吞, 死 glob)。
@@ -348,6 +358,29 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
       echo "    [ERROR] 重启后 ${SERVICE_NAME} 未进入 active 状态, 新代码可能启动失败," >&2
       echo "             请检查: sudo journalctl -u ${SERVICE_NAME} -n 50" >&2
+    fi
+  else
+    # v1.9.150 R-fix(Debian 13 实测): 首次安装路径原本**完全不复核服务状态**,
+    # 脚本照样打印"4/4 完成"。当 /opt/ebpdns 下代码/入口对服务用户不可读时
+    # (发布包 umask 077 解包、从受限介质拷贝等), systemd 会以
+    # status=203/EXEC 失败并反复重启, 而运维看到的是"装好了但 53 端口没有服务",
+    # 毫无线索。这里做一次**不改变行为**的预检: 只启动→观察→停止, 明确报告结果。
+    # 仅在用户尚未让服务运行时执行(避免干扰"由用户手动 start"的既有语义)。
+    echo "    首次安装: 做一次启动预检(启停各一次, 不改变服务最终状态)..."
+    if systemctl start "${SERVICE_NAME}" >/dev/null 2>&1; then
+      sleep 3
+      if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        echo "    预检通过: ${SERVICE_NAME} 可正常启动"
+        systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+      else
+        echo "    [ERROR] 预检失败: ${SERVICE_NAME} 启动后未进入 active 状态" >&2
+        echo "             常见原因: 代码/入口对 ${SERVICE_NAME} 用户不可读(权限)," >&2
+        echo "                       端口 53 被占用, 或配置非法。" >&2
+        echo "             排查: sudo journalctl -u ${SERVICE_NAME} -n 50" >&2
+        echo "                   sudo -u ebpdns test -r ${INSTALL_DIR}/ebpdns/cli.py && echo readable" >&2
+      fi
+    else
+      echo "    [WARN] 预检无法启动 ${SERVICE_NAME}, 请手动确认: sudo systemctl start ${SERVICE_NAME}"
     fi
   fi
 else

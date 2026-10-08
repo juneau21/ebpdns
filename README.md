@@ -1,6 +1,6 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
-> 当前版本 **v1.9.150**（`ebpdns/__init__.py` `__version__ = "1.9.150"`，三处版本号已置位）。本文档与代码逐项对齐：
+> 当前版本 **v1.9.150**（`ebpdns/__init__.py` `__version__ = "1.9.150"`；版本号另见 `web/index.html` 的 APP_VERSION，共两处）。本文档与代码逐项对齐：
 > 功能清单、配置项、API 端点、安装/部署方式均以源码为准（见文末「文档对齐说明」）。
 
 请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新**真实可部署的 DNS 解析软件**。
@@ -13,13 +13,14 @@
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
 
 ---
+
 WEB运行截图
+
 <img width="2560" height="1294" alt="6a4237cd7d1021d49757cca4f0226f46" src="https://github.com/user-attachments/assets/89c5aaeb-9df7-4de4-b0eb-b31ef1f64992" />
 <img width="2560" height="1294" alt="b442dda3f7870d374add040637f25267" src="https://github.com/user-attachments/assets/ac13c55b-5dff-4f68-8e10-e5ae76fe896e" />
 <img width="2560" height="3465" alt="09915fd32938aed251bbac9f21f49a2b" src="https://github.com/user-attachments/assets/3767fdd0-d8f8-4a60-9e54-ea6b9470047f" />
 <img width="2560" height="1788" alt="63164a387b46f8a9b2c1b4a558c102c7" src="https://github.com/user-attachments/assets/6136f64f-9f3d-4874-bb31-e2b7496470ef" />
 <img width="2560" height="1294" alt="4fa7f527f0afbb5686c9202653603d4c" src="https://github.com/user-attachments/assets/ae89efed-3867-4143-a031-d2460267c601" />
-
 
 ## 1. 架构（实际实现路径）
 
@@ -88,8 +89,19 @@ sudo mkdir -p /opt/ebpdns
 sudo cp -r bin ebpdns web etc /opt/ebpdns/
 sudo mkdir -p /etc/ebpdns
 sudo cp etc/ebpdns.conf.json /etc/ebpdns/config.json
+# 重要: systemd unit 以专用用户 ebpdns 运行且 ProtectSystem=strict, 只放行 /etc/ebpdns 可写。
+# 不建用户会直接 status=217/USER 启动失败; /etc/ebpdns 属主不对则无法保存配置/缓存。
+sudo groupadd --system ebpdns 2>/dev/null || true
+sudo useradd --system --gid ebpdns --home-dir /opt/ebpdns --shell /usr/sbin/nologin ebpdns 2>/dev/null || true
+sudo chown -R root:root /opt/ebpdns
+sudo chmod -R a+rX /opt/ebpdns
+sudo chmod 755 /opt/ebpdns/bin/ebpdns
+sudo chown -R ebpdns:ebpdns /etc/ebpdns
+sudo chmod 750 /etc/ebpdns
+sudo chmod 640 /etc/ebpdns/config.json
 sudo cp systemd/ebpdns.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ebpdns
+sudo systemctl is-active ebpdns   # 务必复核; 首次安装不会自动检查
 ```
 
 ### 升级
@@ -139,8 +151,8 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | `listen.udp` / `listen.tcp` | `127.0.0.1:53` | DNS 监听地址（默认仅回环，无配置时不暴露到全网卡；需局域网提供 DNS 时显式改为 `0.0.0.0:53`） |
 | `listen.udp6` / `listen.tcp6` | `[::1]:53` | IPv6 DNS 监听，默认开启（仅回环 `[::1]:53`；系统无 IPv6 协议栈时仅告警跳过，不影响 IPv4 服务）。不希望监听 IPv6 时显式设为 `null`，需全网卡可改 `[::]:53` |
 | `api.host` / `api.port` | `127.0.0.1` / `8080` | API 与 Web 控制台监听（默认仅本机回环，天然安全无需 token；模板与 install.sh 均为 `127.0.0.1:8080`，需局域网访问时显式改 `0.0.0.0` 并配 `api.token`） |
-| `api.token` | `""` | 可选 API 认证令牌。空串=不启用（默认；仅本机回环时安全）。绑定非回环地址时务必设置：除 `/api/health` 与静态资源外，所有 `/api/*` 与 `/metrics` 需带 `Authorization: Bearer <token>` 或 `X-Api-Key: <token>`（或 `?token=`）。最长 256 字符；`GET /api/config` 自动把已设 token 脱敏为 `***`，PUT 收到 `***` 时忽略不覆盖原值 |
-| `cache_size` | 131072 | 用户态缓存容量（模拟 BPF Map 容量，范围 1–10000000，配置值越界会被 API 拒绝） |
+| `api.token` | `""` | 可选 API 认证令牌。空串=不启用（默认；仅本机回环时安全）。绑定非回环地址时务必设置：除 `/api/health` 与静态资源外，所有 `/api/*` 与 `/metrics` 需带 `Authorization: Bearer <token>` 或 `X-Api-Key: <token>`（或 `?token=`，注意 query 形式会进入反代访问日志/浏览器历史，生产建议只用请求头）。最长 256 字符；`GET /api/config` 自动把已设 token 脱敏为 `***`，PUT 收到 `***` 时忽略不覆盖原值 |
+| `cache_size` | 131072 | 用户态缓存容量（模拟 BPF Map 容量，范围 1–10000000，配置值越界会被 API 拒绝）。**下界说明**：内部分 8 分桶且每桶下限 16 条，故配置值 < 48 时实际总容量会被抬到 `16×分区数`（3 分区即 48 条），这是 8-shard 设计的安全下限 |
 | `cache_policy` | `lru` | 缓存淘汰策略：`lru`=按分流 group 分区隔离的 LRU（PartitionedCache，domestic/global/default 默认容量比 0.2/0.2/0.6，各 group 互不挤占；每个分区内部再 8 分桶独立锁）；`partitioned`=与 `lru` 同一分区引擎，显式声明分区模式并按 `cache_partitions` 自定义各 group 容量比例；`tinylfu`=W-TinyLFU 单池三段式（Count-Min Sketch 频率估计，抗扫描污染，命中率通常高 5-15%，额外内存约 512KB）。切换 lru↔tinylfu 自动热重载重建缓存 |
 | `cache_partitions` | `null` | partitioned/lru 模式下各 group 的容量权重（如 `{"domestic":0.2,"global":0.2,"default":0.6}`，自动归一化到和为 1）。`null`=默认 0.2/0.2/0.6；仅 group 键 domestic/global/default 合法，未知键剔除、负权重回退默认 |
 | `map_type` | `LRU_HASH` | 缓存 BPF Map 类型语义标记（保留大写，不做大小写归一）：`LRU_HASH`（默认，LRU 哈希表，最通用）/ `LRU`（纯 LRU 链表）/ `LPM_TRIE`（最长前缀匹配树，面向按网段路由的场景）。当前为纯用户态 Python 实现，`map_type` **仅作语义标记与控制台/API 展示**，不改变淘汰引擎（淘汰引擎由 `cache_policy` 决定）；真实 XDP 数据面集成时据此选择内核 map 类型。非法值回退 `LRU_HASH` |
@@ -151,7 +163,7 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | `prefetch` | true | TTL 到期前 85% 自动预取刷新（跳过 NXDOMAIN 负缓存；恢复缓存自动重排入预取队列） |
 | `kernel_direct` | true | 用户态缓存命中即计为「内核直答」遥测计数（真实 XDP 集成时保持 true 语义一致） |
 | `speed_test` | true | 上游/候选 IP 测速择优总开关 |
-| `speed_interval_ms` | 2000 | **毫秒**。同一域名两次候选 IP 测速之间的最小间隔（节流）：间隔内直接复用上次排序结果；范围 0–604800ms（≈10min，0=每次都测）。注意单位是毫秒而非秒——604800ms≈10min，「7 天」(=604800s) 仅适用于秒级周期字段 |
+| `speed_interval_ms` | 2000 | **毫秒**。同一域名两次候选 IP 测速之间的最小间隔（节流）：间隔内直接复用上次排序结果；范围 0–604800ms（≈10min，0=每次都测）。注意单位是毫秒而非秒——604800ms≈10min，「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级周期字段(注意 `stale_ttl` 上限为 8640000s=100 天, 见配置表) |
 | `speed_timeout_ms` | 300 | 单次候选 IP 探测超时上限（毫秒），范围 1–60000，未按时完成的候选不参与排序 |
 | `ip_speed_check` | true | 候选 IP 测速：对多 IP 答案并发探测 RTT 并按速度排序（SmartDNS 风格），关=保持上游返回顺序 |
 | `ip_speed_probe` | both | 候选 IP 探测方式（枚举）：`udp53` / `tcp443` / `both`（默认 both，取最快；TCP:443 更贴近真实访问） |
@@ -221,17 +233,17 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | PUT/DELETE | `/api/upstreams/<id>` | 修改 / 删除上游 |
 | GET/POST | `/api/rules` | 逐条分流规则列表 / 新增（`match` 必填；支持 `re:` 正则预编译校验；可选 `ttl_min`/`ttl_max`） |
 | PUT/DELETE | `/api/rules/<id>` | 修改 / 删除规则 |
-| POST | `/api/rules/import` | `{url}` 或 `{text}` 批量导入域名列表（URL 实时下载，支持 adblock `||`/`@@` 规则源；该与 `/api/rules/subscribe` body 上限放宽到 16MB，其余 4MB） |
+| POST | `/api/rules/import` | `{url}` 或 `{content}` 批量导入域名列表（URL 实时下载，支持 adblock `||`/`@@` 规则源；该与 `/api/rules/subscribe` body 上限放宽到 16MB，其余 4MB） |
 | POST | `/api/rules/subscribe` | 新增规则订阅 `{url, action, group, ip}`（仅允许 `https://` 源） |
-| DELETE | `/api/rules/subscribe?id=<id>` | 删除规则订阅 |
-| POST | `/api/rules/subscribe/update` | 手动立即重拉全部订阅 |
+| DELETE | `/api/rules/subscribe?url=<url>` | 删除规则订阅（按 url 定位；`?id=` 不受支持） |
+| POST | `/api/rules/subscribe/update` | 重拉**指定**订阅 `{url}`（需提供 url；不带 url 返回 400） |
 | GET | `/api/cache/stats` | 缓存统计（`cache.summary()` + 条目数 `size`） |
 | POST | `/api/reprobe` | 一键重新测速：对所有上游并发实测延迟并写回配置 |
 | POST | `/api/restart` | 重启服务（**需请求体 `{"confirm": true}`**；先返回 200 再在后台执行）。**systemd 托管时进程自退出**：不再调用 `systemctl restart`（v1.9.137 起以专用用户运行，polkit 拒绝非 root restart 系统 unit），改为置退出码 3 后向自身发 SIGTERM 走优雅收尾（缓存落盘/停 server/停池），进程以非零码退出，由 unit `Restart=on-failure` 拉起新实例；手动裸跑时用 `os.execvpe` 以相同参数替换自身进程。防重入：重启进行中重复调用返回 409 |
 | POST | `/api/reload` | 热重载配置（与 SIGHUP 等价，原子换配置引用，返回 changed 明细，无需重启） |
 | POST | `/api/reset` | 重置遥测计数与清空缓存（**需请求体 `{"confirm": true}`**，否则 400） |
 | POST | `/api/profile` | cProfile 性能剖析采样 N 秒（`?seconds=N`，**默认 3，上限 10**，返回 Top 25 文本；仅 POST 触发，单飞，并发请求 409） |
-| GET | `/api/logs` | 增量实时日志，参数：`since`(seq 游标)、`q`(关键字)、`level`(hit/miss/rule/err/sys/warn)、`qtype`、`ip`、`domain`、`upstream`、`rule`、`min_lat`、`limit`(默认 500，上限 2000) |
+| GET | `/api/logs` | 增量实时日志，参数：`since`(seq 游标)、`q`(关键字)、`level`(hit/miss/rule/err/sys/warn)、`qtype`、`ip`、`domain`、`upstream`、`rule`、`min_lat`、`limit`(默认 500，上限 2000)。**注意：`hit`/`miss` 事件按 10% 采样进入事件流**（`total`/`hit`/`miss` 计数器仍为全量精确值），故日志条数约为真实查询量的 1/10；需全量观测可调 `log_level=debug` |
 | GET | `/api/pipeline` | 流水线概览：`hook`/`map_type`/`cache_size`/`kernel_direct` + 前 3 个启用上游（**脱敏，仅返回 proto/name/id**，不暴露地址端口） |
 | GET | `/metrics` | Prometheus 文本指标（配置了 token 时同样需要认证） |
 | GET | `/` `/index.html` `/echarts.min.js` `/favicon.svg` `/static/*` | 控制台静态资源 |
@@ -263,7 +275,7 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 
 ## 7. 稳定性与运维
 
-- **systemd 托管（降权运行）**：服务以专用系统用户 `ebpdns`（nologin，install.sh 自动创建）运行，**不再以 root 常驻**；仅通过 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（+ `CapabilityBoundingSet` 同值）获得绑定 53 特权端口的能力。`/opt/ebpdns` 保持 `root:root` 只读，`/etc/ebpdns` 置 `ebpdns:ebpdns` 750（服务可读写配置/缓存），配合 `ProtectSystem=strict`（仅 `ReadWritePaths=/etc/ebpdns` 可写）、`NoNewPrivileges`、`PrivateTmp`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` 等沙箱硬化收敛攻击面。`Restart=on-failure` + `TimeoutStopSec=5`，崩溃循环保护（60s 内最多 5 次后进入 failed）。进程异常退出（含 SIGKILL/OOM 强杀）后约 3-5s 自动重启，重启后从磁盘载入持久化缓存、恢复分流规则/上游并重新排入预取队列；SIGTERM 优雅退出（正常 <10ms，trim 线程 join 超时 2s），退出时保存缓存。另装每日 04:30 低峰 `ebpdns-restart.timer` 做内存卫生兜底。
+- **systemd 托管（降权运行）**：服务以专用系统用户 `ebpdns`（nologin，install.sh 自动创建）运行，**不再以 root 常驻**；仅通过 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（+ `CapabilityBoundingSet` 同值）获得绑定 53 特权端口的能力。`/opt/ebpdns` 保持 `root:root` 只读，`/etc/ebpdns` 置 `ebpdns:ebpdns` 750（服务可读写配置/缓存），配合 `ProtectSystem=strict`（仅 `ReadWritePaths=/etc/ebpdns` 可写）、`NoNewPrivileges`、`PrivateTmp`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` 等沙箱硬化收敛攻击面。`Restart=on-failure` + `TimeoutStopSec=15`，崩溃循环保护（60s 内最多 5 次后进入 failed）。进程异常退出（含 SIGKILL/OOM 强杀）后约 3-5s 自动重启，重启后从磁盘载入持久化缓存、恢复分流规则/上游并重新排入预取队列；SIGTERM 优雅退出（正常 <10ms，trim 线程 join 超时 2s），退出时保存缓存。另装每日 04:30 低峰 `ebpdns-restart.timer` 做内存卫生兜底。
 - **优雅退出**：预取线程池 `cancel_futures` 取消积压、DoH/DoT 连接锁加超时、结果收集 `as_completed` 加超时兜底，高负载下 stop 不再卡死。
 - **上游熔断**：连续失败达阈值（默认 3 次）临时跳过该上游 30s，防单个故障上游拖垮 miss 查询（配置 `circuit_fails` / `circuit_open_s`）。
 - **DoS 防御**：UDP miss 队列有界信号量（池满丢弃、客户端自动重试）；`decode_name` 压缩指针 32 跳上限；应答上限 8 条 + TC 位；客户端 EDNS bufsize 钳制到 `edns_client_max_size`（默认 1232）。
@@ -272,6 +284,9 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 ---
 
 ## 8. 性能实测
+
+> **可复现性说明**：下表的压测脚本（`stress_test.py` 等）与 `tests/` **不随发布包分发**，
+> 因此这些数字在当前 32 文件包内无法原样复现；它们来自源码仓库的实测记录。
 
 **最新一轮压测（v1.9.149，3 分钟 × 8 并发，8 个随机域名，非特权端口 DNS UDP `127.0.0.1:5354` / API `127.0.0.1:18091`，缓存命中率 100%）**：
 
@@ -322,6 +337,10 @@ sudo ip link set dev eth0 xdp off   # 卸载
 
 要点：
 - **当前为参考实现，未集成到 daemon**：即使编译挂载，内核 `dns_cache` map 因无用户态回填而恒为空，不会产生加速；需另行开发 daemon 侧 libbpf/bcc 回填集成
+- **⚠️ 已知限制（v1.9.150 Debian 13 实测）**：`make` 现可编译通过（原版因 `-Werror` 与变长
+  `memcpy` 直接编译失败，已修）；但 `bpftool prog load` **仍被内核校验器拒绝**（变量下标包读取无法
+  建立范围证明）。同机最小 XDP 程序可正常加载，故为**本程序的数据包解析结构**问题而非主机限制。详见
+  `bpf/README.md` 的"已知限制"一节。**不影响默认部署**（默认数据面为纯用户态）
 - 内核 ≥ 5.4（建议 5.15+），开启 BTF，网卡驱动支持原生 XDP（云虚拟机 virtio 网卡通常不支持）
 - 未命中 `XDP_PASS` 转用户态 daemon；命中 `XDP_TX` 内核回包。map 名/键值布局见 `ebpdns_xdp.h`
 - 详见 `bpf/README.md`
@@ -331,7 +350,7 @@ sudo ip link set dev eth0 xdp off   # 卸载
 ## 10. 本地开发 / 测试
 
 ```bash
-# 单元测试（两种等价方式）
+# 单元测试（两种等价方式）—— 注意: 发布包内不含 tests/, 需在源码仓库执行
 make test
 python3 -m unittest discover -s tests
 # 压测 / 性能剖析（根目录脚本；先以非特权端口起一个 daemon，再连它压测）
@@ -371,13 +390,15 @@ ebpdns/
 │   ├── telemetry.py       # 遥测计数与采样（原子计数 / Top N / Prometheus）
 │   └── api.py              # HTTP JSON API + Web 静态服务
 ├── web/index.html          # 控制台（双模式，ECharts 本地化）
-├── bpf/                    # 可选 eBPF XDP 内核旁路（参考实现，未集成）
+├── bpf/                    # 可选 eBPF XDP 内核旁路（参考实现，未集成；见其 README 的"已知限制"）
 ├── systemd/                 # ebpdns.service（降权用户 + CAP_NET_BIND_SERVICE）+ 每日重启 timer
 ├── etc/ebpdns.conf.json    # 配置模板（与 config.py DEFAULTS 对齐）
 ├── install.sh              # 安装脚本（自动检测/安装 python3、aioquic）
-├── package.sh              # 打包脚本（./package.sh <version>）
-├── stress_test.py / profile_test.py / full_log_test.py  # 压测/剖析脚本
-└── tests/                  # 单元测试
+└── （源码仓库另有，**不随发布包分发**）
+    ├── package.sh           # 打包脚本（./package.sh <version>）
+    ├── stress_test.py / profile_test.py / full_log_test.py  # 压测/剖析脚本
+    ├── tools/build_console.py  # 控制台构建（Makefile 的 console 目标依赖）
+    └── tests/               # 单元测试（Makefile 的 test 目标依赖）
 ```
 
 ---
@@ -397,7 +418,7 @@ ebpdns/
   - **R12–R16 高强度逐行审查修复清零**：R12（32 项 P3）、R13（3 项 P3）、R14（2 项 P3）、R15（1 项 P3）、R16（复核）共 5 轮逐行审查，P3 级问题全部清零，连续两轮（功能验证代理）零待修复验收通过。
   - **版本号/性能数据更新**：文档版本号升到 v1.9.150；性能表更新为 v1.9.149 实测——8 并发 ×180s 缓存 100% 命中，平均 QPS **43,012**、P50 **0.17ms**、P99 **0.56ms**、P99.9 **1.48ms**、约 774 万请求**零错误**、RSS 稳定 **52MB**（非特权端口 DNS 5354 / API 18091）。
   - **配置表订正/补全**：新增 `api.token` 独立行（Bearer/X-Api-Key/`?token=`、最长 256、GET 脱敏 `***`、PUT 收到 `***` 不覆盖）；订正 `max_parallel_upstreams` 说明为「fallback 开启时并发最快 N 个、全败回退剩余，并作工作线程池基数 min(48,max(16,N×8))」；明确 `log_level`/`log_format` 改后需重启（其余字段 PUT/reload 即时生效）。
-  - **`speed_interval_ms` 单位口径保持正确**：毫秒字段（默认 2000ms≈2s，范围 0–604800ms≈10min），「7 天」(=604800s) 仅适用于 `health_check_interval`/`rule_sub_interval`/`stale_ttl` 等秒级字段——文档与前端 tooltip 均按此口径。
+  - **`speed_interval_ms` 单位口径保持正确**：毫秒字段（默认 2000ms≈2s，范围 0–604800ms≈10min），「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级字段(`stale_ttl` 上限为 100 天)——文档与前端 tooltip 均按此口径。
   - **复核无改动项**：`bpf/README.md`（`dns_cache`=LRU_HASH 1024、`counters`=PERCPU_ARRAY，与 `.c`/`.h` 一致）、前端 `speed_interval_ms` tooltip、`etc/ebpdns.conf.json` 均已与代码对齐，本轮仅复查。
 
 - **v1.9.148**：文档与代码全面对齐（本版为文档同步版，无数据面行为变更）。
@@ -426,7 +447,7 @@ ebpdns/
   - **正则三态 fail-closed**：屏蔽规则正则匹配异常/超时时按「命中」处理（fail-closed，安全方向），不在 ReDoS 窗口内被绕过。
   - **CSRF 策略收敛**：API 请求无 `Origin`/`Referer` 时，仅当携带有效 token **或** API 绑定在环回地址（`127.0.0.1`/`::1`/`localhost`）才放行；非浏览器客户端在非环回监听下必须带 token，否则 403。
   - **systemd 降权**：服务改由专用系统用户 `ebpdns`（nologin）运行，仅授 `CAP_NET_BIND_SERVICE` 绑定 53，配合整套沙箱硬化（`ProtectSystem=strict` 等）。
-  - 文档同步：配置默认值改回真实代码（`listen` 默认 `127.0.0.1:53`/`[::1]:53`、`api.host` 默认 `127.0.0.1`）、补全 API 端点表与 token 示例、修正 `EBPDNS_CONFIG` 拼写与 `TimeoutStopSec=5`。
+  - 文档同步：配置默认值改回真实代码（`listen` 默认 `127.0.0.1:53`/`[::1]:53`、`api.host` 默认 `127.0.0.1`）、补全 API 端点表与 token 示例、修正 `EBPDNS_CONFIG` 拼写与 `TimeoutStopSec` 值（v1.9.150 据 unit 实际值订正为 15）。
 
 - **v1.9.47**：**响应 IP 合法性校验（防 DNS 劫持/rebinding）**。上游返回的 A/AAAA 若为私有/保留/环回地址（10.x/192.168.x/127.x/169.254.x/fc00::/7 等）自动丢弃，全部答案均为私有 IP 时返回 NODATA；forceIp 规则豁免。配置项 `rebind_protection`（默认开启），前端可开关。
 
@@ -462,7 +483,7 @@ ebpdns/
   **实测（VM 场景复现：64 线程、30 真实域名+60 虚构负缓存+AAAA，log_level=debug 全量日志）**：3 轮各 1 小时共 180 分钟，累计查询数亿次，RSS 稳定 63-70MB（对比修复前 VM 737MB，**内存下降 90%+**），QPS 稳定 0.85-1.7 万，成功率 99.8-100%，全程零 ERROR 零 Traceback；仅 2 个网络不可达上游（doh.pub/120.53.53.53）的前 3 次连接失败 WARNING（fail_seq 限频，第 4 次起降为 DEBUG），非异常。
 
 - **v1.9.3**：逐文件逐行二次全量审查 + 一小时极限压测后的修复与优化。① **补上 v1.9.2 遗漏的慢池弹性**(`_doh_pool` worker 按启用慢上游 8→32)——上一轮因断言失败整段脚本未写入, 实际未生效; ② 修复 NXDOMAIN 负缓存 TTL 逻辑 bug——旧 `max(neg_ttl, min(mn,60))` 在 ttl_max 生效时会"抬高"而非钳制, 负缓存不服从 TTL 管控, 改为 `max(10, _clamp_ttl(...))`; ③ `_ip_speed_cache` 超限清理从"只删过期项"(随机 IP 压测下永不缩小)改为按测速时间删最旧 1/4; ④ 后台结果收集 `_collect_rest` 不再向已返回客户端的 trace 继续 append(污染引用); ⑤ API 上游增/改的 port/latency 非法值从 500 崩溃降级为 400 明确报错; ⑥ QUIC 连接失败日志从 `%s` 改 `%r`(aioquic 的 str(e) 常为空, 原日志"连接失败:"后无详情无法排错)。**实测(1 小时 48 线程真实域名+AAAA+负缓存混合压测)**: 累计 5119 万次查询, 成功率 100.0%, QPS 稳定 1.3-1.5 万, RSS 72→130MB(极限 QPS 下 Python 分配器常态, 10 分钟 40 线程对照压测 RSS 稳定 58MB 证实结构零泄漏——所有诊断结构均在限长内: ip_speed_cache=0、各线程池 pending=0、deque 到上限即停), 日志全程零 ERROR 零 WARNING, QUIC 连接 45 分钟零重连。
-- **v1.9.2**：全面代码审查(逐文件逐行)后的修复与优化。① DoH 连接池 `_ConnPool` key 补 path——同一 host:port 不同 DoH 路径(如 NextDNS /4d5525 vs /dns-query)不再复用错连接; ② QUIC 连接管理器 `get_quic_upstream` key 补 path——DoH3 同问题修复, API QUIC 诊断 key 同步对齐并给 stats() 补 path 字段; ③ server.py TCP 绑定失败从 raise 致命降级为 WARNING(仅 UDP 服务)——修复 TCP:53 被占时整个 daemon 起不来的问题(原注释称"不致命"但代码实际致命); ④ 慢池 `_doh_pool` worker 数按 DoH/DoT/DoQ/DoH3 启用上游弹性(8→32)——用户 VM 大量 DoH 上游时固定 8 worker 导致慢查询排队拖高 miss 延迟; ⑤ 后台结果收集 `_collect_rest` 超时从固定 1s 对齐到上游查询超时(timeout_ms)——避免慢协议(DoH/DoH3)结果过早放弃导致上游成功率统计缺失(显示"待命")。
+- **v1.9.2**：全面代码审查(逐文件逐行)后的修复与优化。① DoH 连接池 `_ConnPool` key 补 path——同一 host:port 不同 DoH 路径(如 NextDNS /<profile-id> vs /dns-query)不再复用错连接; ② QUIC 连接管理器 `get_quic_upstream` key 补 path——DoH3 同问题修复, API QUIC 诊断 key 同步对齐并给 stats() 补 path 字段; ③ server.py TCP 绑定失败从 raise 致命降级为 WARNING(仅 UDP 服务)——修复 TCP:53 被占时整个 daemon 起不来的问题(原注释称"不致命"但代码实际致命); ④ 慢池 `_doh_pool` worker 数按 DoH/DoT/DoQ/DoH3 启用上游弹性(8→32)——用户 VM 大量 DoH 上游时固定 8 worker 导致慢查询排队拖高 miss 延迟; ⑤ 后台结果收集 `_collect_rest` 超时从固定 1s 对齐到上游查询超时(timeout_ms)——避免慢协议(DoH/DoH3)结果过早放弃导致上游成功率统计缺失(显示"待命")。
 - **v1.9.1**：修复用户 VM 实测 v1.9.0 仍存在的高内存(4.5 小时 810M)。根因: `_STABLE_SEC=15s` 过短——用户 VM 的 QUIC 连接存活约 20-30s(被上游空闲关闭/偶发失败), 超过 15s 阈值被判"稳定"导致退避反复复位 2s, 每 30s 重连一次, 4.5h 多个 DoH3 上游累积上千次重连; 且 `query()` 超时后未取消悬挂在事件循环上的协程(future), 协程持续持有旧连接 proto 引用, 旧 QuicConnection 对象无法被 GC 回收累积。修复: ① `_STABLE_SEC=60.0`——连接存活不足 60s 一律视为不稳定, 退避持续指数递增至 60s 封顶(重连频率降低约 3 倍); ② `query()` 超时后主动 `fut.cancel()` 取消悬挂协程, 释放对旧连接的引用; ③ 退避较大时主动 `gc.collect()` 回收 aioquic 连接对象循环引用(protocol↔quic↔http)。实测: 3 个不稳定 DoQ 上游(服务器每 8/15/30s 强制断开全部连接)持续查询 15 分钟, 45 次重连下 RSS 全程稳定 47→48MB 零泄漏(修复前同场景内存线性增长); 48 线程 5 分钟压测 476 万查询 100% 成功 RSS 60MB 稳定。
 - **v1.9.0**：修复长期运行内存泄漏(用户 VM 6 小时 1.7G)与 QUIC 重连风暴。① `_maintain` 退避逻辑 bug——`backoff=2.0` 在进入 connect 块时复位导致不稳定上游(连接建立后短时断开)形成 2s 一次无限重连风暴, 修复为退避只在"连接稳定存活 >=15s"后复位, 否则持续指数递增到 60s 封顶(实测 5s 断连的极端场景 180s 重连从 36 次降至 6 次); ② `_exchange` 查询"业务失败"(超时/HTTP 非 200)不再主动关闭整个连接(连接可复用), 仅连续 3 次失败才触发重建, 消除偶发超时引发的重连风暴; ③ 修复 `_H3Client._streams` 泄漏——对端对已结束流的数据包不再重建条目, 流状态字典不再无限增长; ④ aioquic 连接关闭期残留 timer 噪音(`NoneType sendto` / `call_exception_handler` None)通过 loop exception handler 统一降噪; ⑤ API 上游列表新增 QUIC 连接诊断(connected/reconnects/fail_seq), 控制台可实时观察 DoQ/DoH3 上游健康度。实测: 3 分钟 64 线程 332 万查询 100% 成功, daemon RSS 57→62MB 收敛; 极端不稳定上游(每 5s 强制断连)180s 内存稳定 44MB 无泄漏; 稳定 DoQ 75s 6.3 万查询 100% 成功。
 - **v1.8.19**：QA 循环收尾。① 清理全部 pyflakes 未使用变量(resolver/upstream 共 5 处), 静态检查零告警; ② 后台上游结果收集超时 WARNING 降为 DEBUG(慢上游排队是常态, 客户端已拿到首答, 压测高峰不再打扰运维日志), 收集超时 3s→1s 更快释放后台线程; ③ install.sh 已含 aioquic 自动检测安装(apt→pip 三级回退)。实测: 26 单测全过; 27 项联合测试(6 协议上游/分流/负缓存/TTL/API/规则导入/持久化/一键重测速)全 PASS; 5 分钟 64 线程 373 万查询 100% 成功 QPS 12,332 p99 16.7ms RSS 峰值 63MB 零泄漏无崩溃; 高负载 SIGKILL 后 0.2s 重启立即恢复查询 成功率 99.99%; 日志零 WARNING/ERROR。

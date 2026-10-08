@@ -48,7 +48,7 @@ DEFAULTS = {
     "persist_ttl": 0,            # 持久化缓存恢复后的独立 TTL(秒), 0=按保存时剩余 TTL 原样恢复; 上限 31536000(一年)
     "cache_persist": True,       # 缓存持久化总开关: 关闭后不写盘(周期/退出保存均不生效)也不从磁盘载入
     "prefetch": True,
-    "kernel_direct": True,          # 缓存命中语义标记"内核直答"（真实 XDP 数据面时启用）
+    "kernel_direct": True,          # 缓存命中计入"直答"遥测计数（真实 XDP 数据面时语义一致；当前为纯用户态）
     "speed_test": True,             # 测速择优
     "speed_interval_ms": 2000,
     "speed_timeout_ms": 300,
@@ -72,6 +72,13 @@ DEFAULTS = {
     "log_format": "text",           # 日志格式: text=可读文本 / json=结构化 JSON lines(可观测性)
     "timeout_ms": 1500,             # 上游单次查询超时
     "max_parallel_upstreams": 3,    # 工作线程池估算基数(解析已改为并发全部可用上游)
+    # 多上游 NXDOMAIN 一致性判定: 需至少该数量的上游一致返回 NXDOMAIN 才确认
+    # 域名不存在并提前返回(防单个上游撒谎把存在的域名判成不存在)。resolver 会把
+    # 该值自动钳到实际参与投票的健康上游数; 设为 1 恢复旧行为(首个 NXDOMAIN 即返)。
+    # R-fix: 此前仅存在于 resolver 的 cfg.get("nxdomain_quorum", 2) 兜底读取,
+    # 未登记进 DEFAULTS —— 而 api._CFG_WRITABLE_KEYS 由 DEFAULTS 推导, 导致该键
+    # 被 PUT /api/config 白名单静默剔除, 文档(README 配置表)宣称可配却无法下发。
+    "nxdomain_quorum": 2,
     "log_level": "info",
     "web_root": None,               # None = 自动定位到包内 web/ 目录
     "upstreams": [
@@ -90,7 +97,7 @@ DEFAULTS = {
         {"id": "google-doh", "name": "Google DoH", "proto": "doh", "addr": "dns.google", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
         {"id": "google-ip-doh", "name": "Google IP DoH", "proto": "doh", "addr": "8.8.8.8", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
         {"id": "quad9-doh", "name": "Quad9 DoH", "proto": "doh", "addr": "dns.quad9.net", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
-        {"id": "nextdns-doh", "name": "NextDNS DoH", "proto": "doh", "addr": "dns.nextdns.io", "port": 443, "url": "/4d5525", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
+        {"id": "nextdns-doh", "name": "NextDNS DoH", "proto": "doh", "addr": "dns.nextdns.io", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
         {"id": "opendns-doh", "name": "OpenDNS DoH", "proto": "doh", "addr": "doh.opendns.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
         {"id": "dnssb-doh", "name": "DNS.SB DoH", "proto": "doh", "addr": "doh.dns.sb", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": False, "latency_measured": False},
         {"id": "adguard-doh", "name": "AdGuard DoH", "proto": "doh", "addr": "dns.adguard.com", "port": 443, "url": "/dns-query", "group": "global", "latency": 5000, "enabled": True, "latency_measured": False},
@@ -390,6 +397,10 @@ _NUM_RANGES = {
     "circuit_fails": (1, 100),
     "circuit_open_s": (1, 86400),
     "ip_speed_cache_ttl": (0, 86400),
+    # R-fix: nxdomain_quorum 范围 1-64。下限 1(恢复"首个 NXDOMAIN 即返"旧行为),
+    # 上限 64 与 resolver 的上游并发上限同一量级; 超过健康上游数时 resolver 会自动
+    # 钳到健康上游数(等价于"等全部上游"), 故上限仅防离谱值。
+    "nxdomain_quorum": (1, 64),
 }
 # 枚举字段: 合法取值集合
 _ENUM_VALUES = {
@@ -464,6 +475,23 @@ def _validate_upstream_item(item):
     # 避免运行态携带坏 id 导致后续 PUT /api/config 整请求 400 自锁。
     if not _UPSTREAM_ID_RE.match(_id):
         return False
+    # R-fix NaN/Infinity: latency/weight 此前加载期完全不校验。api._validate_upstream_dict
+    # 用 `0 <= lat <= 3600000` 拦 NaN/Infinity(两者比较均为 False → 被拒), 但手编
+    # config.json 走的是本函数 —— 非有限值放行后 json.dumps 会把它输出成裸的
+    # NaN/Infinity(非法 JSON, 严格解析器直接报错), 且 NaN 参与 resolver 的
+    # eff_lat/weight 排序会产生不可预期的比较结果。此处就地归一为安全值(保留该
+    # 上游条目, 不整条丢弃 —— 与 cache_partitions 的加载期回退语义一致)。
+    for _k, _lo, _hi, _dflt in (("latency", 0, 3600000, 5000),
+                                ("weight", 0, 1000, 1)):
+        if _k not in item:
+            continue
+        _v = item.get(_k)
+        _ok = (isinstance(_v, (int, float)) and not isinstance(_v, bool)
+               and math.isfinite(_v) and _lo <= _v <= _hi)
+        if not _ok:
+            logging.warning("上游 %s 的 %s 非法(需为 %d-%d 的有限数值), 已回退默认 %r: %r",
+                            _id, _k, _lo, _hi, _dflt, _v)
+            item[_k] = _dflt
     return True
 
 
@@ -503,6 +531,14 @@ def _validate_cfg(cfg):
         try:
             iv = int(v)
         except (TypeError, ValueError, OverflowError):
+            _fallback(cfg, key)
+            continue
+        # R-fix NaN/Infinity: int(float('nan')) / int(float('inf')) 分别抛
+        # ValueError / OverflowError, 已由上一行捕获; 此处再加 math.isfinite 兜底,
+        # 防未来加入接受 float 的数值键时非有限值静默入库 —— json.dumps 会把
+        # NaN/Infinity 输出为裸字面量(非法 JSON), 且 NaN 参与上游延迟排序会产生
+        # 不可预期的比较结果。与 api._validate_cfg_update 的 isfinite 检查同口径。
+        if isinstance(v, float) and not math.isfinite(v):
             _fallback(cfg, key)
             continue
         if (lo is not None and iv < lo) or (hi is not None and iv > hi):
@@ -577,6 +613,33 @@ def _validate_cfg(cfg):
         else:
             # P3-3(R4): 空值统一归一为 None(与默认值、api 写入路径对齐), 不再写空串 ""。
             cfg["edns_client_subnet"] = None
+    # R-fix: cache_file / web_root 必须是非空字符串路径(或 None)。此前二者完全不在
+    # 校验范围内: `cache_file: 123` 会让 cli.run 里 os.path.isabs() 抛 TypeError 穿透
+    # main() → 启动 traceback / systemd 崩溃循环; `web_root: 123` 会让 api._serve_static
+    # 抛 TypeError → 控制台全部静态资源连接被丢弃(而 /api/health 仍 200, 监控误判健康)。
+    for _pk in ("cache_file", "web_root"):
+        if _pk not in cfg:
+            continue
+        _pv = cfg.get(_pk)
+        if _pv is None:
+            continue   # web_root 的 None 表示"自动定位包内 web/" (load_config 末尾填充)
+        if not isinstance(_pv, str) or not _pv.strip():
+            logging.warning("%s 非法(需为非空字符串路径, got %r), 已回退默认 %r",
+                            _pk, _pv, DEFAULTS.get(_pk))
+            cfg[_pk] = copy.deepcopy(DEFAULTS.get(_pk))
+    # R-fix: api.host / listen 绑定串必须是字符串; api.host 为空串时显式回退回环。
+    # 此前空串能通过"isinstance(str)"式校验, 而 socket.bind(("",port)) 实际绑定
+    # 0.0.0.0("留空"变成监听全部网卡), 与 README 反复强调的"须显式改 0.0.0.0"意图相反。
+    _api = cfg.get("api")
+    if isinstance(_api, dict):
+        _ah = _api.get("host")
+        if not isinstance(_ah, str) or not _ah.strip():
+            logging.warning("api.host 非法/为空(got %r), 已回退回环 %r",
+                            _ah, DEFAULTS["api"]["host"])
+            _api["host"] = DEFAULTS["api"]["host"]
+    elif _api is not None:
+        logging.warning("api 配置段不是对象(got %r), 已回退默认", type(_api).__name__)
+        cfg["api"] = copy.deepcopy(DEFAULTS["api"])
     # v1.9.84 P3: upstreams/rules 必须是列表, 防止用户配置把它们写成 dict/标量
     # 导致后续遍历/保存处类型错误(deep_merge 对 list→dict 不会报错)。
     for key in ("upstreams", "rules"):

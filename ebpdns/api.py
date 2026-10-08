@@ -416,7 +416,12 @@ def _upstream_optional_fields(body):
     # allow_private_ip 缺省 False(不过滤豁免)保持不变。
     for bk, bd in (("allow_private_ip", False),
                    ("doh_strict_cert", True),
-                   ("dot_strict_cert", True)):
+                   ("dot_strict_cert", True),
+                   # R-fix: QUIC 上游开关。此前这两个键只在 quic_upstream.py 被读取,
+                   # 任何 API 路径都不提取/不校验, POST 新建时被静默丢弃 →
+                   # 文档承诺的 doq/doh3 strict_cert 开关实际无法配置。
+                   ("doq_strict_cert", True),
+                   ("doh3_strict_cert", True)):
         if bk in body:
             fields[bk] = _as_bool(body.get(bk), bd)
     return fields, None
@@ -466,8 +471,11 @@ def _sub_url_blocked(url):
     if not ips:
         return "订阅主机名无可用 IP", []
     for ip in ips:
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        # R-fix: 改用 ipaddress.is_global 作为唯一判据。原先的显式枚举漏掉了
+        # 100.64.0.0/10(RFC 6598, 运营商级 NAT / 部分云内网互联段): 该段
+        # is_private/is_loopback/is_link_local/is_reserved 全为 False 而 is_global
+        # 亦为 False, 于是被当公网放行。is_global 覆盖全部"非全球可路由"空间。
+        if not ip.is_global:
             return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)", []
     return None, [str(ip) for ip in ips]
 
@@ -620,6 +628,20 @@ _RUNTIME_KEYS = {"cache_file", "rule_sub_file", "rule_local_file"}
 # 弹琥珀色"忽略未保存的键: listen, api, web_root"提示, 纯 UX 噪音。它们不是用户
 # 误填的键, 而是设计上不可热写的键, 从 dropped 中排除。
 _SERVER_KEYS = {"listen", "api", "web_root"}
+
+# R-fix: 单条 PUT /api/upstreams/<id> 与 bulk PUT /api/config 的 upstreams[] 共用同一份
+# 可写字段白名单(此前 bulk 路径无未知键检查, 同一条目经两条路径行为不一致:
+# 单条 400 拒绝、bulk 却把任意键永久固化进 config.json 并回显)。
+# 含 id/latency_measured —— 前端把 /api/upstreams 的结果整组回传保存, 二者必然出现。
+_UPSTREAM_WHITELIST = frozenset({
+    "id", "name", "proto", "addr", "url", "port", "enabled",
+    "latency", "latency_measured", "group", "weight", "allow_private_ip",
+    # R12 P2: DoH/DoT 上游级证书校验 kill switch(upstream.py 读取)。
+    "doh_strict_cert", "dot_strict_cert",
+    # R-fix: QUIC 上游(strict_cert)开关。此前只在 quic_upstream.py 被读取,
+    # 从未进入任何 API 白名单 → POST/PUT 都被静默丢弃, 该开关实际无法配置。
+    "doq_strict_cert", "doh3_strict_cert",
+})
 
 
 class AppContext:
@@ -888,6 +910,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
+        # R-fix: HEAD 请求只回首部(Content-Length 保留, 与 GET 一致, 符合 RFC 7231)。
+        if getattr(self, "_head_only", False):
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, OSError):
@@ -904,16 +929,39 @@ class _Handler(BaseHTTPRequestHandler):
         # 读请求行/头或 body 超时会抛 socket.timeout/TimeoutError, 此处静默断连,
         # 不打印 traceback(慢滴攻击连接每次超时都打栈会淹近日志)。body 读路径的
         # IO 异常已由 _read_json 统一吞掉并回 _SENTINEL。
+        # R-fix: 另加**未预期异常**的统一兜底 —— 此前任一 handler 漏包 try/except 时
+        # 异常会穿透到 socketserver, 客户端只看到连接被重置(RemoteDisconnected)而非
+        # 5xx JSON, 前端显示"后端不可达", traceback 进 journal。现在统一回结构化 500。
+        # 注意: 先记录日志再尝试回 500; 若响应已部分写出, _send 会失败并被忽略。
         try:
             super().handle()
         except (_socket.timeout, TimeoutError, ConnectionResetError,
                  BrokenPipeError, EOFError):
             pass
+        except Exception:
+            try:
+                logging.getLogger("ebpdns.api").exception(
+                    "API 处理未预期异常, 已回 500: %s %s", self.command, self.path)
+            except Exception:
+                pass
+            try:
+                self._send(500, {"error": "internal error"})
+            except Exception:
+                pass
 
     def _read_json(self, expect_dict=True, limit=None):
         try:
             if limit is None:
                 limit = getattr(self, "_body_limit", self.MAX_BODY)
+            # R-fix: 显式拒绝 Transfer-Encoding。本服务只实现 Content-Length 定长体,
+            # 既不实现 chunked 也不该静默忽略它 —— 二者并存时(CL.TE)前面的反代可能按
+            # TE 转发、本服务按 CL 截断, 剩余字节会被下一轮 handle_one_request 当作
+            # **独立请求**解析(请求走私)。这里直接 400 并关闭连接(fail-closed)。
+            _te = (self.headers.get("Transfer-Encoding") or "").strip()
+            if _te:
+                self._send(400, {"error": "Transfer-Encoding not supported"})
+                self.close_connection = True
+                return _SENTINEL
             # R51 P3-1: Content-Length 为非数值字符串(如 "abc")时 int() 抛 ValueError,
             # 此前未被 handle() 捕获会冒泡到 socketserver 打 traceback(仅日志噪音)。
             # 这里主动回 400 并返回 _SENTINEL(与 413 路径一致, 调用方静默 return),
@@ -921,6 +969,11 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
+                self._send(400, {"error": "bad Content-Length"})
+                self.close_connection = True
+                return _SENTINEL
+            if n < 0:
+                # R-fix: 负值此前与 0 同路径被当作"无 body"; 显式拒绝。
                 self._send(400, {"error": "bad Content-Length"})
                 self.close_connection = True
                 return _SENTINEL
@@ -1010,16 +1063,50 @@ class _Handler(BaseHTTPRequestHandler):
                 return p in (80, 443)
             return p == req_port
 
+        # R-fix: LAN 模式主机名放行。原先非 IP 的 Origin host 一律拒绝, 导致
+        # `api.host=0.0.0.0` 时用**主机名**访问控制台(如 http://ebpdns.lan:8080)的
+        # 所有写操作被 403 拒绝 —— 且因该分支在 token 校验之前, 携带正确 token 也无救。
+        # 安全性不削弱: 调用点已先要求 Origin host == 请求 Host 头 host 且端口一致,
+        # 即浏览器视角的同源; 这里只判定"该主机名是否可信的本地名字"。
+        _LOCAL_TLDS = (".local", ".lan", ".home", ".internal", ".intranet", ".localdomain")
+        _host_ok_cache = {}
+
         def _is_private_or_loopback_ip(host):
             """LAN 模式 CSRF 自洽回退的纵深检查: 要求 host 是私网段/环回/链路本地 IP,
-            拒绝裸公网域名(如 evil.ddns.net)。LAN 模式下管理应通过 IP 访问。"""
+            或可信的本地主机名(私有 TLD / 无点短名 / 解析到私网地址)。
+            拒绝裸公网域名(如 evil.ddns.net)。"""
             if not host:
                 return False
             try:
                 ip = ipaddress.ip_address(host)
             except ValueError:
-                return False   # 是主机名, 不是 IP — 拒绝
-            return ip.is_private or ip.is_loopback or ip.is_link_local
+                pass
+            else:
+                return ip.is_private or ip.is_loopback or ip.is_link_local
+            # 是主机名: 先用私有 TLD / 无点短名快速判定
+            h = host.lower().rstrip(".")
+            if h.endswith(_LOCAL_TLDS) or "." not in h:
+                return True
+            # 其余(FQDN)对每个主机名至多解析一次, 要求解析结果全为私网/环回地址。
+            # 防止公网域名经 DNS rebinding 指向本机后伪装成"本地名字"。
+            _hit = _host_ok_cache.get(h)
+            if _hit is not None:
+                return _hit
+            ok = False
+            try:
+                _infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+                _ips = []
+                for _f, _t, _p, _c, _sa in _infos:
+                    try:
+                        _ips.append(ipaddress.ip_address(_sa[0]))
+                    except ValueError:
+                        continue
+                ok = bool(_ips) and all(
+                    _i.is_private or _i.is_loopback or _i.is_link_local for _i in _ips)
+            except Exception:
+                ok = False
+            _host_ok_cache[h] = ok
+            return ok
 
         # R23 P3-1: 环回判定——取代硬编码 _LOOPBACK 元组。IP 字符串走
         # ipaddress.is_loopback, 覆盖全部 127/8 与 ::1(此前只认 127.0.0.1/::1,
@@ -1198,6 +1285,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not presented:
             presented = (self.headers.get("X-Api-Key", "") or "").strip()
         if not presented:
+            # R-fix: README 与配置表把 `?token=<token>` 列为与 Bearer/X-Api-Key 等价的
+            # 第三种认证方式(README:135/240/249/253), 但代码从不读查询串 —— 按文档
+            # 照抄 curl 的用户一律拿到 401。此处补齐该途径(取第一个值, 保持与
+            # Bearer 相同的 strip/常量时间比较语义)。
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query,
+                                           keep_blank_values=False)
+                _qt = qs.get("token") or []
+                if _qt:
+                    presented = str(_qt[0]).strip()
+            except Exception:
+                presented = ""
+        if not presented:
             return False
         # P2-1(R5): hmac.compare_digest 对 str 形式要求两端均为 ASCII-only, 任一含
         # 非 ASCII(如中文 token)即抛 TypeError, 导致所有已认证写请求断连且无 JSON 错误。
@@ -1215,6 +1315,96 @@ class _Handler(BaseHTTPRequestHandler):
         调用方须在 app._lock 内递增 _rule_rebuild_gen 后, 在锁外调用本方法。"""
         return self.app.rebuild_rule_index_synced()
 
+    def _origin_ok(self):
+        """R-fix: 读端点(GET /api/*, /metrics)的同源校验, 防 DNS rebinding 读取。
+
+        与 _csrf_ok 的差别: _csrf_ok 对"无 Origin/Referer 且绑定非回环"的**非浏览器**
+        客户端要求 token(防跨站写); 而读端点必须对**脚本/curl**保持免 token 可用
+        (默认部署 token 为空), 因此这里只针对"带 Origin/Referer 的浏览器请求"做
+        同源判定, 并对 Host 头做回环/本地名字收敛。
+
+        判据: Origin(或 Referer)的 host 与请求 Host 头的 host 必须自洽, 且两者都必须
+        是回环 / 配置的 api.host / 可信本地名字, 端口一致。攻击者的 evil.com 既不等于
+        Host 头、也不是回环/本地名字, 因此 rebinding 请求被拒。
+        """
+        api_cfg = self.app.cfg.get("api", {}) or {}
+        configured_host = str(api_cfg.get("host", "127.0.0.1") or "127.0.0.1").strip().lower()
+        configured_port = api_cfg.get("port", 8080)
+
+        req_host = self.headers.get("Host", "") or ""
+        _rp = urllib.parse.urlsplit("//" + req_host)
+        req_host_part = (_rp.hostname or "").lower()
+        req_host_port = _rp.port
+
+        def _u_host(u):
+            try:
+                return (urllib.parse.urlparse(u).hostname or "").lower()
+            except Exception:
+                return ""
+
+        def _u_port(u):
+            try:
+                return urllib.parse.urlparse(u).port
+            except Exception:
+                return None
+
+        def _u_scheme(u):
+            try:
+                return (urllib.parse.urlparse(u).scheme or "").lower()
+            except Exception:
+                return ""
+
+        def _trusted_host(h):
+            """host 是否可信: 回环 / 等于配置 api.host / 可信本地名字 / 私网 IP。"""
+            if not h:
+                return False
+            if h == "localhost":
+                return True
+            try:
+                ip = ipaddress.ip_address(h)
+            except ValueError:
+                pass
+            else:
+                return (ip.is_loopback or ip.is_private or ip.is_link_local)
+            if h == configured_host:
+                return True
+            for _t in (".local", ".lan", ".home", ".internal", ".intranet", ".localdomain"):
+                if h.endswith(_t):
+                    return True
+            return "." not in h
+
+        try:
+            _lan = (configured_host == ""
+                    or ipaddress.ip_address(configured_host).is_unspecified)
+        except ValueError:
+            _lan = False
+
+        # 请求 Host 头本身必须可信(防 Host 头投毒/rebinding 指向外部名)
+        if req_host_part and not (_trusted_host(req_host_part) or _lan):
+            return False
+
+        src = self.headers.get("Origin") or self.headers.get("Referer")
+        if not src:
+            return True   # 非浏览器直连(脚本/探针): 读端点放行
+        oh = _u_host(src)
+        if not oh:
+            return False
+        if not _trusted_host(oh):
+            return False
+        # Origin 与 Host 头必须自洽(同主机)
+        if req_host_part and oh != req_host_part:
+            return False
+        # 端口一致(无端口按 scheme 归一)
+        op = _u_port(src)
+        if op is None:
+            op = 443 if _u_scheme(src) == "https" else 80
+        if req_host_port is None:
+            if op not in (80, 443) and op != configured_port:
+                return False
+        elif op != req_host_port:
+            return False
+        return True
+
     def _route(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -1229,6 +1419,23 @@ class _Handler(BaseHTTPRequestHandler):
         if (path.startswith("/api/") or path == "/metrics") and path != "/api/health":
             if not self._check_api_token():
                 return self._send(401, {"error": "未授权"})
+
+        # R-fix: 读端点的 DNS-rebinding 防护。
+        # 背景: 写操作有 _csrf_ok(Origin/Referer 对端校验), 但 **GET 读端点此前一行
+        # 校验都没有**, 请求 Host 头可为任意值。攻击者可让受害浏览器经 DNS rebinding
+        # 同源 fetch('/api/config') / '/api/logs', 读走整份 DNS 配置(上游拓扑、订阅 URL)
+        # 与查询日志(client_ip + 域名)。默认部署 api.host=127.0.0.1/token="" 下这属于
+        # "任何在同一台机器上浏览网页的人都能读走"。
+        # 判据(与 _csrf_ok 的严格模式同口径): Origin(若有)的 host 与请求 Host 头的 host
+        # 必须都是回环地址 / 等于配置的 api.host / 属于可信本地名字, 且端口一致。
+        # 无 Origin 的非浏览器客户端(curl/脚本)不受影响; 控制台自身导航天然同源。
+        if path.startswith("/api/") or path == "/metrics":
+            try:
+                if not self._origin_ok():
+                    return self._send(403, {"error": "cross-origin read blocked"})
+            except Exception:
+                # 校验逻辑自身异常时 fail-closed(读端点不出数据), 但仍返回结构化 403
+                return self._send(403, {"error": "cross-origin read blocked"})
 
         # v1.9.76 P1-2: rules/import(粘贴海量域名)与 rules/subscribe 单独放宽到 16MB,
         # 其余接口默认 4MB。_read_json 未显式传 limit 时读取此实例属性。
@@ -1464,7 +1671,13 @@ class _Handler(BaseHTTPRequestHandler):
         if dnsmsg.type_code(qtype) == 0:
             return self._send(400, {"error": "bad qtype: %r" % (qtype,)})
         try:
-            res = self.app.resolver.resolve(domain, qtype, silent=False, client_ip="查询控制台")
+            # R-fix: 控制台手动查询不应污染真实流量统计。原实现未传 counted, 默认
+            # counted=True, 于是每次人工查询都会抬升 total/qtype_dist/qps_window(QPS 曲线)
+            # 与 top_clients(出现伪客户端"查询控制台"), 缓存命中时还抬高 hit/hit_rate;
+            # 并对被查询域名 schedule_prefetch, 把人工查询变成后台预取任务。
+            # 与预取/后台刷新路径一致改为 counted=False(仍返回完整 trace 供控制台展示)。
+            res = self.app.resolver.resolve(domain, qtype, silent=False,
+                                            client_ip="查询控制台", counted=False)
         except Exception:
             # v1.9.146 P1-2: 不再把 str(e)(socket 错误/上游 IP 端口/内部异常类型)回给
             # 调用方; 详情只记日志。LAN 暴露且未配 token 时这是侦察信息泄露面。
@@ -1696,10 +1909,14 @@ class _Handler(BaseHTTPRequestHandler):
         # 哪些提交的键未被保存(避免静默丢弃让用户误以为已生效)。
         # P3-1: 运行时派生键(cache_file/rule_sub_file/rule_local_file)不计入 ignored_keys,
         # 否则每次保存都提示纯噪音; 它们本就不该落盘, 下方 data 过滤仍按白名单剔除。
+        # R-fix: 不再把 listen/api/web_root 排除出 dropped。它们确实**不可热写**
+        # (白名单设计正确: web_root 若能经 API 重定向, 静态处理器就变成任意文件读取
+        # 原语), 但原先为"避免 UX 噪音"把它们从 ignored_keys 里滤掉, 导致脚本/外部
+        # 集成方收到的响应是"保存成功、无被忽略键"——**无法察觉自己的提交被丢弃**。
+        # 现按真实语义回报: 被丢弃就列出来, 让调用方可据 ignored_keys 判断。
         dropped = [k for k in data.keys()
                    if k not in _CFG_WRITABLE_KEYS
-                   and k not in _RUNTIME_KEYS
-                   and k not in _SERVER_KEYS]
+                   and k not in _RUNTIME_KEYS]
         data = {k: v for k, v in data.items() if k in _CFG_WRITABLE_KEYS}
         # M1 防御: GET /api/config 已把 api.token 脱敏为 "***" 回传前端。若前端原样
         # 回传保存, 白名单(_CFG_WRITABLE_KEYS 排除了 api)本就会丢弃整个 api 子表; 此处
@@ -1725,6 +1942,17 @@ class _Handler(BaseHTTPRequestHandler):
         if "upstreams" in data:
             _seen_uids = set()
             for i, u in enumerate(data["upstreams"]):
+                # R-fix: 未知键必须拒绝, 与单条 PUT /api/upstreams/<id> 的白名单
+                # (_UPSTREAM_WHITELIST 强制 400) 口径一致。此前 bulk 路径只校验已知
+                # 字段, 于是同一条目经单条接口改是 400、经本接口却能把任意键
+                # (如 "evil": {...}) 永久固化进 config.json 并原样回显给前端。
+                if isinstance(u, dict):
+                    _unknown = [k for k in u.keys() if k not in _UPSTREAM_WHITELIST]
+                    if _unknown:
+                        return self._send(400, {
+                            "error": "upstreams[%d]: 未知字段 %s (允许: %s)"
+                                     % (i, ",".join(sorted(_unknown)),
+                                        ",".join(sorted(_UPSTREAM_WHITELIST)))})
                 verr = _validate_upstream_dict(u)
                 if verr:
                     return self._send(400, {"error": "upstreams[%d]: %s" % (i, verr)})
@@ -2490,14 +2718,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
             # v1.9.74 P2-7: 字段白名单 + proto 枚举校验, 禁止改 id / 灌入任意字段
             # (防误改内部字段如 latency_measured/健康检查状态, 或注入非法 proto)。
-            _UPSTREAM_WHITELIST = {"name", "proto", "addr", "url", "port",
-                                   "enabled", "latency", "group", "weight",
-                                   "allow_private_ip",
-                                   # R12 P2: R8 新增的 DoH/DoT 上游级证书校验 kill switch
-                                   # (upstream.py:884/1196 读取), 此前仅可经 bulk PUT /api/config
-                                   # 写入; 单条编辑表单提交时字段被白名单静默丢弃。与
-                                   # allow_private_ip 同型(bool 归一)补齐, 消除 API 表面不一致。
-                                   "doh_strict_cert", "dot_strict_cert"}
+            # R-fix: 直接使用模块级 _UPSTREAM_WHITELIST(已提升), 不再在此重复定义,
+            # 避免单条/bulk 两条路径的白名单漂移。
             # P2-18: 删除函数内重复的 _ALLOWED_PROTO, 统一用模块级
             # _ALLOWED_UPSTREAM_PROTO(与 POST 新建/parse_upstream_addr 同源), 防漂移。
             # P2-1: 先完整校验+归一化 body(只算到局部 updates, 不碰 cfg), 全部通过后
@@ -3628,6 +3850,28 @@ class _Handler(BaseHTTPRequestHandler):
     # ---------- BaseHTTPRequestHandler ----------
     def do_GET(self):
         self._route()
+
+    def do_HEAD(self):
+        # R-fix: HTTP/1.1 要求对可 GET 的资源支持 HEAD(探针/反代/缓存校验常用),
+        # 此前落到 stdlib 默认实现返回 501 + HTML 错误页。
+        # 实现方式: 以 GET 语义路由(路由表按 method == "GET" 分派, 若原样传 "HEAD"
+        # 会全部落到 404), 但置 _head_only 让 _send 只写首部不写 body。
+        self._head_only = True
+        self.command = "GET"
+        try:
+            self._route()
+        finally:
+            self._head_only = False
+
+    def do_OPTIONS(self):
+        # R-fix: 返回 Allow, 供跨域预检/工具探测。不实现 CORS 通配, 仅声明方法集。
+        try:
+            self.send_response(204)
+            self.send_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            pass
 
     def do_POST(self):
         if not self._csrf_ok():

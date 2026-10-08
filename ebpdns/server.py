@@ -57,7 +57,10 @@ def make_udp_socket(host):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except OSError:
+    except (AttributeError, OSError):
+        # R-fix: 非 Linux 平台(如 Windows)的 socket 模块**没有** SO_REUSEPORT 常量,
+        # 属性访问本身抛 AttributeError(不是 OSError 子类), 仅捕 OSError 会穿透并
+        # 使进程启动即崩。此处与 TCP 路径(server_bind 内)口径对齐。
         pass
     if family == socket.AF_INET6:
         try:
@@ -298,6 +301,9 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
     # 拖垮线程数。用有界信号量限流(类变量, tcp/tcp6 共享总额度)。
     # 达到上限时 process_request 在 accept 线程阻塞等待, 形成背压而非炸线程。
     _conn_slots = threading.BoundedSemaphore(256)
+    # R-fix: accept 线程等待槽位的最长时间(秒)。超时即拒绝该新连接, 避免无限阻塞
+    # 把整条 TCP 通道(含 UDP TC=1 回退)掐死。
+    _accept_slot_wait = 0.5
 
     def __init__(self, resolver, spec):
         self.resolver = resolver
@@ -305,10 +311,25 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
         if is_ipv6_host(host):
             self.address_family = socket.AF_INET6
         super().__init__((host, port), _TCPRequestHandler)
+        # 注: IPV6_V6ONLY 在 server_bind() 内、bind 之前设置(绑后再设无效), 见该处注释。
 
     def process_request(self, request, client_address):
-        # 新连接先占槽位; 满了就在此处阻塞(背压), 而不是无界派生线程
-        self._conn_slots.acquire()
+        # R-fix: 原为**无限阻塞** acquire()。256 个慢连接(每 <5s 发 1 字节即可维持,
+        # 总寿命 30s 后重连)会让 accept 线程永久卡在这里, request_queue_size(默认 5)
+        # 随即填满 —— 新 TCP 连接被内核接受但永远拿不到应答, 其中包含正常客户端因
+        # UDP 应答 TC=1 而发起的 TCP 重试(README 把"超限应答置 TC 走 TCP"当作 DoS
+        # 防御设计, 该防御反而被反制)。实测: 256 槽占满后第 257 次连接握手立即成功
+        # 但查询 5.02s 超时。
+        # 改为限时等待: 拿不到槽位就关闭新连接(记 debug), accept 线程始终保持响应,
+        # 已建立的连接不受影响。
+        got = self._conn_slots.acquire(timeout=self._accept_slot_wait)
+        if not got:
+            try:
+                request.close()
+            except Exception:
+                pass
+            log.debug("TCP 连接槽位已满(256), 拒绝来自 %s 的新连接", client_address[0])
+            return
         try:
             super().process_request(request, client_address)
         except Exception:
@@ -333,6 +354,20 @@ class TCPDNSServer(socketserver.ThreadingTCPServer):
                     self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 except (AttributeError, OSError):
                     pass  # 内核不支持 SO_REUSEPORT 时跳过
+                # R-fix(Debian 实测): 与 UDP 路径(make_udp_socket)对齐, TCP6 显式设
+                # IPV6_V6ONLY=1, 且**必须在 bind 之前**设置(绑后再设无效)。
+                # Linux 默认 net.ipv6.bindv6only=0(Debian 13 实测为 0), 不设则 [::]:PORT
+                # 为双栈 socket。实测表明: 因本 socket 同时带 SO_REUSEPORT, 内核按地址族
+                # 分派 —— 12/12 条 IPv4 连接仍由 0.0.0.0 监听器处理、6/6 条 IPv6 由 [::]
+                # 处理, V6ONLY 设与不设结果相同, 故实践中不构成功能缺陷(审查报告 §3B.4
+                # 的严重性据此下调)。显式设置是为了与 UDP 口径一致、不依赖内核在
+                # REUSEPORT 下的未文档化分派顺序, 并在不启用 REUSEPORT 的平台上保证
+                # IPv4/IPv6 监听相互独立。
+                try:
+                    if self.address_family == socket.AF_INET6:
+                        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except (AttributeError, OSError):
+                    pass  # 平台无该选项 / 内核不支持: 跳过
                 super().server_bind()
                 return
             except OSError as e:

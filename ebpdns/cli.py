@@ -1,6 +1,7 @@
 """命令行入口：ebpdns run / status / config-path / version。"""
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -234,6 +235,15 @@ def _save_cache(cfg, config_path, cache):
             return 0
 
 
+def _safe_int_cap(cfg):
+    """R-fix: 取 cache_size 作为持久化限幅基准(畸形/缺失回退 131072)。"""
+    try:
+        v = int(cfg.get("cache_size") or 131072)
+    except (TypeError, ValueError):
+        return 131072
+    return v if v > 0 else 131072
+
+
 def _load_cache(cfg, config_path, cache):
     """启动时从磁盘载入缓存（过滤已过期条目）。返回载入条数。"""
     # v1.9.143: 持久化总开关关闭时不载入磁盘缓存。
@@ -242,6 +252,31 @@ def _load_cache(cfg, config_path, cache):
     path = _default_cache_file(cfg, config_path)
     try:
         if not os.path.isfile(path):
+            return 0
+        # R-fix(内存上限): cache.restore() 的条数上限作用在 json.load **已把整份文件
+        # 物化成 Python 对象之后**, 截断只省下第二份副本, 拦不住解析阶段的尖峰。
+        # 实测: 77 MB cache.json(30 万条) → json.load 峰值约 399 MB, restore 累计
+        # 约 560 MB; 100 万条约 730 MB。默认 cache_size=131072 时文件约 16 MB 属安全区,
+        # 但 README 把 cache_size 范围写到 10000000, 一旦用户配到百万级并积累出相应
+        # cache.json, 重启时会在载入阶段被 systemd 的 MemoryMax 杀掉 → Restart=on-failure
+        # → StartLimitBurst 后进入 failed, **DNS 永久不可用且只能人工删文件恢复**。
+        # 这里按"容量 × 每条约 512B 上限"限幅, 超限时改名备份并冷启动(不删数据)。
+        _cap = _safe_int_cap(cfg)
+        _limit_bytes = max(8 * 1024 * 1024, min(256 * 1024 * 1024, _cap * 512))
+        try:
+            _sz = os.path.getsize(path)
+        except OSError:
+            _sz = 0
+        if _sz > _limit_bytes:
+            _bak = "%s.oversized.%d" % (path, int(time.time()))
+            try:
+                os.replace(path, _bak)
+                log.warning("cache.json 过大(%d 字节 > 上限 %d, 容量 %d), 已改名备份为 %s "
+                            "并冷启动(不影响解析, 仅缓存需重新预热)",
+                            _sz, _limit_bytes, _cap, _bak)
+            except OSError as e:
+                log.warning("cache.json 过大(%d 字节 > 上限 %d)但改名失败(%s), 跳过载入",
+                            _sz, _limit_bytes, e)
             return 0
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -808,15 +843,32 @@ def main(argv=None):
     elif args.cmd == "status":
         cmd_status(cfg, config_path)
     elif args.cmd == "config-path":
-        chosen = None
-        for p in config_mod.default_paths():
-            if os.path.isfile(p):
-                chosen = p
-                break
-        print(chosen or "未找到配置文件, 将使用内置默认值")
+        # R-fix: 原先无条件遍历 default_paths() 重新探测, **完全忽略 -c/--config**,
+        # 于是 `config-path -c /tmp/x.json` 打印的是探测到的模板路径而非用户传入的
+        # 路径(与 status/config-print 行为不一致), 脚本据此读写会落到错配置上。
+        # 现优先采用已解析出的 config_path(显式 -c 或 EBPDNS_CONFIG 探测结果)。
+        if config_path:
+            print(os.path.abspath(config_path))
+        else:
+            chosen = None
+            for p in config_mod.default_paths():
+                if os.path.isfile(p):
+                    chosen = p
+                    break
+            print(chosen or "未找到配置文件, 将使用内置默认值")
     elif args.cmd == "config-print":
         import json
-        print(json.dumps(cfg, ensure_ascii=False, indent=2))
+        # R-fix: 与 GET /api/config 的脱敏策略对齐。api.token 是等价于控制台完全控制权
+        # 的凭据, 而本命令把明文打到 stdout —— 运维贴进工单/CI 日志即泄漏。
+        # 用深拷贝脱敏, 不改动内存中的 cfg(避免影响后续逻辑)。
+        try:
+            _out = copy.deepcopy(cfg)
+            _api = _out.get("api")
+            if isinstance(_api, dict) and str(_api.get("token") or "").strip():
+                _api["token"] = "***"
+        except Exception:
+            _out = cfg
+        print(json.dumps(_out, ensure_ascii=False, indent=2))
     else:
         parser.print_help()
     return 0

@@ -854,7 +854,7 @@ code.blk .c{color:var(--text3)} code.blk .kw{color:var(--cyan)} code.blk .fn{col
               </div>
               <div>
                 <b style="color:var(--cyan)">W-TinyLFU</b>（tinylfu）<br>
-                Caffeine 风格三段式：window(1%) → probation(20%) → protected(80%) + Count-Min Sketch 频率估计。一次性访问在窗口区即淘汰，高频条目受保护不被挤出，抗扫描污染，命中率通常高 5-15%。额外内存约 512KB。
+                Caffeine 风格三段式：window(1%) → probation(40%) → protected(60%) + Count-Min Sketch 频率估计。一次性访问在窗口区即淘汰，高频条目受保护不被挤出，抗扫描污染，命中率通常高 5-15%。额外内存约 512KB。
               </div>
             </div>
             <div style="margin-top:8px; color:var(--text3); font-size:12px">lru ↔ tinylfu 切换后自动热重载重建缓存（已有缓存会清空），建议运行 24 小时对比命中率再决定长期策略。map_type（LRU_HASH/LRU/LPM_TRIE）为 BPF Map 类型语义标记，当前用户态实现下不改变上述淘汰引擎。</div>
@@ -1115,7 +1115,7 @@ const DEFAULTS = {
     { id:'google-doh', name:'Google DoH/DoH3', proto:'doh', addr:'dns.google', port:443, url:'/dns-query', group:'global', latency:160, enabled:false },
     { id:'google-ip-doh', name:'Google IP DoH', proto:'doh', addr:'8.8.8.8', port:443, url:'/dns-query', group:'global', latency:160, enabled:false },
     { id:'quad9-doh', name:'Quad9 DoH/DoH3', proto:'doh', addr:'dns.quad9.net', port:443, url:'/dns-query', group:'global', latency:180, enabled:false },
-    { id:'nextdns-doh', name:'NextDNS DoH', proto:'doh', addr:'dns.nextdns.io', port:443, url:'/4d5525', group:'global', latency:200, enabled:false },
+    { id:'nextdns-doh', name:'NextDNS DoH', proto:'doh', addr:'dns.nextdns.io', port:443, url:'/dns-query', group:'global', latency:200, enabled:false },
     { id:'opendns-doh', name:'OpenDNS DoH', proto:'doh', addr:'doh.opendns.com', port:443, url:'/dns-query', group:'global', latency:200, enabled:false },
     { id:'dnssb-doh', name:'DNS.SB DoH', proto:'doh', addr:'doh.dns.sb', port:443, url:'/dns-query', group:'global', latency:220, enabled:false },
     { id:'adguard-doh', name:'AdGuard DoH', proto:'doh', addr:'dns.adguard.com', port:443, url:'/dns-query', group:'global', latency:220, enabled:false },
@@ -3190,7 +3190,7 @@ async function boot(){
     // 'sim' —— 那会把"token 错了"伪装成"进入演示模式", 用户看到假数据却毫无察觉。
     // 这里显式标记认证失败, 仍渲染 UI(否则用户无处输入 token), 但页脚标红并提示去
     // 「配置 → 连接设置」填 token; 填对后保存按钮会刷新页面重新走 boot()。
-    const _authFailed = !!(statusErr && statusErr.isAuthError);
+    let _authFailed = !!(statusErr && statusErr.isAuthError);
     if (s && s.app === 'ebpdns') MODE = 'real';
     if (MODE === 'real'){
       // configPath 取自已成功的 /api/status(s), 独立于 /api/config 拉取——

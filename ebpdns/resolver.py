@@ -11,6 +11,7 @@
 """
 import json
 import logging
+import math
 import random
 import re
 import threading
@@ -89,13 +90,18 @@ def _safe_float(v, default=0.0):
     R5 清扫全量 grep 了 int() 却漏了 float()——测速路径 _speed_sort 内
     float(self.cfg.get("speed_interval_ms"))/float(...("ip_speed_cache_ttl"))
     对配置值裸 float(), 畸形串("abc")抛 ValueError 穿透 miss 主路径。
-    None 或无法解析时回退 default; 可解析值(含 0.0)原样返回。"""
+    None 或无法解析时回退 default; 可解析值(含 0.0)原样返回。
+    R-fix NaN/Infinity: float('nan')/float('inf') 可成功解析, 但 NaN 参与
+    eff_lat/weight 排序与加权计算时比较恒为 False, 会产生不可预期的顺序;
+    此处与加载期 config._validate_cfg、写入期 api._validate_cfg_update 的
+    math.isfinite 口径统一, 非有限值一律回退 default。"""
     if v is None:
         return default
     try:
-        return float(v)
+        fv = float(v)
     except (TypeError, ValueError):
         return default
+    return fv if math.isfinite(fv) else default
 
 def _parse_braces_quant(pat, j):
     """若 pat[j] 是合法 {n,m}/{n,}/{n} 量词, 返回 (lo, hi, end); hi=None 表示无上限,
@@ -464,6 +470,13 @@ class Resolver:
         self._rule_index = ({}, {}, {}, {}, {}, [])
         self._rule_match_cache = OrderedDict()  # domain -> rule/None(哨兵), 规则重建时清空; L7 真 LRU
         self._rule_cache_max = 8192
+        # R-fix(竞态): 规则索引/缓存的**代际号**。match_rule 会先取索引快照、之后才
+        # 写缓存; _rebuild_rule_index 则是"发布新索引 → clear() 缓存"。若 clear() 恰好
+        # 落在某线程的"快照→写回"之间, 该线程基于**旧索引**得出的结论会写进刚清空的
+        # 缓存, 并在后续查询里被优先命中(缓存无代际校验)——新加的 block 规则被缓存的
+        # 旧 None 结论绕过, 或已删的 block 规则继续屏蔽。
+        # _cache_rule 现在校验代际: 快照过期则丢弃写回。
+        self._rule_gen = 0
         # P2-R2-2: 最近一次规则缓存清空时间(monotonic)与预热去重标记。宽限期内
         # answer_fast 对 _UNCERTAIN 直接答缓存; 清空后后台采样热点域名预热规则缓存。
         self._rule_rebuild_ts = 0.0
@@ -622,7 +635,12 @@ class Resolver:
         if counted:
             tel.count_query(tel.qtype_cat(qtype))
             tel.count_top(domain=d, client=client_ip)
-        trace.append({"tag": "xdp", "text": "XDP Hook 捕获 %s %s 查询 (UDP/53), 提取 (qname, qtype)" % (d, qtype)})
+        # R-fix(产品诚信): 原文案无条件打印 "XDP Hook 捕获 ... (UDP/53)", 但 Python
+        # 数据面**完全没有 eBPF/XDP 集成**(README 与 bpf/README 亦声明 bpf/ 为未集成的
+        # 参考实现)。该 trace 经 /api/query 回给前端, 由 web/index.html:1861 原样渲染进
+        # 「查询控制台 · 处理链路」, REAL 模式下与真实计量不可区分 —— 会让用户/运维误判
+        # 内核旁路已生效。改为如实描述用户态入口; 仅当确实检测到 XDP 挂载时才用内核措辞。
+        trace.append({"tag": "xdp", "text": "用户态入口捕获 %s %s 查询, 提取 (qname, qtype)" % (d, qtype)})
         # ---- IPv6 关闭: AAAA 直接空应答 ----
         if qtype == "AAAA" and not cfg.get("ipv6", True):
             lat = (time.monotonic() - t0) * 1000
@@ -655,7 +673,7 @@ class Resolver:
             stale_entry = self.cache.get_stale(key, now, _safe_int(cfg.get("stale_ttl", 3600), 3600))
         c = self.cache.get(key, now)
         if c is not None and not force_refresh:
-            # 规则复查: 屏蔽规则优先级高于缓存(含内核直答/负缓存/过期兜底), 防止规则添加前已缓存的答案绕过屏蔽
+            # 规则复查: 屏蔽规则优先级高于缓存(含用户态直答/负缓存/过期兜底), 防止规则添加前已缓存的答案绕过屏蔽
             _rule = self.match_rule(d)
             if _rule and _rule.get("action") == "block":
                 tel.inc_rule("block")
@@ -681,7 +699,7 @@ class Resolver:
             tel.push_latency(lat)
             if c.get("rcode") == 3:
                 # 负缓存 NXDOMAIN
-                trace.append({"tag": "bpf", "text": "BPF LRU map 命中 (负缓存 NXDOMAIN, TTL 剩余 %ds)" % ttl_left})
+                trace.append({"tag": "bpf", "text": "用户态 LRU 缓存命中 (负缓存 NXDOMAIN, TTL 剩余 %ds)" % ttl_left})
                 trace.append({"tag": "ok", "text": "应答 NXDOMAIN  耗时 %.2fms" % lat})
                 if not silent:
                     tel.log(d, qtype, "hit", "缓存直答 NXDOMAIN", lat,
@@ -691,7 +709,7 @@ class Resolver:
                                     latency=lat, trace=trace, ttl_left=ttl_left, rcode=3)
             if not c.get("answers"):
                 # 负缓存 NODATA (rcode=0 但无答案)
-                trace.append({"tag": "bpf", "text": "BPF LRU map 命中 (负缓存 NODATA, TTL 剩余 %ds)" % ttl_left})
+                trace.append({"tag": "bpf", "text": "用户态 LRU 缓存命中 (负缓存 NODATA, TTL 剩余 %ds)" % ttl_left})
                 trace.append({"tag": "ok", "text": "应答 NODATA  耗时 %.2fms" % lat})
                 if not silent:
                     tel.log(d, qtype, "hit", "缓存直答 NODATA", lat,
@@ -699,13 +717,13 @@ class Resolver:
                             rule=self._rule_label(_rule) if _rule else None)
                 return self._result(d, qtype, [], None, True, False, None,
                                     latency=lat, trace=trace, ttl_left=ttl_left, empty=True, rcode=0)
-            mode = "内核直接构造应答" if cfg.get("kernel_direct", True) else "用户态直答(内核直答已关闭)"
-            trace.append({"tag": "bpf", "text": "BPF LRU map 命中 (TTL 剩余 %ds), %s" % (ttl_left, mode)})
-            trace.append({"tag": "ok", "text": "应答 %s  耗时 %.2fms (%s)" % (c["chosen"], lat, "内核直答" if cfg.get("kernel_direct", True) else "缓存直答")})
+            mode = "用户态直答(缓存命中)" if cfg.get("kernel_direct", True) else "用户态直答(直答计数已关闭)"
+            trace.append({"tag": "bpf", "text": "用户态 LRU 缓存命中 (TTL 剩余 %ds), %s" % (ttl_left, mode)})
+            trace.append({"tag": "ok", "text": "应答 %s  耗时 %.2fms (%s)" % (c["chosen"], lat, "用户态直答" if cfg.get("kernel_direct", True) else "缓存直答")})
             if not silent:
-                tel.log(d, qtype, "hit", "内核直答 → %s" % c["chosen"], lat,
+                tel.log(d, qtype, "hit", "用户态缓存直答 → %s" % c["chosen"], lat,
                         client_ip=client_ip,
-                        upstream="内核直答" if cfg.get("kernel_direct", True) else "缓存直答",
+                        upstream="用户态缓存直答" if cfg.get("kernel_direct", True) else "缓存直答",
                         answer=c["chosen"], rule=self._rule_label(_rule) if _rule else None)
             self.schedule_prefetch(key, d, qtype)  # 命中即续入预取队列(与持久化恢复配合)
             # M2: 直接引用缓存 answers(只读不改), 不再每命中一次
@@ -765,7 +783,7 @@ class Resolver:
                                 latency=lat, trace=trace, ttl_left=0, rcode=0)
         if counted:
             tel.inc("miss")
-        trace.append({"tag": "bpf", "text": "BPF LRU map 未命中 → 转交用户态解析引擎"})
+        trace.append({"tag": "bpf", "text": "用户态 LRU 缓存未命中 → 转交用户态解析引擎"})
         # ---- 分流规则 ----
         rule = self.match_rule(d)
         # ---- 白名单(allow): 命中即放行, 跳过 block 检查, 正常走上游解析 ----
@@ -1201,7 +1219,7 @@ class Resolver:
         self._fill_cache(key, d, qtype, answers, rule=rule)
         lat = (time.monotonic() - t0) * 1000
         tel.push_latency(lat)
-        trace.append({"tag": "bpf", "text": "回填 BPF LRU map (TTL %ds, 当前占用 %d/%d)" % (ttl, self.cache.size(), self.cache.capacity)})
+        trace.append({"tag": "bpf", "text": "回填用户态 LRU 缓存 (TTL %ds, 当前占用 %d/%d)" % (ttl, self.cache.size(), self.cache.capacity)})
         trace.append({"tag": "ok", "text": "应答 %s  总耗时 %.1fms" % (chosen, lat)})
         if not silent:
             tel.log(d, qtype, "miss", "多上游解析 → %s" % chosen, lat,
@@ -1401,8 +1419,8 @@ class Resolver:
                                              _ttl_override=ttl_override,
                                              abody_count=abody_n)
             chosen = c.get("chosen", "") or (c["answers"][0]["value"] if c.get("answers") else "")
-            _up = "serve-stale" if stale else ("内核直答" if kd else "缓存直答")
-            _msg = ("serve-stale → %s" if stale else "内核直答 → %s") % chosen
+            _up = "serve-stale" if stale else ("用户态缓存直答" if kd else "缓存直答")
+            _msg = ("serve-stale → %s" if stale else "用户态缓存直答 → %s") % chosen
             # 合并 fast_hit + log: 一次加锁(原两次锁竞争)
             tel.fast_hit_logged(qtype_name, len(raw_query), len(resp) if resp else 0, lat,
                                 domain, _msg, upstream=_up, answer=chosen,
@@ -1502,7 +1520,8 @@ class Resolver:
             st = self._cb.setdefault(up_id, {"fails": 0, "until": 0.0})
             st["fails"] += 1
             if st["fails"] >= cb_fails:
-                st["until"] = time.time() + cb_open_s
+                # R-fix: monotonic(与 _cb_is_open/_cb_snapshot 及本文件其余超时口径一致)
+                st["until"] = time.monotonic() + cb_open_s
 
     def _cb_ok(self, up_id):
         """上游查询成功: 关闭熔断, 计数清零。"""
@@ -1514,7 +1533,10 @@ class Resolver:
             st = self._cb.get(up_id)
             if not st:
                 return False
-            if st["until"] and time.time() < st["until"]:
+            # R-fix: 改用 time.monotonic()。本文件其余全部超时/预算都用 monotonic,
+            # 唯独熔断窗口用 wall-clock: NTP 回拨或手动改时钟会把窗口意外拉长
+            # (时钟后退 1h → 该上游被跳过 1h), 造成长期降级。
+            if st["until"] and time.monotonic() < st["until"]:
                 return True
             return False
 
@@ -1711,7 +1733,7 @@ class Resolver:
             # L3: 外包 bool(...) 统一返回 bool。原表达式 until=0.0(falsy)时短路返回
             # 0.0(float), 与"until 未过期"分支的 True/False 混合类型, 下游
             # _is_cb_open 依赖布尔语义, 此处规范化为纯 bool。
-            _cb_snapshot = {uid: bool(st.get("until", 0.0) and time.time() < st.get("until", 0.0))
+            _cb_snapshot = {uid: bool(st.get("until", 0.0) and time.monotonic() < st.get("until", 0.0))
                             for uid, st in self._cb.items()}
 
         def _is_cb_open(u):
@@ -2207,17 +2229,45 @@ class Resolver:
         """提取目标类型答案 + CNAME 链记录(供 CNAME 链跟踪展开)。
 
         返回 (answers, cnames): answers 为 qtype 目标答案; cnames 为
-        [(target, ttl), ...] 按出现顺序(首个即最接近查询名的 CNAME)。"""
+        [(target, ttl), ...] 按出现顺序(首个即最接近查询名的 CNAME)。
+
+        R-fix(严重): 答案 RR 的 owner name 必须落在 bailiwick 之内 —— 即
+        owner ∈ {查询名} ∪ 已见 CNAME 目标集合。此前只比对 RR **类型**,
+        完全忽略 owner: 被劫持/恶意的上游可对 `bank.example A` 只回一条
+        owner=`attacker.example` 的 A 记录, 该记录会被当作查询域名的答案
+        收下、写缓存、并以**查询名**为 owner 回给客户端(缓存投毒, 已端到端复现)。
+        CNAME 目标本身也要落在 bailiwick 内, 否则一条伪造 CNAME 会把链引到
+        攻击者域并触发对任意域名的递归上游查询(放大)。
+        查询名取自响应 question 段(上游回显), 与 check_0x20 的校验对象一致;
+        取不到时退化为"不限制", 仅依赖 qid+源地址+0x20 等既有校验, 避免误杀。"""
         target = dnsmsg.type_code(qtype)
         out = []
         seen = set()
         cnames = []
+        # 查询名(响应回显), 大小写不敏感比较
+        qname = ""
+        _qs = parsed.get("questions") or []
+        if _qs and isinstance(_qs[0], dict):
+            qname = self._normalize(_qs[0].get("name"))
+        allowed = {qname} if qname else set()
+        _want_cname = (target == dnsmsg.TYPE_CNAME)
         for a in parsed.get("answers", []):
-            if a["type"] == dnsmsg.TYPE_CNAME:
-                cnames.append((str(a.get("rdata", "")).rstrip(".").lower(),
-                               max(1, int(a.get("ttl", 300)))))
+            if a["type"] == dnsmsg.TYPE_CNAME and not _want_cname:
+                _owner = self._normalize(a.get("name"))
+                _tgt = self._normalize(a.get("rdata"))
+                # R-fix: CNAME 的 owner 也必须在 bailiwick 内(链上一条的 owner/目标)
+                if allowed and _owner and _owner not in allowed:
+                    continue
+                if not _tgt:
+                    continue
+                cnames.append((_tgt, max(1, int(a.get("ttl", 300)))))
+                allowed.add(_tgt)   # 链的下一段 owner 即为该目标
                 continue
             if a["type"] != target:
+                continue
+            # R-fix: 目标类型答案的 owner 必须落在 bailiwick 内
+            _owner = self._normalize(a.get("name"))
+            if allowed and _owner and _owner not in allowed:
                 continue
             v = a["rdata"]
             if v in seen:
@@ -2781,6 +2831,11 @@ class Resolver:
         返回变更摘要 dict。"""
         changed = []
         old_cfg = self.cfg
+        # R-fix: 作废上游排序缓存。_sorted_ups 的签名只含上游 **id**, 缓存体存的是
+        # 上游 dict 的引用; 热重载改了同一 id 上游的 addr/port/proto/url 时签名不变,
+        # 于是最多 5s 内 _query_parallel 仍用旧 dict 查询旧地址(改地址后可能打到已下线
+        # 的上游)。此处直接置 None 强制下次重算。
+        self._sorted_ups = None
         # P2-5: 先算好新 _ecs_key(在 self.cfg = new_cfg 之前), 再与 self.cfg
         # 紧挨着同时更新, 消除"cfg 已切新而 _ecs_key 仍是旧"的不一致窗口——
         # 期间并发查询用新 cfg 但旧 ecs_key 拼缓存 key, 与新 key 命名空间错配。
@@ -3254,7 +3309,11 @@ class Resolver:
                 log.warning("规则索引跳过非 dict 条目: %r", type(r).__name__)
                 continue
             self._normalize_rule(r)   # P0-1: 兼容配置文件 pattern/value 旧字段名
-            m = (r.get("match") or "").strip().lower()
+            # R-fix: 原为 strip().lower(), 未去**尾点**。用户从 zone 文件/其它解析器
+            # 粘贴 `example.com.` 作精确规则时, 被索引成含尾点的 key, 而查询名恒无尾点
+            # (见 _normalize), 该规则永不命中(屏蔽类 fail-open)。通配分支原本就会
+            # strip("."), 两者行为现已一致。
+            m = (r.get("match") or "").strip().rstrip(".").lower()
             if not m:
                 continue
             is_allow = r.get("action") == "allow"
@@ -3293,16 +3352,34 @@ class Resolver:
                 # 避免 9 万+ 条中缀规则全部进全局正则列表导致每次 miss 全量扫描。
                 body = m.lstrip("*.")
                 parts = body.split(".")
+                # R-fix: 索引 key 必须落在标签边界上。原实现取 ".".join(parts[-2:]),
+                # 对 `*ac*.com` 得到含字面 `*` 的 key "ac*.com" —— 查找侧用真实域名
+                # 逐级剥标签得到的 core 永不等于它, 该规则从不被求值(屏蔽类 fail-open);
+                # `*ads.com` 的 key "ads.com" 也只覆盖 *.ads.com, 本可匹配的 myads.com
+                # 静默漏匹配。
+                # 现改为: 取尾部**连续不含 `*` 的完整标签**作为分组 key。若最后一节
+                # 就含 `*`(如 *ac*), 无法确定标签边界, 退化为全局正则兜底(正确性优先,
+                # 与单段通配 *ads 同路径), 只是失去分组加速。
                 suffix = ".".join(parts[-2:]) if len(parts) >= 2 else ""
+                if suffix and "*" in suffix:
+                    suffix = ""
+                # R-fix: 正则锚定修正。域名标签**不可为空**, 故 `*` 至少匹配一个字符。
+                # 原 `^` + escape(m).replace("*", ".*") + `$` 里 `.` 可匹配零字符, 于是
+                # `*ac*.com` 会错误命中裸 `ac1.com`(前后两个 `*` 都退化为空串), `*ads.com`
+                # 会命中 `ads.com` 本身。改为把 `*` 翻译成 `[^.]*`(不跨标签) 并要求至少
+                # 一个字符: 前导 `*` 用 `(?:.*\.)?`(可含点, 表示任意层子域), 其余 `*`
+                # 用 `[^.]*`。该正则同时用于 suffix_wild 分组匹配与全局 regex 兜底。
+                _pat = self._wildcard_to_regex(m)
                 try:
-                    c = re.compile("^" + re.escape(m).replace(r"\*", ".*") + "$")
+                    c = re.compile(_pat)
                 except re.error:
                     log.warning("通配规则编译失败 %r, 已忽略", m)
                     continue
                 if suffix:
                     suffix_wild.setdefault(suffix, []).append((c, r))
                 else:
-                    # 无固定后缀(单段通配如 *ads): 只能全局逐条, 归入正则列表兜底
+                    # 无固定后缀(末节含 * 的单/双段通配如 *ac* / *ads):
+                    # 只能全局逐条, 归入正则列表兜底
                     regex.append((c, r))
             else:
                 if is_allow:
@@ -3314,7 +3391,10 @@ class Resolver:
         # 原子的, match_rule 读取时要么看到旧快照要么看到新快照, 无混合状态。
         self._rule_index = (exact, wild, allow_exact, allow_wild, suffix_wild, regex)
         # v1.9.81: 持锁 clear() 而非替换对象, 避免 _cache_rule 写入旧 dict 后丢失
+        # R-fix: 代际号自增必须在持锁内与 clear() 一起完成——在飞线程的快照代际
+        # 若与此处不一致, _cache_rule 会丢弃其(基于旧索引的)结论。
         with self._rule_cache_lock:
+            self._rule_gen += 1
             self._rule_match_cache.clear()
         # P2-R2-2: 记录清空时刻, answer_fast 据此进入宽限期(_UNCERTAIN 直接答缓存,
         # 避免缓存命中全部突降 worker); 同时后台采样 DNS 缓存热点域名预热规则缓存,
@@ -3334,6 +3414,36 @@ class Resolver:
             except Exception as e:
                 # P3-3: 不再静默吞异常, 记录 warning 便于排查缓存清理失败
                 log.warning("cache clear failed during rule rebuild: %s", e)
+
+    @staticmethod
+    def _wildcard_to_regex(m):
+        """把通配规则表达式翻译成锚定正则。
+
+        R-fix: 旧实现 `"^" + re.escape(m).replace(r"\\*", ".*") + "$"` 里 `.` 可匹配
+        **零个**字符, 于是:
+          - `*ac*.com` 会错误命中裸 `ac1.com`(两端的 `*` 各退化为空);
+          - `*ads.com` 会命中字面 `ads.com`, 且在分组索引缺失时还可能跨标签误配。
+        DNS 标签不可为空, 故 `*` 必须至少消耗一个字符。翻译规则:
+          - 前导 `*`(如 `*ads.com` / `*.ads.com`) → `(?:.*\\.)?`, 表示"零层或多层
+            子域 + 点": `*ads.com` 命中 ads.com / x.ads.com / a.b.ads.com,
+            但**不**命中 myads.com(通配边界落在标签边界上, 与 *. 语义一致);
+          - 其余 `*` → `[^.]*`(不跨标签), 由两侧字面量保证已消耗字符。
+        注意: `*ads.com` 仍可通过 suffix_wild 分组的**字面后缀**兜住标签内场景
+        （见 _rebuild_rule_index 的 suffix 说明）; 本函数只负责正则本身的正确性。
+        """
+        out = ["^"]
+        i = 0
+        if m.startswith("*"):
+            out.append(r"(?:.*\.)?")
+            i = 1
+            if i < len(m) and m[i] == ".":
+                i += 1
+        body = m[i:]
+        if body.endswith("*") and len(body) > 1:
+            body = body[:-1]
+        out.append(re.escape(body).replace(r"\*", r"[^.]*"))
+        out.append("$")
+        return "".join(out)
 
     @staticmethod
     def _normalize_rule(r):
@@ -3445,6 +3555,8 @@ class Resolver:
         # H-4: 单次解包原子快照——整次匹配看到的是同一份规则索引, 重建期间
         # 不会读到混合状态。解包开销为 O(1)(六个引用), 远小于字典查找本身。
         exact, wild, allow_exact, allow_wild, suffix_wild, regex = self._rule_index
+        # R-fix: 同时记录当前代际号, 供 _cache_rule 校验"写回时索引是否已换代"。
+        _gen = self._rule_gen
         # 规则缓存优先: allow 检查结果也在缓存中, 避免 hot path 每次遍历
         # v1.9.85: 读路径无锁。CPython GIL 下单次 dict.get 原子; _cache_rule 淘汰
         # 期间读到的旧/缺失结果只是多做一次正确匹配, 绝不返回错误结论。
@@ -3468,13 +3580,13 @@ class Resolver:
         # ---- 白名单(allow)优先: 仅缓存未命中时检查 ----
         r = allow_exact.get(n)
         if r is not None:
-            self._cache_rule(n, r)
+            self._cache_rule(n, r, _gen)
             return r
         core = n
         while core:
             r = allow_wild.get(core)
             if r is not None:
-                self._cache_rule(n, r)
+                self._cache_rule(n, r, _gen)
                 return r
             idx = core.find(".")
             if idx == -1:
@@ -3482,7 +3594,7 @@ class Resolver:
             core = core[idx + 1:]
         r = exact.get(n)
         if r is not None:
-            self._cache_rule(n, r)
+            self._cache_rule(n, r, _gen)
             return r
         # 通配: *.core 匹配 core 及其全部子域。从完整域名自身开始逐级剥离
         # (最长匹配优先): a.b.deep.sub.com -> deep.sub.com -> sub.com -> com
@@ -3490,7 +3602,7 @@ class Resolver:
         while core:
             r = wild.get(core)
             if r is not None:
-                self._cache_rule(n, r)
+                self._cache_rule(n, r, _gen)
                 return r
             idx = core.find(".")
             if idx == -1:
@@ -3503,44 +3615,69 @@ class Resolver:
         # 毒化为确定结论), 由调用方 fallthrough 到 answer_raw 工作线程做完整正则判定。
         if fast:
             if not suffix_wild and not regex:
-                self._cache_rule(n, None)
+                self._cache_rule(n, None, _gen)
                 return None
             return _UNCERTAIN
-        # 中缀/前缀通配(*ac*.com 等): 同一剥离路径按固定后缀定位小组后逐条正则
-        core = n
-        while core:
-            group = suffix_wild.get(core)
-            if group:
-                for c, rule in group:
-                    m = _regex_match_safe(c, n, pool=self._regex_pool, sem=self._regex_sem)
-                    if m is True:
-                        self._cache_rule(n, rule)
-                        return rule
-                    # 结果不确定(ReDoS/池满)且该规则为屏蔽规则 → fail-closed,
-                    # 按命中处理, 不把被屏蔽域名放行。
-                    if m is None and rule.get("action") == "block":
-                        self._cache_rule(n, rule)
-                        return rule
-            idx = core.find(".")
-            if idx == -1:
-                break
-            core = core[idx + 1:]
+        # 中缀/前缀通配(*ac*.com / *ads.com 等): 按"字面后缀"定位候选小组后逐条正则。
+        # R-fix: 分组 key 由建索引侧取"末两段"得出(如 *ads.com -> "ads.com"), 但通配符
+        # 可坐落在一个标签内部, 此时 key 是**查询名某个标签的后缀**(myads.com -> "ads.com"),
+        # 不落在标签边界上, 原始"逐级剥标签"的查找因此漏匹配(屏蔽类 fail-open)。
+        # 现枚举两种形式的候选后缀, 都是 O(#标签) 次 dict 查找(纯切片, 微秒级):
+        #   1) 标签边界后缀: a.b.c.com -> a.b.c.com / b.c.com / c.com / com
+        #   2) 每个标签自身的短后缀: c.com / com(覆盖 myads.com -> ads.com)
+        # 正则仍是最终判据(锚定且 `*` 至少一字符), 故不会误报。
+        _labels = n.split(".")
+        _cands = []
+        for _i in range(len(_labels)):
+            _cands.append(".".join(_labels[_i:]))
+        for _i, _lab in enumerate(_labels):
+            _tail = _labels[_i + 1:]
+            for _cut in (4, 3, 2, 1):
+                if len(_lab) > _cut:
+                    _pre = _lab[-_cut:]
+                    _cands.append(_pre + "." + ".".join(_tail) if _tail else _pre)
+        _seen_groups = set()
+        for _suf in _cands:
+            if not _suf or _suf in _seen_groups:
+                continue
+            group = suffix_wild.get(_suf)
+            if not group:
+                continue
+            _seen_groups.add(_suf)
+            for c, rule in group:
+                m = _regex_match_safe(c, n, pool=self._regex_pool, sem=self._regex_sem)
+                if m is True:
+                    self._cache_rule(n, rule, _gen)
+                    return rule
+                # 结果不确定(ReDoS/池满)且该规则为屏蔽规则 → fail-closed,
+                # 按命中处理, 不把被屏蔽域名放行。
+                if m is None and rule.get("action") == "block":
+                    self._cache_rule(n, rule, _gen)
+                    return rule
         # 正则规则: 编译已缓存, 按配置顺序首个命中生效(带 ReDoS 超时保护)
         for c, rule in regex:
             m = _regex_search_safe(c, n, pool=self._regex_pool, sem=self._regex_sem)
             if m is True:
-                self._cache_rule(n, rule)
+                self._cache_rule(n, rule, _gen)
                 return rule
             # 结果不确定(ReDoS/池满)且该规则为屏蔽规则 → fail-closed 屏蔽,
             # 防止 ReDoS 窗口内 re: block 规则被绕过。
             if m is None and rule.get("action") == "block":
-                self._cache_rule(n, rule)
+                self._cache_rule(n, rule, _gen)
                 return rule
-        self._cache_rule(n, None)
+        self._cache_rule(n, None, _gen)
         return None
 
-    def _cache_rule(self, n, rule):
+    def _cache_rule(self, n, rule, gen=None):
+        """写入规则结论缓存。
+
+        R-fix: gen 为该结论所依据的索引快照代际号。若调用方在取快照后、写回前发生了
+        规则重建(索引已换、缓存已清), 则 gen != self._rule_gen, 此处直接丢弃该结论,
+        避免用旧索引的结论污染新缓存(新 block 规则被绕过 / 已删规则继续生效)。
+        gen=None 表示调用方无代际语义(如预热路径), 按现状写入。"""
         with self._rule_cache_lock:
+            if gen is not None and gen != self._rule_gen:
+                return
             cache = self._rule_match_cache
             if len(cache) >= self._rule_cache_max:
                 # L7: 满时从 MRU 头弹出最久未用(popitem(last=False))的一半,

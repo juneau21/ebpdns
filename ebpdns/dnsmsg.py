@@ -33,15 +33,51 @@ TYPE_NAMES = {
     TYPE_A: "A", TYPE_NS: "NS", TYPE_CNAME: "CNAME", TYPE_SOA: "SOA",
     TYPE_PTR: "PTR", TYPE_MX: "MX", TYPE_TXT: "TXT", TYPE_AAAA: "AAAA",
     TYPE_SRV: "SRV", TYPE_HTTPS: "HTTPS", TYPE_OPT: "OPT",
+    # R-fix: 补齐常见类型。此前 TYPE_NAMES 只含 10 类, 任何其它 qtype 会被
+    # type_name() 降级成数字串、再被 type_code() 判为 0 → 发往上游的是 qtype=0
+    # 的非法问题, 客户端得到空 NOERROR 且被负缓存(甚至 ANY=255 也如此)。
+    # 这里补的是**名称映射**, 使 type_name/type_code 双向自洽; 报文解析对这些
+    # 类型仍按"未知类型 → rdata hex 透传"处理(见 _parse_rdata 末尾分支)。
+    # 注意: ANY(255) 是查询类型而非可缓存 RR 类型, 一并登记以保证往返一致。
+    # SVCB=64 单列; HTTPS=65 已由 TYPE_HTTPS 常量映射(此处不重复, 否则覆盖)。
+    255: "ANY",
+    257: "CAA", 43: "DS", 46: "RRSIG", 48: "DNSKEY", 47: "NSEC",
+    35: "NAPTR", 52: "TLSA", 99: "SPF", 64: "SVCB", 13: "HINFO",
+    29: "LOC", 44: "SSHFP", 50: "NSEC3", 51: "NSEC3PARAM",
 }
 TYPE_CODES = {v: k for k, v in TYPE_NAMES.items()}
-# 可解析的记录类型（用于查询控制台下拉）
-QUERY_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA", "HTTPS", "PTR"]
+# 可解析的记录类型（用于查询控制台下拉与 API /api/query 的 qtype 白名单）
+QUERY_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA", "HTTPS", "PTR",
+               # R-fix: 与上方 TYPE_NAMES 补齐同步。此前这些类型不在白名单,
+               # API 直接拒绝; 而一旦绕过(如内部调用)就会退化成 qtype=0 的非法查询。
+               "SRV", "CAA", "DS", "DNSKEY", "RRSIG", "NSEC", "NAPTR", "TLSA",
+               "SPF", "SVCB", "ANY"]
 
 
 def type_code(name):
-    """类型名 -> 数字。未知类型返回 0。"""
-    return TYPE_CODES.get(str(name).upper(), 0)
+    """类型名 -> 数字。未知类型返回 0。
+
+    R-fix: 必须兼容**纯数字串**。type_name() 对不在 TYPE_NAMES 内的 code 会返回
+    str(code)(如 255 -> "255"), 而此处原实现只查 TYPE_CODES, 于是 ANY(255)/
+    CAA(257)/DS(43)/RRSIG(46)/DNSKEY(48) 等一律被映射为 **0**, 上游收到 qtype=0
+    的非法问题(多半 FORMERR/忽略), 客户端得到空 NOERROR 且该空结果被负缓存。
+    现在: 数字串按数值解析(0-65535 且非 0 才算有效类型), 其余仍回退 0。"""
+    if name is None:
+        return 0
+    if isinstance(name, int) and not isinstance(name, bool):
+        return name if 0 <= name <= 65535 else 0
+    s = str(name).strip().upper()
+    hit = TYPE_CODES.get(s)
+    if hit:
+        return hit
+    if s.isdigit():
+        try:
+            n = int(s)
+        except ValueError:
+            return 0
+        # 0 保留为"未知/无效"哨兵(与既有调用方 `type_code(...) or TYPE_A` 语义一致)
+        return n if 1 <= n <= 65535 else 0
+    return 0
 
 
 def type_name(code):
@@ -340,7 +376,21 @@ def check_0x20(query_bytes, response_data):
                 return False
     except Exception:
         return False
-    return qn == rn
+    if qn != rn:
+        return False
+    # R-fix(纵深防御): 一并校验 question 的 qtype/qclass 必须与查询一致。
+    # 原实现只逐位比较 qname, 伪造应答只要 qname 大小写匹配即可通过, question 里的
+    # qtype/qclass 可为任意值。实际危害已被"答案按请求 qtype 过滤"限制, 但在 0x20
+    # 自适应降级(upstream._0x20_disabled)后整体强度下降, 该层值得补齐。
+    # 查询侧取不到(畸形)时按 fail-open 处理, 与上方 qn is None 分支同语义。
+    try:
+        _qs = 12 + len(qn)
+        if len(query_bytes) >= _qs + 4 and len(response_data) >= _qs + 4:
+            if query_bytes[_qs:_qs + 4] != response_data[_qs:_qs + 4]:
+                return False
+    except Exception:
+        pass
+    return True
 
 
 # ---------- 响应解析 ----------
@@ -490,7 +540,15 @@ def parse_message(data):
             try:
                 value = _parse_rdata(data, pos, rtype, rdlen)
             except Exception:
-                value = data[pos:pos + rdlen].hex()
+                # R-fix: 原实现回退为 `data[pos:pos+rdlen].hex()`, 于是畸形 rdata
+                # (典型: CNAME rdata 内的前向压缩指针使 decode_name 抛 DNSError)
+                # 会以 hex 文本入库。该 hex 串随后被 resolver._extract_answers_full
+                # 当作 **CNAME 目标域名**, 触发对任意"域名"的递归上游查询, 并把
+                # `查询名 CNAME <hex串>` 回给客户端且写缓存 —— 客户端拿到完全伪造的
+                # CNAME 链。与上方 R32/P3-1 的"返回 None → 丢弃该 RR"同口径, 异常
+                # 路径改为丢弃该 RR(fail-closed), 不再制造伪域名。
+                pos += rdlen
+                continue
             pos += rdlen
             if value is None:
                 # R32/P3-1: 结构化类型(A/AAAA/MX/SRV/SOA) rdlen 与预期结构不符时,
@@ -873,16 +931,25 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
     # 含被丢弃的多余记录, 会绕过 MAX_ANSWERS 上限。
     n_in = len(answers or [])
     answers = (answers or [])[:MAX_ANSWERS]
+    # 仅当传入答案数未超 MAX_ANSWERS 时才可复用 abody(否则 abody 含被丢弃的
+    # 多余记录, 会绕过 MAX_ANSWERS 上限)。
     can_use_abody = abody is not None and n_in <= MAX_ANSWERS
+    # R-fix: 因 MAX_ANSWERS 数量上限丢弃了尾部记录时, 必须同样置 TC=1。
+    # 此前只有"装不下 bufsize"才置 TC, 数量截断时 TC 仍为 0 —— 客户端按 RFC 1035
+    # 认为应答完整, 不会走 TCP 重试, 于是第 9 条起的地址永久不可见(CDN 常见 10 条 A)。
+    # answer_raw 被 UDP 与 TCP 两条服务路径共用, 故 TCP 客户端同样受影响。
+    count_truncated = n_in > MAX_ANSWERS
     # 无截断快速路径: 完整 abody + OPT 直接放下。
     # R3-P1-A: force_truncated=True(上游 UDP 截断、TCP 回退失败, 被迫沿用部分
     # answers 直答)时, 即使报文装得下也强制置 TC=1, 让客户端自行 TCP 重试拿完整答案。
+    # R-fix: count_truncated 同型参与判定与置位。
+    _force_tc = bool(force_truncated) or count_truncated
     if can_use_abody and 12 + len(qbytes) + len(abody) + opt_len <= limit:
         # R5-P1: an_count 必须与 abody 中实际 RR 数一致。abody_count 由调用方
         # 预编码时通过 return_count=True 取得; 未提供时回退 len(answers)(与原
         # 行为一致, 仅在调用方未升级时存在微小偏差)。
         _an_count = abody_count if abody_count is not None else len(answers)
-        return (build_response_header(raw_query, rcode, _an_count, force_truncated, 1 if opt else 0)
+        return (build_response_header(raw_query, rcode, _an_count, _force_tc, 1 if opt else 0)
                 + qbytes + abody + (opt or b""))
     # 逐条累计: 超 bufsize 丢尾部并置 TC(让客户端走 TCP 重试)
     # bytearray(); out.extend(qbytes) 替代 bytearray(qbytes): 语义等价(构造出含
@@ -892,7 +959,7 @@ def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
     out = bytearray()
     out.extend(qbytes)
     kept = 0
-    truncated = bool(force_truncated)
+    truncated = _force_tc
     if enc_owner is None:
         enc_owner = encode_name(owner_name) if owner_name else b"\x00"
     for a in answers:
@@ -1011,14 +1078,20 @@ def build_response(query_data, domain, qtype, answers, rcode=0, bufsize_cap=None
     直答时置位——让客户端自行 TCP 重试拿完整答案, 残缺答案集不缓存、不固化。"""
     if len(query_data) < 12:
         return None
+    # R-fix: 此处原先把 answers 先截断到 MAX_ANSWERS 再交给 build_udp_response,
+    # 于是下游看到的 n_in 恒 ≤ MAX_ANSWERS, 其"数量超限需置 TC"的判定永不成立,
+    # 客户端拿不到第 9 条起的记录却看到 TC=0(不会走 TCP 重试)。
+    # 现在把"已被本函数截断"的事实显式并入 force_truncated。
+    _n_in = len(answers or [])
     answers = (answers or [])[:MAX_ANSWERS]
+    _count_tc = _n_in > MAX_ANSWERS
     qbytes = extract_question(query_data)
     if qbytes is None:
         qbytes = encode_name(domain) + struct.pack(">HH", qtype, CLASS_IN)
     return build_udp_response(query_data, qbytes, answers, rcode,
                               abody=None, owner_name=domain, fallback_type=qtype,
                               bufsize_cap=bufsize_cap, _ttl_override=_ttl_override,
-                              force_truncated=truncated)
+                              force_truncated=bool(truncated) or _count_tc)
 
 
 def build_error_response(query_data, rcode=2):
