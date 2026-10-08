@@ -3,7 +3,7 @@
 > 当前版本 **v1.9.150**（`ebpdns/__init__.py` `__version__ = "1.9.150"`，三处版本号已置位）。本文档与代码逐项对齐：
 > 功能清单、配置项、API 端点、安装/部署方式均以源码为准（见文末「文档对齐说明」）。
 
-把「ebpdns · eBPF 版 SmartDNS 解析器控制台」从浏览器内仿真升级为**真实可部署的 DNS 解析软件**。
+请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新**真实可部署的 DNS 解析软件**。
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT / DoQ / DoH3）
 - 复刻 SmartDNS 的**测速择优、上游 weight 加权轮询、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
@@ -13,6 +13,13 @@
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
 
 ---
+WEB运行截图
+<img width="2560" height="1294" alt="6a4237cd7d1021d49757cca4f0226f46" src="https://github.com/user-attachments/assets/89c5aaeb-9df7-4de4-b0eb-b31ef1f64992" />
+<img width="2560" height="1294" alt="b442dda3f7870d374add040637f25267" src="https://github.com/user-attachments/assets/ac13c55b-5dff-4f68-8e10-e5ae76fe896e" />
+<img width="2560" height="3465" alt="09915fd32938aed251bbac9f21f49a2b" src="https://github.com/user-attachments/assets/3767fdd0-d8f8-4a60-9e54-ea6b9470047f" />
+<img width="2560" height="1788" alt="63164a387b46f8a9b2c1b4a558c102c7" src="https://github.com/user-attachments/assets/6136f64f-9f3d-4874-bb31-e2b7496470ef" />
+<img width="2560" height="1294" alt="4fa7f527f0afbb5686c9202653603d4c" src="https://github.com/user-attachments/assets/ae89efed-3867-4143-a031-d2460267c601" />
+
 
 ## 1. 架构（实际实现路径）
 
