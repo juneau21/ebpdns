@@ -1,0 +1,45 @@
+ebpdns
+Copyright (C) 2026 ebpdns contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+=====================================================================
+
+This product (v2.1.1) is a rewrite in Rust. Its behaviour is modelled on the
+prior Python release v1.9.162 (the reference implementation); the current
+per-area conformance status -- aligned, unverified, or known gaps -- is
+documented in README.md ("Conformance status vs v1.9.162").
+
+It bundles/links the following Rust crates (see Cargo.lock for the
+exact versions and their respective licenses):
+
+  tokio, futures, async-trait                       (MIT)
+  axum, hyper, hyper-util, tower, tower-http        (MIT)
+  tokio-tungstenite                                 (MIT/Apache-2.0)
+  rustls, tokio-rustls, rustls-pemfile, webpki-roots
+    (TLS provider: aws-lc-rs / ring as configured) (Apache-2.0/ISC/MIT)
+  quinn                                             (Apache-2.0/MIT)
+  serde, serde_json, bytes, thiserror, tracing,
+    tracing-subscriber, clap, regex, once_cell, lru,
+    dashmap, parking_lot, rand, hex, url,
+    rust-embed, mime_guess, num_cpus, socket2, libc (MIT/Apache-2.0)
+  idna                                              (MIT/Apache-2.0/Unicode-3.0)
+  aya, aya-log, aya-build                           (MIT/Apache-2.0)
+  criterion                                         (Apache-2.0/MIT)
+  leptos, wasm-bindgen, gloo-net, gloo-timers       (MIT/Apache-2.0)
+
+The WebAssembly frontend and the XDP eBPF program are built from the
+same source tree.  DNS message encoding/decoding is an original
+implementation written to match the behavior of this project's
+Python reference; no third-party DNS resolver core is used.
