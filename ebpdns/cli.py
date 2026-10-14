@@ -235,6 +235,25 @@ def _save_cache(cfg, config_path, cache):
             return 0
 
 
+def _safe_int(v, default=0):
+    """与 resolver/cache/probe/dnsmsg 的 _safe_int 同模式(本地副本, 避免循环 import)。
+    None/无法解析(含畸形字符串)→default; 可解析值(含整数 0)原样返回 int(v)。
+
+    v1.9.161 审查修复: _ebpf_load_and_wire 预热路径调用的 _safe_int 从未定义
+    (本模块只有 _safe_int_cap), 该行在构造预热 entries 前抛 NameError, 被外层
+    except Exception 吞成"eBPF 预热失败(仅缺预热)"——kernel_cache=true 时用户态→
+    内核 warmup 恒不执行且静默。这里补回同型实现, 恢复预热。
+
+    R-fix: bool 是 int 子类, int(True)==1; 对"计数/上限"类配置误传 True 会被
+    当成 1, 显式拒绝 bool 以免脏值穿透到 map 容量。"""
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_int_cap(cfg):
     """R-fix: 取 cache_size 作为持久化限幅基准(畸形/缺失回退 131072)。"""
     try:
@@ -295,6 +314,152 @@ def _load_cache(cfg, config_path, cache):
 
 
 log = logging.getLogger("ebpdns")
+
+
+def _ebpf_load_and_wire(cfg, app_ctx, resolver):
+    """v1.9.158: 按 cfg 创建 BpfLoader 并 load(), 成功则注入 resolver 并从用户态缓存
+    取热条目 warmup; 失败则把 loader 挂到 app_ctx(供 /api/status 读降级 reason),
+    resolver 不注入。启动(_boot_ebpf)与运行态热重载(reconfigure_ebpf)共用本核心。
+    返回 loader(无论 load 成败, 供调用方读取) 或 None(bpf_loader 模块不可用/未启用)。
+    任一环节失败 → 降级纯用户态, 打 WARNING, 绝不阻断 DNS 服务。"""
+    try:
+        if not cfg.get("kernel_cache", False):
+            return None
+        try:
+            from .bpf_loader import BpfLoader
+            from . import dnsmsg as _dm
+            # _qname_djb2 在 bpf_loader 中是 BpfLoader 的静态方法(与 resolver 本地
+            # _ebpf_qname_djb2 实现一致, 已逐向量比对)。warmup 复用 loader 自带函数。
+            _qname_djb2 = BpfLoader._qname_djb2
+        except ImportError as e:
+            log.warning("eBPF 内核态缓存未启用: bpf_loader 模块不可用 (%s)，将以纯用户态运行", e)
+            return None
+        loader = BpfLoader(cfg, log)
+        if not loader.load():
+            reason = ""
+            try:
+                reason = loader.status().get("reason", "")
+            except Exception:
+                pass
+            log.warning("eBPF 内核态缓存未启用: %s，将以纯用户态运行", reason or "loader.load() 返回 False")
+            # 保留 loader 到 app_ctx, 供 /api/status 读取具体降级原因; resolver 不注入(无需回写)
+            try:
+                app_ctx._bpf = loader
+            except Exception:
+                pass
+            return loader
+        # 注入 resolver(供解析回写) 与 app_ctx(供 /api/status 统计读取)
+        resolver._bpf = loader
+        try:
+            app_ctx._bpf = loader
+        except Exception:
+            pass
+        st = loader.status() or {}
+        # ---- 预热: 遍历用户态 cache 热条目, 最多 kernel_cache_max 条 ----
+        try:
+            max_entries = _safe_int(cfg.get("kernel_cache_max", 65536), 65536)
+            entries = []
+            # ECS 启用时 eBPF key 无对应维度, 不预热(避免跨子网错答)
+            ecs_on = bool(getattr(resolver, "_ecs_key", None))
+            for e in resolver.cache.serialize():
+                try:
+                    k = e.get("key") or []
+                    # PartitionedCache key=[group,domain,qtype]; LRU/TinyLFU key=[domain,qtype]
+                    if len(k) == 3:
+                        domain, qtype = k[1], k[2]
+                    elif len(k) == 2:
+                        domain, qtype = k[0], k[1]
+                    else:
+                        continue
+                    qn = _dm.type_code(qtype) if isinstance(qtype, str) else int(qtype)
+                    if qn not in (_dm.TYPE_A, _dm.TYPE_AAAA):
+                        continue
+                    rcode = int(e.get("rcode", 0) or 0)
+                    if rcode not in (0, 3):
+                        continue
+                    addrs = resolver._ebpf_extract_addrs(e.get("answers"))
+                    ttl = int(e.get("remaining") or e.get("ttl") or 0)
+                    if ecs_on:
+                        continue
+                    entries.append((_qname_djb2(domain), qn, {
+                        "naddr": len(addrs), "rcode": rcode,
+                        "ttl": ttl, "addrs": addrs,
+                    }))
+                    if len(entries) >= max_entries:
+                        break
+                except Exception:
+                    continue
+            if entries:
+                n = loader.warmup(entries)
+                log.info("eBPF 内核态缓存已启用 (iface=%s, mode=%s)，预热 %d/%d 条到内核 map",
+                         st.get("iface", "?"), st.get("load_mode", "?"), n, len(entries))
+            else:
+                log.info("eBPF 内核态缓存已启用 (iface=%s, mode=%s)，用户态缓存无 A/AAAA 热条目可预热",
+                         st.get("iface", "?"), st.get("load_mode", "?"))
+        except Exception as e:
+            log.warning("eBPF 预热失败(内核缓存已启用, 仅缺预热): %r", e)
+        return loader
+    except Exception as e:
+        # 兜底: 任何未预期异常都降级为纯用户态, 不影响 DNS 服务
+        log.warning("eBPF 内核态缓存启动异常，降级纯用户态: %r", e)
+        try:
+            resolver._bpf = None
+        except Exception:
+            pass
+        return None
+
+
+def _boot_ebpf(cfg, app_ctx, resolver):
+    """v1.9.158 §5.1: 启动 eBPF 内核态缓存(进程启动路径)。
+    流程: cfg.kernel_cache=True → import BpfLoader → load() → 成功则从用户态
+    cache.serialize() 取热条目(LRU/存活条目)批量 warmup。
+    任一环节失败 → 降级纯用户态, 打 WARNING, 绝不阻断 DNS 服务。"""
+    _ebpf_load_and_wire(cfg, app_ctx, resolver)
+
+
+def reconfigure_ebpf(old_cfg, new_cfg, app_ctx):
+    """v1.9.158: 运行态(PUT /api/config 热重载成功后)按新旧 eBPF 配置差异在线重建 loader。
+    - new kernel_cache=false: 卸载现有 loader(若有), app_ctx/resolver._bpf=None。
+    - new kernel_cache=true 且当前无 loader(false→true): 创建并 load(复用 _ebpf_load_and_wire)。
+    - kernel_cache=true 但 iface/max 变化: 先卸载旧 loader, 再用新 cfg 重建。
+    - 配置无变化: 不动。
+    全程 best-effort: 任何异常只 WARNING, 绝不阻断配置保存或 DNS 数据面。
+    无 CAP_BPF 等 load 失败时, loader 仍挂 app_ctx(显示降级 reason), resolver._bpf=None(不回写)。"""
+    try:
+        resolver = app_ctx.resolver
+        old_on = bool(old_cfg.get("kernel_cache", False))
+        new_on = bool(new_cfg.get("kernel_cache", False))
+        old_iface = old_cfg.get("kernel_cache_iface", "auto")
+        new_iface = new_cfg.get("kernel_cache_iface", "auto")
+        old_max = old_cfg.get("kernel_cache_max", 65536)
+        new_max = new_cfg.get("kernel_cache_max", 65536)
+        cur = getattr(app_ctx, "_bpf", None)
+        config_changed = (old_iface != new_iface) or (old_max != new_max)
+        # 需要卸载: 新关闭, 或开启态下 iface/max 变了(需用新参数重建)
+        need_unload = cur is not None and (not new_on or (old_on and config_changed))
+        if need_unload:
+            try:
+                cur.unload()
+            except Exception as e:
+                log.warning("eBPF 运行态卸载失败(忽略, 继续): %r", e)
+            try:
+                app_ctx._bpf = None
+            except Exception:
+                pass
+            try:
+                resolver._bpf = None
+            except Exception:
+                pass
+            cur = None
+            log.info("eBPF 内核态缓存已按热重载卸载(kernel_cache=%s, iface=%r, max=%s)",
+                     new_on, new_iface, new_max)
+        # 需要加载/重建: 新开(false→true) 或 卸载后(配置变化)需重建
+        if new_on and cur is None:
+            log.info("eBPF 内核态缓存按热重载在线加载(iface=%r, max=%s)", new_iface, new_max)
+            _ebpf_load_and_wire(new_cfg, app_ctx, resolver)
+    except Exception as e:
+        log.warning("eBPF 运行态重配置异常(忽略, 纯用户态继续): %r", e)
+
 
 
 def _setup_logging(level="info", fmt="text"):
@@ -445,6 +610,16 @@ def _ensure_subs_downloaded(cfg, config_path, app_ctx):
                                 f.flush()
                                 os.fsync(f.fileno())
                             os.replace(tmp, sub_path)
+                            # P3-1(v1.9.157): rename 后对父目录 fsync, 与其余原子写路径同型
+                            try:
+                                _dd = os.open(os.path.dirname(os.path.abspath(sub_path)) or ".",
+                                              os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                                try:
+                                    os.fsync(_dd)
+                                finally:
+                                    os.close(_dd)
+                            except OSError:
+                                pass
                             # R2-06: 与 API 规则写路径一致, 锁内只自增代际; rebuild 移到
                             # 锁外走 _rebuild_lock 串行 + 代际跳过, 不再绕过代际跟踪直接
                             # rebuild(此前冷启动 rebuild 与 API rebuild 并发时不被
@@ -504,7 +679,9 @@ def run(cfg, config_path=None):
         os._exit(1)
     if app_ctx.dns_server is not None:
         app_ctx.dns_server.fatal_callback = _fatal_exit
-        app_ctx.dns_server.udp.fatal_callback = _fatal_exit
+        # R28/P3: listen.udp=null 时 dns_server.udp 为 None(不监听 IPv4 UDP), 与 udp6 同型守卫。
+        if app_ctx.dns_server.udp:
+            app_ctx.dns_server.udp.fatal_callback = _fatal_exit
         if app_ctx.dns_server.udp6:
             app_ctx.dns_server.udp6.fatal_callback = _fatal_exit
     _sync_sub_meta(cfg, config_path)  # 订阅元信息与独立文件对齐(文件为准, 避免重启后界面空/规则仍生效)
@@ -544,6 +721,12 @@ def run(cfg, config_path=None):
             app_ctx.resolver.rearm_prefetch()
         except Exception:
             pass
+    # v1.9.158 §5.1: 启动 eBPF 内核态缓存(在用户态缓存载入后, 以便用热条目预热)。
+    # cfg.kernel_cache=False(默认)时直接 return; 启用后加载失败自动降级纯用户态。
+    try:
+        _boot_ebpf(cfg, app_ctx, app_ctx.resolver)
+    except Exception as _e:
+        log.warning("eBPF 启动钩子异常(忽略, 纯用户态继续): %r", _e)
     api_cfg = cfg.get("api", {})
     host = api_cfg.get("host", "127.0.0.1")
     port = int(api_cfg.get("port", 8080))
@@ -593,12 +776,25 @@ def run(cfg, config_path=None):
     log.info("DNS  监听  UDP=%s UDP6=%s TCP=%s TCP6=%s",
              endpoints.get("udp"), endpoints.get("udp6"),
              endpoints.get("tcp"), endpoints.get("tcp6"))
-    log.info("HTTP API   http://%s:%s  (控制台 http://%s:%s/)", host, port, host, port)
+    # R31 P3: host 为 IPv6 字面量(如 ::1)时 URL 展示必须包成 [::1], 否则
+    # http://::1:8080/ 冒号歧义、浏览器/urllib 无法解析。含冒号且未带 [ 即视为 IPv6,
+    # 与 cmd_status(:750)/api.py 的 URL 构造约定一致; IPv4/回环/域名(无冒号)原样输出。
+    _host_disp = "[%s]" % host if (":" in str(host) and not str(host).startswith("[")) else host
+    log.info("HTTP API   http://%s:%s  (控制台 http://%s:%s/)",
+             _host_disp, port, _host_disp, port)
     log.info("缓存 LRU=%d · TTL=%ds · 预取=%s · 测速=%s · 上游=%d 个",
              cfg.get("cache_size"), cfg.get("ttl"), cfg.get("prefetch"),
              cfg.get("speed_test"), len([u for u in cfg.get("upstreams", []) if u.get("enabled")]))
     log.info("按 Ctrl+C 退出")
-    log.info("缓存持久化 → %s (每 %ds 保存 + 退出时保存, 重启自动恢复)", cache_file, _CACHE_SAVE_INTERVAL)
+    # 持久化总开关按实际行为 gate 启动日志: _save_cache/_load_cache 在
+    # cache_persist=false 时直接 return(cache_persist 默认 True, 与二者取值一致),
+    # 即不写盘也不从磁盘恢复。旧代码无条件打印"→ path(每60s保存+退出保存,重启恢复)",
+    # 在 cache_persist=false 时与真实行为不符(实测 /tmp/cache.json 根本不生成), 误导运维。
+    if cfg.get("cache_persist", True):
+        log.info("缓存持久化 → %s (每 %ds 保存 + 退出时保存, 重启自动恢复)",
+                 cache_file, _CACHE_SAVE_INTERVAL)
+    else:
+        log.info("缓存持久化已关闭（不写盘 / 不从磁盘恢复）")
 
     api_server.start_thread()
 
@@ -858,14 +1054,40 @@ def main(argv=None):
             print(chosen or "未找到配置文件, 将使用内置默认值")
     elif args.cmd == "config-print":
         import json
+        import urllib.parse
         # R-fix: 与 GET /api/config 的脱敏策略对齐。api.token 是等价于控制台完全控制权
         # 的凭据, 而本命令把明文打到 stdout —— 运维贴进工单/CI 日志即泄漏。
         # 用深拷贝脱敏, 不改动内存中的 cfg(避免影响后续逻辑)。
+        # R17 P3-5: 除 api.token 外, rule_subscriptions[].url 形如
+        # https://user:pass@host/sub/<tok> 可能在 userinfo 段内嵌凭据, 同样明文打到
+        # stdout。此处剥离 URL 的 userinfo(user:pass@ → ), 保留 scheme/host:port/
+        # path/query 以便运维识别订阅源; 解析失败的 URL 原样保留不中断打印。
+        def _strip_url_userinfo(u):
+            try:
+                sp = urllib.parse.urlsplit(str(u))
+                host = sp.hostname
+                if not host:
+                    return u
+                # R18 P3-2: urlsplit().hostname 对 IPv6 字面量返回不带方括号的
+                # "2001:db8::1", 直接拼 port 会重建出非法 netloc
+                # "2001:db8::1:8443"。对含冒号的 host 先包方括号再拼 port。
+                netloc = "[%s]" % host if ":" in host else host
+                if sp.port:
+                    netloc = "%s:%d" % (netloc, sp.port)
+                return urllib.parse.urlunsplit(
+                    (sp.scheme, netloc, sp.path, sp.query, sp.fragment))
+            except Exception:
+                return u
         try:
             _out = copy.deepcopy(cfg)
             _api = _out.get("api")
             if isinstance(_api, dict) and str(_api.get("token") or "").strip():
                 _api["token"] = "***"
+            _subs = _out.get("rule_subscriptions")
+            if isinstance(_subs, list):
+                for _s in _subs:
+                    if isinstance(_s, dict) and isinstance(_s.get("url"), str):
+                        _s["url"] = _strip_url_userinfo(_s["url"])
         except Exception:
             _out = cfg
         print(json.dumps(_out, ensure_ascii=False, indent=2))

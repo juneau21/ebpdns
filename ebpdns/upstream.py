@@ -57,17 +57,19 @@ _ADDR_CACHE_MAX = 256   # 安全上限: 上游 hostname 数量有限, 超限淘�
 # 校验(直接接受 qid/源校验通过的响应), 并打日志。
 _0x20_misses = {}       # up_id -> 连续失配次数
 def _is_header_only(data):
-    """R-fix: 是否为"12 字节纯 header-only"(QDCOUNT==0 且 ANCOUNT==0)畸形态。
+    """是否为畸形/header-only 响应(QDCOUNT != 1), 应拒绝。
 
-    合法 DNS 响应恒 echo 我们查询的 question(QDCOUNT==1), 故 QDCOUNT==0 本身即结构
-    异常。UDP(原 R12 P3-11)与明文 TCP(原 R13 P3-A)各自内联实现过该校验, 但 DoH/DoT/
-    DoQ/DoH3 只判 `len >= 12`, 于是同一畸形形状在六条路径上判定不一致 —— 加密路径会把
-    它当成功上交, 下游 parse_message 得到 rcode=0/answers=[], resolver 按 NODATA
-    **写负缓存**, TTL 内该域名对外返回空应答。此处抽出公共判据供四条加密路径复用。"""
+    合法 DNS 响应恒 echo 我们查询的 question(QDCOUNT==1), 故 QDCOUNT!=1 本身即结构
+    异常。v1.9.161 之前判据为 "QDCOUNT==0 且 ANCOUNT==0", 一个 QDCOUNT==0 但
+    ANCOUNT=5(无 question 段却塞答案)的畸形响应能过闸; 现收紧为 fail-closed:
+    只要 data[4:6] 解析出的 qdcount != 1 即拒绝(含 NODATA/NXDOMAIN 这类 qd=1/an=0
+    的合法响应不受影响)。len<12 的短帧由各调用点前置长度判断兜底, 此处不重复。
+    """
     try:
-        return (len(data) >= 12
-                and bytes(data[4:6]) == b"\x00\x00"
-                and bytes(data[6:8]) == b"\x00\x00")
+        if len(data) < 12:
+            return False
+        qdcount = struct.unpack(">H", bytes(data[4:6]))[0]
+        return qdcount != 1
     except Exception:
         return False
 
@@ -1559,10 +1561,11 @@ def _dot_query(up, query_bytes, timeout_ms):
         # R31 P2-1: 撤销 R30 P3-2 的跨查询保存/恢复机制。上一次 _exchange 已从
         # 内核读出但未消费的残余帧(协议违规服务器同段多发)属于上一次查询的数据,
         # 跨查询恢复会把它拼到新响应 buf 开头, 内层 parse_tcp_frame 从 buf 头部
-        # 优先解析该残余帧; 而 DoT 路径不做 qid 校验, 会把上一次查询的应答误当作
-        # 当前查询的响应返回(可能返回错误域名的 IP)。正确做法是当前 _exchange
-        # 内消费完所需响应帧后直接丢弃 rest, 不跨查询保留。合法 DoT 服务器(RFC
-        # 7858)绝不流水线多发帧, rest 恒为空, 直接丢弃零开销。
+        # 优先解析该残余帧。R18 P3-1 订正: 本 _exchange 下方(见 qid 校验段)已对响应
+        # 帧做 qid 匹配检查、丢弃 qid 不符帧, 故即便残余帧滞留也不会误当本次结果;
+        # 但跨查询保留仍会让上一轮数据滞留缓冲、干扰新响应的帧边界解析, 正确做法仍是
+        # 当前 _exchange 内消费完所需响应帧后直接丢弃 rest, 不跨查询保留。合法 DoT
+        # 服务器(RFC 7858)绝不流水线多发帧, rest 恒为空, 直接丢弃零开销。
         buf = bytearray()
         while True:
             remaining = deadline - time.monotonic()
@@ -2113,17 +2116,9 @@ def _tcp_query(up, query_bytes, timeout_ms):
                     if not buf:
                         break
                     continue
-                # R13 P3-A: 补 header-only 结构闸(QDCOUNT==0 且 ANCOUNT==0), 与 UDP
-                # 热路径(:1830)对称。R12 P3-1 让已降级上游跳过 check_0x20 后, 原依赖
-                # extract_qname(qd<1→None)的隐式兜底消失, 恰好 12B、qid 匹配的
-                # "无 question 段畸形响应"会被当合法 NOERROR 上交。合法响应恒 echo
-                # 查询 question(QDCOUNT==1), QDCOUNT==0 本身即结构异常。纵深防御,
-                # 不受 0x20 降级态影响(fail-safe)。
-                if _is_header_only(msg):
-                    buf = rest
-                    if not buf:
-                        break
-                    continue
+                # R17 P3-1: 删除原 R13 P3-A 在此重复的 `if _is_header_only(msg):` 块
+                # (死代码)。上方 `len(msg) < 12 or _is_header_only(msg)` 已合并该校验,
+                # 能执行到此处的帧必然 not _is_header_only(msg), 旧独立检查恒为 False。
                 # v1.9.143 P2-2: 补 qid 比对, 与 DoT 路径(line 1438)及 UDP 四层校验
                 # (源 IP+端口+qid+0x20)对齐。明文 TCP 虽需完成三次握手才能注入(比
                 # UDP 难), 但 on-path 攻击者若能预测/抢到 TCP 序列号并注入一个 qname
@@ -2251,7 +2246,10 @@ def probe_ip(ip, query_bytes, port=53, timeout_ms=800, up_id=None, _tried_lower=
             # (L305 len(data)<12 拒绝) 同型。原 qid 短路逻辑 `len(data) >= 2 and ...`
             # 在收到 0/1 字节 UDP 数据报时跳过 qid 校验直接 return 成功, 使伪造的
             # 0 字节回包可误判上游 RTT。此处与 _ask 对齐, 短包 continue 丢弃。
-            if len(data) < 12:
+            # R17 P3-2: 追加 header-only(QDCOUNT==0 且 ANCOUNT==0)结构闸, 与六条数据面
+            # 路径口径统一。恰好 12B、qid 匹配的无 question 段畸形响应会被当作有效响应
+            # 返回 RTT, 轻微误导测速择优(数据面仍走 _udp_query 四层校验, 不受影响)。
+            if len(data) < 12 or _is_header_only(data):
                 continue
             if len(data) >= 2 and query_bytes[:2] != data[:2]:
                 continue

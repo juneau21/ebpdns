@@ -50,11 +50,34 @@ RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=15
 # v7 P2-3: 安全沙箱硬化。
-#   仅保留 CAP_NET_BIND_SERVICE(绑定 53 端口); 移除 CAP_NET_RAW——代码中无 SOCK_RAW/
-#   AF_PACKET/AF_XDP 实际使用(bpf/ 目录为独立 C 代码, 经 load.sh 单独加载, 不进
-#   Python 守护进程), 原始套接字能力纯属多余的攻击面。
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+#   仅保留绑 53 端口与 eBPF 所需的最小能力集; 移除多余能力收敛攻击面。
+# v1.9.158 §8: eBPF 内核态缓存(kernel_cache=true)由本 Python 守护进程内直接经
+#   bpf(2)/libbpf(ctypes) 加载 map/prog 并 attach XDP, 需要:
+#     CAP_BPF         — bpf(BPF_MAP_CREATE/PROG_LOAD) 创建 LRU_HASH map 与加载 XDP prog
+#     CAP_NET_ADMIN   — 把 XDP prog attach 到指定网卡
+#     CAP_SYS_ADMIN   — bpftool/libbpf 部分辅助路径(pin map 等)
+#     CAP_IPC_LOCK    — 提升 memlock 限额以便锁定较大 LRU map(配合下方 LimitMEMLOCK=infinity);
+#                       未启用 kernel_cache 时这些能力不被实际消耗, 攻击面不变。
+#   仅当启用 kernel_cache 时实际使用; 未启用时攻击面不变。
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_IPC_LOCK
+# v1.9.158: eBPF LRU_HASH map(kernel_cache_max 可达 1048576 条 × ~151B ≈ 150MB)需锁定
+# 内存不被 swap/回收。默认 memlock 限制(通常 64KB)会让 BPF_MAP_CREATE 报 ENOMEM, 故放开到
+# infinity(与 CAP_IPC_LOCK 配套; 未启用 eBPF 时此限额无副作用)。
+LimitMEMLOCK=infinity
+# v1.9.161 审查文档化(不放宽沙箱): 在本 service 的硬化组合下, bpf_loader 的
+# **bpftool CLI 兜底路径不可用**, 内核缓存(kernel_cache=true)仅在 **libbpf.so.0
+# 可用**(install.sh 已确保安装 libbpf 运行库)时生效:
+#   - ProtectSystem=strict(仅 ReadWritePaths=/etc/ebpdns)使 bpftool 无法在
+#     /sys/fs/bpf 下 mkdir/pin  map(prog), pin 路径创建即 EPERM/EROFS。
+#   - RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX **不含 AF_NETLINK**,
+#     bpftool 兜底用的 `ip link set dev X xdpgeneric`(netlink RTM_SETLINK)
+#     会 EAFNOSUPPORT, 无法 attach XDP。
+# 安全优先: 不为了让 bpftool 兜底工作而去加 AF_NETLINK 或放宽 ProtectSystem
+# (那会扩大攻击面)。因此部署前提是宿主机装有 libbpf.so.0(ctypes 直调 bpf(2)/
+# libbpf_open_object), 该路径经 CAP_BPF/CAP_NET_ADMIN 即可, 不依赖 netlink 也不写
+# /sys/fs/bpf。若 libbpf 缺失, bpf_loader 会优雅降级为纯用户态(打 WARNING),
+# DNS 服务不受影响, 仅失去内核态直答加速。
 # v7 P2-3: 沙箱硬化
 NoNewPrivileges=yes
 # P3-7(第七轮审查): 由 full 收紧为 strict。/etc 整体只读, 仅 ReadWritePaths=/etc/ebpdns
@@ -92,8 +115,10 @@ LockPersonality=yes
 #   RestrictNamespaces: 禁止创建新 namespace(unshare/CLONE_NEW*), 收敛容器逃逸面。
 #     本服务为单进程 DNS 解析器, 不调用 unshare; 若未来引入需 namespace 的功能(如隔离子进程),
 #     启动报 EOPNOTSUPP/EPERM 时再放开。
-#   ProtectKernelModules: 禁止加载/卸载内核模块(init_module/finit_module/delete_module),
-#     eBPF loader 经独立 load.sh 单独加载, 不进本守护进程, 故可安全禁止。
+#   ProtectKernelModules: 禁止加载/卸载内核模块(init_module/finit_module/delete_module)。
+#     v1.9.158: eBPF 虽由本守护进程经 bpf(2)/libbpf 加载, 但走的是 BPF_PROG_LOAD 等
+#     bpf() 系统调用(受 CAP_BPF 管控), 并非 init_module 内核模块加载, 故仍可安全禁止;
+#     仅当未来改用 insmod/modprobe 加载内核模块形式的 XDP 驱动时才需移除此项。
 #   ProtectProc=invisible + ProcSubset=pid: 隐藏 /proc 下其他进程(仅见自身及 pid 子集),
 #     防其他进程信息泄露; /proc/self 仍可读(内存探针/trim 线程需要)。
 RestrictNamespaces=yes

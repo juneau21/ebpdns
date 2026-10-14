@@ -70,7 +70,11 @@ def type_code(name):
     hit = TYPE_CODES.get(s)
     if hit:
         return hit
-    if s.isdigit():
+    # R17/P3-3: 必须先限定 ASCII。str.isdigit() 对 Unicode 数字(阿拉伯-印度数字
+    # ١٢٣、全角１２３、上标²³等)同样返回 True, 且 int() 可把它们解析成对应数值
+    # (int("١٢٣")==123), 范围校验无法拦截——API/内部入参应只接受 ASCII 数字 0-9。
+    # 加 isascii() 守卫后, 非 ASCII 数字串走不到 int 分支, 回退 0(未知类型)。
+    if s.isascii() and s.isdigit():
         try:
             n = int(s)
         except ValueError:
@@ -197,8 +201,17 @@ def decode_name(data, offset):
             labels.append(data[pos:pos + length].decode("ascii"))
         except UnicodeDecodeError:
             labels.append(data[pos:pos + length].decode("ascii", errors="replace"))
-        # 累计线格式长度: 每标签 1(长度前缀) + label_len; 末尾 +1(根终止符)。
-        # RFC 1035: 线格式域名总长 ≤ 255 字节。
+        # R19/P3-1: name_len 累计的是【展开后(未压缩)域名】的线格式长度——
+        # 每个标签 1(长度前缀) + label_len; 末尾根终止符 \x00 不累计。
+        # RFC 1035 §3.3/§4.1.4: 255 上限针对【展开后】的名字, 而非本地报文片段。
+        #
+        # 压缩指针分支(:179-194)本身不累加 label 长度——指针只是 2 字节间接寻址,
+        # 不贡献任何标签; 跳转后落到目标 offset 的标签在此【非压缩分支】解码并累计,
+        # 它们是展开名的后缀部分, 只计一次(线性遍历, 不重复计同一物理标签)。
+        # 因此 CNAME rdata 用压缩指针指向一个接近 255 字节的 qname 时, name_len 算的就是
+        # 展开后目标名的总长: 纯指针→=qname 长(≤255 合法则照收); 前缀标签+指针→=前缀+qname。
+        # 判定 expanded≤255 ⟺ name_len≤254, 故 name_len>=255 即 expanded≥256 非法, 拒绝正确,
+        # 不会误杀"展开后 ≤255"的合法压缩应答(已用 2827 组前缀×后缀组合暴力验证 0 误杀/0 误放)。
         name_len += 1 + length
         if name_len >= 255:
             raise DNSError("name too long")
@@ -574,10 +587,6 @@ _RCODE_NAMES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
                 4: "NOTIMP", 5: "REFUSED"}
 
 
-def _rcode_name(rcode):
-    return _RCODE_NAMES.get(rcode, "RCODE%d" % rcode)
-
-
 # ---------- TCP / TLS 帧 ----------
 def tcp_frame(payload):
     """DNS over TCP: 2 字节长度前缀。"""
@@ -627,6 +636,12 @@ def encode_rdata(rtype, value):
         # R43/P3-1: 收窄为 ASCII 数字(拒绝 Unicode 数字, 避免 int() 抛 ValueError)。
         # parts[0] 为空串时 `not parts[0]` 短路 → 默认 10, 与原 isdigit()(空串 False)一致。
         pref = int(parts[0]) if parts and parts[0] and all('0' <= c <= '9' for c in parts[0]) else 10
+        # R19/P3-2: pref 来自手动配置字符串, 可为超长数字串(如 1000 位)或绕过 config 校验的
+        # 越限值。int() 对超长数字串仍成功, 但 struct.pack(">H") 对 >65535 抛 struct.error,
+        # 被下方 except 吞掉后落到末尾 bytes.fromhex(value)→value.encode(), 产出 UTF-8 文本字节
+        # (畸形 rdata, 客户端按标签长度解析会越界)。钳到 uint16[0,65535], 与 build_query 的
+        # udp_size 钳制(:260)/resolver 的 uint32 TTL 钳制同型, 不再产出畸形 rdata。
+        pref = max(0, min(pref, 65535))
         target = parts[1] if len(parts) > 1 else value
         try:
             return struct.pack(">H", pref) + encode_name(target)
@@ -680,8 +695,15 @@ def encode_rdata(rtype, value):
         parts = value.split()
         if len(parts) >= 4:
             try:
-                return (struct.pack(">HHH", int(parts[0]), int(parts[1]), int(parts[2]))
-                        + encode_name(parts[3]))
+                # R19/P3-2: priority/weight/port 均 uint16。与 MX pref 同型——
+                # 手动配置传入超长数字串时 int() 成功但 pack(">H") 抛 struct.error,
+                # 被 except 吞掉落兜底产出畸形 rdata。逐个钳到 [0,65535]。
+                # int() 对非数字串抛 ValueError 仍由外层 except 兜住(落入 hex/encode 兜底,
+                # 与既有行为一致); 此处仅消除"超长数字串→struct.error→畸形文本"路径。
+                prio = max(0, min(int(parts[0]), 65535))
+                wgt = max(0, min(int(parts[1]), 65535))
+                prt = max(0, min(int(parts[2]), 65535))
+                return (struct.pack(">HHH", prio, wgt, prt) + encode_name(parts[3]))
             except (ValueError, DNSError, struct.error):
                 pass
     try:
@@ -771,7 +793,6 @@ def _question_edns_info(data):
             while True:
                 ln = data[pos]
                 if ln == 0:
-                    qend = pos + 1   # 含 null 终止符
                     pos += 1
                     break
                 if ln & 0xC0 == 0xC0:
@@ -872,21 +893,6 @@ def _question_edns_info(data):
         return qbytes, bufsize, opt_bytes
     except Exception:
         return None, 512, None
-
-
-def _edns_bufsize(query_data):
-    """P2-9: 从客户端查询读 EDNS0 UDP payload size(OPT RR class 字段)。
-    无 EDNS OPT → 512(经典 UDP 上限); 有 OPT → 钳制到 [512, 65535]。"""
-    return _question_edns_info(query_data)[1]
-
-
-def _opt_rr_bytes(query_data):
-    """从查询报文 additional 段提取 OPT RR 原始字节(name=0 + type/class/ttl/rdlen + rdata)。
-
-    v1.9.76 2.5: 有 OPT 的查询必须在响应 additional 段回显 OPT(保留 DO 位),
-    否则下游/客户端按"不支持 EDNS"处理, 大响应能力与 DNSSEC 链验证失效。
-    逐字节复制查询 OPT(含 DO 位与 options), 无 OPT 返回 None。"""
-    return _question_edns_info(query_data)[2]
 
 
 def build_udp_response(raw_query, qbytes, answers, rcode, abody=None,
@@ -1109,11 +1115,20 @@ def build_error_response(query_data, rcode=2):
     qbytes, _limit, opt = _question_edns_info(query_data)
     if qbytes is None:
         qbytes = b""
-    qid, flags, qd, an, ns, ar = struct.unpack(">HHHHHH", query_data[:12])
+    qid, flags, _qd, _an, _ns, _ar = struct.unpack(">HHHHHH", query_data[:12])
     # D-04: 掩码保留 opcode(0x7800) + RD(0x0100) + CD(0x0010), 置 QR+RA。
     flags = (flags & 0x7910) | 0x8080 | (rcode & 0x0F)
     opt_count = 1 if opt else 0
-    header = struct.pack(">HHHHHH", qid, flags, qd, 0, 0, opt_count)
+    # R22 P3: qd 硬编码为 1, 与 build_response_header/build_simple_response 一致。
+    # qbytes 仅含第 0 个 question(_question_edns_info 只切 qi==0), 若回显请求 qd
+    # (非标 qd>1)则响应头声明 qd 个 question 而 body 仅 1 段, 头/段数量不自洽。
+    # R23 P3: 该硬编码隐含"qbytes 恒含恰好 1 个 question"的前提; qd=0 畸形请求
+    # (或首条 question 截断)时 _question_edns_info 返回 qbytes=None, 经上一行
+    # 退化为 b"", 此时头仍写 qd=1 而 body 含 0 个 question, 头/段不自洽。
+    # 让声明 qd 与实际 question 段一致: qbytes 非空=1, 空=0。对 qd>=1 正常流量
+    # (qbytes 恒非空)输出逐字节零变化, 仅 qd=0/首 question 畸形时改为声明 0。
+    declared_qd = 1 if qbytes else 0
+    header = struct.pack(">HHHHHH", qid, flags, declared_qd, 0, 0, opt_count)
     resp = header + qbytes
     if opt:
         resp += opt

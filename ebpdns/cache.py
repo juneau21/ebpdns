@@ -9,6 +9,7 @@ import threading
 import time
 import logging
 import math
+import itertools
 from collections import OrderedDict
 
 log = logging.getLogger("ebpdns")
@@ -213,7 +214,19 @@ class LRUCache:
             if pos >= n:
                 pos = 0
             step = min(self._PURGE_SCAN_STEP, n)
-            keys = list(m.keys())[pos:pos + step]
+            # R25/P3-1: 当整分片已落入单次扫描预算(step>=n, 即 n<=64)时, 强制 pos=0
+            # 从 head 扫全分片。否则若游标 0<pos<n, islice(pos, pos+n) 不回绕只扫
+            # [pos,n), 且 cursor=(pos+n)%n=pos 原地不动, [0,pos) 区间的过期条目永远
+            # 不再被周期抽样(仅靠 get 惰性清理兜底)。n>64 时 step=64, 条件不成立,
+            # 维持原分批回绕游标语义不变。
+            if step >= n:
+                pos = 0
+            # R17/P2-2: 原 list(m.keys()) 会物化整个 shard 的全部 key(O(n)) 再
+            # 切片, 违背"每次只抽样一小段、均摊 O(step)"的设计意图——高容量下
+            # (每 shard 10万+条)在 shard 锁内持续分配大列表, 阻塞同 shard 的
+            # get/put 热路径。改用 islice 只物化本次抽样的 step(≤64) 条; 先收成
+            # 短 list 再遍历 pop, 避免边迭代 dict 边删除触发 RuntimeError。
+            keys = list(itertools.islice(m.keys(), pos, pos + step))
             for k in keys:
                 e = m.get(k)
                 if e is None:
@@ -320,8 +333,17 @@ class LRUCache:
                     if e["remaining"] <= 0:
                         continue
                     e["expires_at"] = now + _safe_float(e.get("remaining", 0.0), 0.0)
-                elif e.get("expires_at", 0) <= now:
-                    continue
+                else:
+                    # R18/P3-A: 与 TinyLFU.restore(:987) 同型——裸 expires_at 分支
+                    # 必须过 _safe_float(内含 math.isfinite) 归一。cache.json 被外部
+                    # 工具写坏为 NaN/Infinity/畸形串时, 旧实现 `NaN <= now` 恒 False
+                    # → 不丢弃, 条目以 NaN expires_at 入库后 `expires_at <= now` 也恒
+                    # False → 永不过期。None/NaN/inf/畸形一律丢弃, 并回写归一后的
+                    # float(LRUCache 是默认策略, PartitionedCache.restore 也委托到此)。
+                    _exp = _safe_float(e.get("expires_at", 0.0), None)
+                    if _exp is None or _exp <= now:
+                        continue
+                    e["expires_at"] = _exp
                 e.pop("resp_body", None)
                 i = self._shard(k)
                 new_maps[i][k] = e
@@ -972,16 +994,39 @@ class TinyLFUCache:
                         _remaining = _safe_float(e.get("remaining", 0.0), 0.0)
                         e["expires_at"] = now + _remaining
                     else:
-                        if e.get("expires_at", 0) <= now:
+                        # R17/P3-1: 旧格式条目只有裸 expires_at。json.load 默认接受
+                        # NaN/Infinity 字面量, 若 cache.json 被外部工具写坏为 NaN,
+                        # 则 NaN <= now 恒 False(不跳过), 条目以 NaN expires_at 入库
+                        # 后 `expires_at <= now` 也恒 False → 永不过期。复用 _safe_float
+                        # (内部含 math.isfinite 校验) 归一: None/NaN/inf/畸形值一律
+                        # 走 default=None → 丢弃该条目, 与上方 remaining 分支同口径。
+                        _exp = _safe_float(e.get("expires_at", 0.0), None)
+                        if _exp is None or _exp <= now:
                             continue
-                        _remaining = e.get("expires_at", 0) - now
+                        # R18/P3-B: 校验通过后必须回写归一后的 float。否则字符串型
+                        # 坏值(如 "1893456000.0")经 _safe_float 解析通过校验、条目入库,
+                        # 但 e["expires_at"] 仍是 str; 命中时 resolver 侧
+                        # `expires_at - now` / `expires_at <= now` 抛 TypeError,
+                        # 该缓存 key 恒 SERVFAIL。与 remaining 分支(:979)同口径回写。
+                        e["expires_at"] = _exp
+                        _remaining = _exp - now
                     e.pop("resp_body", None)
                     _valid.append((k, e, _remaining))
                 except Exception:
                     continue
-            # 按剩余 TTL 降序: 剩余有效期最长的排后面(MRU 端), _evict_locked 淘汰
+            # 按剩余 TTL 升序: 剩余有效期最长的排在尾部(MRU 端), _evict_locked 淘汰
             # 队首(LRU, 最短 TTL)时先丢最不耐用的条目。
             _valid.sort(key=lambda x: x[2])
+            # R28/P3: 仅保留剩余 TTL 最长的 main_cap(=prot_cap+prob_cap) 条灌入 protected。
+            # 原实现把全部有效条目灌入 protected 后依赖 _evict_locked 的 probation 溢出
+            # 淘汰收敛; 但 step2 挤下 protected 队首(最短 TTL)时 move_to_end(last=False)
+            # 会把"最后挤下(最长 TTL)"顶到 probation 队首, step3 popitem(last=False) 再从
+            # 队首丢 → 反把最长 TTL 先丢、留存队尾=最短 TTL(与"先丢最不耐用"意图相反,
+            # 实证 cap=20 灌 30 条 TTL1..30 时 probation 错留 1..7、丢了 8..18)。
+            # 截断到 main_cap 后, step2 恰好挤下 prob_cap 条到 probation, step3 不再溢出,
+            # probation 留存次长 TTL 段, 与 protected 选择口径一致。不触碰 _evict_locked,
+            # 正常运行期(非 restore)准入/老化/频率 Sketch 逻辑零改动。
+            _valid = _valid[-self._main_cap:]
             for k, e, _rem in _valid:
                 self._protected[k] = e
             self._evict_locked()

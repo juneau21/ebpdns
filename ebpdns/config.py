@@ -49,6 +49,11 @@ DEFAULTS = {
     "cache_persist": True,       # 缓存持久化总开关: 关闭后不写盘(周期/退出保存均不生效)也不从磁盘载入
     "prefetch": True,
     "kernel_direct": True,          # 缓存命中计入"直答"遥测计数（真实 XDP 数据面时语义一致；当前为纯用户态）
+    # v1.9.158: eBPF XDP 内核态缓存开关组。kernel_direct(上方)为遥测计数开关, 保留不变,
+    # 与本组互不影响: kernel_cache=True 时真实 XDP 命中由内核直接 XDP_TX, 不进用户态。
+    "kernel_cache": False,          # bool: 是否启用 eBPF 内核态缓存加速(XDP 命中直接回包, 不进用户态)
+    "kernel_cache_iface": "auto",   # str: XDP 挂载网卡名; "auto"=读 /proc/net/route 选默认路由网卡
+    "kernel_cache_max": 65536,      # int: eBPF LRU_HASH map 最大条目, 范围 [1024, 1048576]
     "speed_test": True,             # 测速择优
     "speed_interval_ms": 2000,
     "speed_timeout_ms": 300,
@@ -293,6 +298,13 @@ def parse_upstream_addr(raw, proto_sel=None):
     #   3) 普通 host: "host:port" → 切 port。
     if host.startswith("["):
         _rb = host.find("]")
+        # R27 P3: 方括号 [ ] 之间必须至少 1 个字符。空括号 "[]"(_rb==1) 或无右括号
+        # "["(_rb==-1) 均为畸形 IPv6 字面量, 配置期拒绝; 否则 "[]" 穿透"裸 [v6]"分支
+        # (_after=="" 被 pass) 被接受, "[]:80" 走端口切分也被接受, 最终
+        # listen.udp="[]:80" 经 server.parse_bind 返回 ("",80) 静默绑 0.0.0.0:80
+        # 全网卡(配置期 fail-open)。合法最短 [::1] 的 ] 在下标 4, 不受影响。
+        if _rb <= 1:
+            return None
         if _rb > 0:
             _after = host[_rb + 1:]
             if _after == "":
@@ -379,14 +391,13 @@ _NUM_RANGES = {
     # 由 parse_upstream_addr 与 _validate_upstream_dict 分别校验)。
     # v1.9.90: 周期类字段加一周上限(604800=7*86400), 防止手编超大值让健康检查/
     # 测速/规则订阅形同关闭(永远不再触发)。注意单位: health_check_interval/rule_sub_interval/
-    # stale_ttl 为秒(604800s=7天); speed_interval_ms 为**毫秒**(604800ms≈10min, 同一域名
-    # 两次候选 IP 测速的节流间隔, 过长即失去择优意义)——两者上限数值相同但单位不同,
-    # 文档/前端帮助文字不得混为"7 天"。
+    # stale_ttl 为秒(604800s=7天); speed_interval_ms 为**毫秒**(上限 60000ms=60s, 与前端
+    # UI max / JS clamp 同口径; 同一域名两次候选 IP 测速的节流间隔, >60s 即失去择优意义)。
     "health_check_interval": (0, 604800),
     "max_parallel_upstreams": (1, 16),
     "stale_ttl": (0, 8_640_000),   # 上限 100 天(与前端 UI max / api 校验同口径)
     "persist_ttl": (0, 31_536_000),
-    "speed_interval_ms": (0, 604800),   # 毫秒(见上方单位说明), 默认 2000ms≈2s
+    "speed_interval_ms": (0, 60000),    # 毫秒, 上限 60s(与前端 UI 同口径), 默认 2000ms≈2s
     "speed_timeout_ms": (1, 60000),
     # 客户端侧 EDNS bufsize 上限: 最小 512(经典 DNS), 最大 65535
     "edns_client_max_size": (512, 65535),
@@ -401,6 +412,9 @@ _NUM_RANGES = {
     # 上限 64 与 resolver 的上游并发上限同一量级; 超过健康上游数时 resolver 会自动
     # 钳到健康上游数(等价于"等全部上游"), 故上限仅防离谱值。
     "nxdomain_quorum": (1, 64),
+    # v1.9.158: eBPF LRU map 容量。下限 1024(过小 map 无意义且 LRU 元数据开销占比高),
+    # 上限 1048576(100 万条目 × ~151B ≈ 150MB memlock, 需配合 ulimit -l / memlock)。
+    "kernel_cache_max": (1024, 1048576),
 }
 # 枚举字段: 合法取值集合
 _ENUM_VALUES = {
@@ -424,6 +438,9 @@ _BOOL_KEYS = {
     "ipv4_first", "ipv6", "edns", "padding", "rebind_protection",
     "ip_speed_check", "dnssec_0x20", "prefer_ipv4", "cache_persist",
     "percpu",
+    # v1.9.158: eBPF 内核态缓存总开关。纳入后加载期非 bool 回退默认,
+    # PUT /api/config 写入路径 _as_bool 归一(与 percpu 同型修复)。
+    "kernel_cache",
 }
 
 
@@ -475,6 +492,16 @@ def _validate_upstream_item(item):
     # 避免运行态携带坏 id 导致后续 PUT /api/config 整请求 400 自锁。
     if not _UPSTREAM_ID_RE.match(_id):
         return False
+    # R18 P3-1: name/group 类型校验, 与 API 写端 _validate_upstream_dict 对齐。
+    # 此前加载端不校验这两个字段: 手编 config.json 写 {"name": 123} / {"group": 123}
+    # 能加载运行, 而控制台任何保存都被写端 400 拒绝 → 自锁到必须手改 config.json。
+    # 坏条目加载期即跳过(与 id 字符集校验同型), 消除加载放行/写端拒绝的双入口漂移。
+    _name = item.get("name")
+    if _name is not None and not isinstance(_name, str):
+        return False
+    _grp = item.get("group")
+    if _grp is not None and not isinstance(_grp, str):
+        return False
     # R-fix NaN/Infinity: latency/weight 此前加载期完全不校验。api._validate_upstream_dict
     # 用 `0 <= lat <= 3600000` 拦 NaN/Infinity(两者比较均为 False → 被拒), 但手编
     # config.json 走的是本函数 —— 非有限值放行后 json.dumps 会把它输出成裸的
@@ -506,6 +533,13 @@ def _validate_rule_subscription_item(item):
     if not url or not url.lower().startswith("https://"):
         return False
     if item.get("action") not in _RULE_SUB_ACTIONS:
+        return False
+    # R18 P3-1: group 类型校验, 与 API 写端 _validate_rule_dict 对齐(该函数被
+    # POST 新建/PUT 单条/bulk rules[]/rule_subscriptions[] 四条写路径复用, group
+    # 非 None 时必须为 str)。此前加载端不校验, {"group": 123} 穿透落库为非 str,
+    # 而控制台任何保存都被写端 400 拒绝, 形成加载放行/保存拒绝的口径漂移。
+    _grp = item.get("group")
+    if _grp is not None and not isinstance(_grp, str):
         return False
     if item.get("action") == "forceIp":
         ip = str(item.get("ip") or "").strip()
@@ -573,6 +607,18 @@ def _validate_cfg(cfg):
         logging.warning("map_type 非法(got %r, 合法 %s), 已回退默认 %r",
                         cfg.get("map_type"), sorted(_MAP_TYPES), DEFAULTS["map_type"])
         cfg["map_type"] = DEFAULTS["map_type"]
+    # v1.9.158: kernel_cache_iface 必须是非空字符串(网卡名或 "auto")。手编 config.json
+    # 写入数字/数组/null 时, bpf_loader 取 iface 做 netlink attach 会抛 TypeError;
+    # 与 bootstrap_dns/health_probe_domain 同型: 非字符串加载期回退默认 "auto" 并告警,
+    # PUT /api/config 写入路径(_validate_cfg_update)对非法值直接 400 拒绝。
+    if "kernel_cache_iface" in cfg:
+        _kif = cfg.get("kernel_cache_iface")
+        if not isinstance(_kif, str) or not _kif.strip():
+            logging.warning("kernel_cache_iface 非法(需为非空字符串网卡名或 auto, got %r), "
+                            "已回退默认 %r", _kif, DEFAULTS["kernel_cache_iface"])
+            cfg["kernel_cache_iface"] = DEFAULTS["kernel_cache_iface"]
+        else:
+            cfg["kernel_cache_iface"] = _kif.strip()
     # v1.9.90: bootstrap_dns 必须是合法 host:port(DoH/DoT hostname 预解析用的 UDP
     # bootstrap)。用 parse_upstream_addr 校验格式与端口范围, 非法回退 223.5.5.5:53。
     if "bootstrap_dns" in cfg:
@@ -630,6 +676,10 @@ def _validate_cfg(cfg):
     # R-fix: api.host / listen 绑定串必须是字符串; api.host 为空串时显式回退回环。
     # 此前空串能通过"isinstance(str)"式校验, 而 socket.bind(("",port)) 实际绑定
     # 0.0.0.0("留空"变成监听全部网卡), 与 README 反复强调的"须显式改 0.0.0.0"意图相反。
+    # R17 P3-4: 此处为 api.host 校验的**唯一**位置(原晚期 R41 块仅查非字符串, 已被本块
+    # 的"非字符串或空串"超集覆盖, 删除以免漂移)。R41 理由一并保留: 手编 config.json 写
+    # "api":{"host":123} 时, 非字符串 host 会被 cli.run 传给 ThreadingHTTPServer →
+    # socket.bind((int,port)) 抛 TypeError(非 OSError)致进程启动崩溃。
     _api = cfg.get("api")
     if isinstance(_api, dict):
         _ah = _api.get("host")
@@ -760,14 +810,8 @@ def _validate_cfg(cfg):
             # 跨语言/终端复制粘贴引入隐藏字符。不强制清空, 保持向后兼容。
             logging.warning("api.token 含非 ASCII 字符, 建议改为可打印 ASCII "
                             "(比较路径已按 UTF-8 bytes 兼容, 仍可认证): len=%d", len(tok))
-        # P3-2(R41): api.host 必须是字符串。手编 config.json 写 "api": {"host": 123} 时
-        # _validate_cfg 通过(api 是 dict, token/port 走默认), cli.run 把 int 传给
-        # ThreadingHTTPServer → socket.bind((int, port)) 抛 TypeError(非 OSError,
-        # cli.py 不捕获)致进程崩溃。与 api.token/api.port 同型: 非字符串回退默认并告警。
-        _raw_host = api_cfg.get("host", "127.0.0.1")
-        if not isinstance(_raw_host, str):
-            logging.warning("api.host 不是字符串, 已回退默认 127.0.0.1: %r", _raw_host)
-            api_cfg["host"] = "127.0.0.1"
+        # R17 P3-4: api.host 的"非字符串/空串 → 回退回环"校验已上移并集中到本函数前部
+        # (见 _validate_cfg 开头的 _api 块), 原 R41 仅查非字符串的冗余块已删除, 避免漂移。
         # P3-3(R5): 嵌套 api.port 加载期数值校验。此前 _validate_cfg 只碰顶层标量键,
         # 手编 config.json 写 "port":"abc" 或 null 时, cli.run 里 int(...) 直接
         # ValueError 崩溃, 无回退无友好提示。此处与 api.host 处理对齐: 非法回退 8080 并告警。

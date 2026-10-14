@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
-# ebpdns 安装脚本 (Debian 13 / 兼容 Debian 系)
+# ebpdns v1.9.163 安装脚本 (Debian 13 / 兼容 Debian 系)
 #   用法: sudo ./install.sh
-#         自动检测并安装依赖 (python3 / aioquic); 可用
-#         EBPDNS_SKIP_DEPS=1 跳过自动安装(仅检测并提示)
+#         自动检测**并自动安装**全部所需依赖与软件, 一条命令完成部署:
+#           * 必需: python3(>=3.10)
+#           * 可选: aioquic(DoQ/DoH3)、完整 eBPF 工具链
+#                   (clang/llvm/libbpf-dev/linux-libc-dev/bpftool)
+#           * 运行时工具: iproute2(ip)、libcap2-bin(setcap)
+#         可选依赖安装失败**不阻断部署**(DNS 服务照常, 仅对应增强功能不可用)。
+#         离线/受限环境可用 EBPDNS_SKIP_DEPS=1 跳过自动安装(仅检测并提示)。
 #   支持两种场景:
 #     A) 就地安装: 包已解压到 /opt/ebpdns, 直接在 /opt/ebpdns 下运行本脚本
 #     B) 异地安装: 包在任意目录, 运行后拷贝到 /opt/ebpdns
@@ -33,13 +38,78 @@ else
   echo "==> 0/4 依赖检测与自动安装"
 fi
 
-# --- python3 ---
+# ---------- 统一依赖安装助手 (v1.9.161) ----------
+# 设计要点:
+#   * apt-get update 只做一次并记住结果(原脚本在 python3 与 aioquic 两处各更新一次,
+#     联网慢时白白多花几十秒);
+#   * `if ! cmd; then` 形式规避 set -e —— 旧脚本用 `! command -v python3` 作条件,
+#     在 `set -e` 下一旦为真会直接终止脚本(退出码被 `!` 反转, 与 set -e 语义冲突),
+#     这也是"自动安装依赖"长期不可靠的原因之一;
+#   * 缺失即装、装完复验, 失败只提示不中断(可选项失败不应阻断部署)。
+_APT_UPDATED=0
+_apt_update_once() {
+  [[ "$_APT_UPDATED" == "1" ]] && return 0
+  _APT_UPDATED=1
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "    → apt-get update (仅执行一次)"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null \
+      || echo "[WARN] apt-get update 失败，继续尝试安装（可能安装到过期包）"
+  fi
+}
+
+# _ensure_pkg <用于判定的命令> <apt 包名> <说明>
+#   判定命令已存在 → 跳过; 否则自动 apt 安装并复验。
+#   返回 0=就绪, 1=未能就绪。
+_ensure_pkg() {
+  local probe="$1" pkg="$2" desc="$3"
+  if command -v "$probe" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$AUTO_DEPS" != "1" ]]; then
+    echo "    (已跳过自动安装) 缺少 ${desc}（apt 包 ${pkg}）"
+    return 1
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "    [WARN] 缺少 ${desc}（apt 包 ${pkg}），且本机无 apt-get，请手动安装"
+    return 1
+  fi
+  _apt_update_once
+  echo "    → 自动安装 ${desc}（${pkg}）"
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1 \
+     && command -v "$probe" >/dev/null 2>&1; then
+    echo "    ✓ ${desc} 已安装"
+    return 0
+  fi
+  echo "    [WARN] ${desc} 自动安装失败，请手动:  apt install -y ${pkg}"
+  return 1
+}
+
+# _ensure_path <绝对路径> <apt 包名> <说明>  —— 用于无同名命令的依赖(头文件/库)
+_ensure_path() {
+  local path="$1" pkg="$2" desc="$3"
+  if [[ -e "$path" ]]; then
+    return 0
+  fi
+  if [[ "$AUTO_DEPS" != "1" ]] || ! command -v apt-get >/dev/null 2>&1; then
+    echo "    (未安装) 缺少 ${desc}（apt 包 ${pkg}）"
+    return 1
+  fi
+  _apt_update_once
+  echo "    → 自动安装 ${desc}（${pkg}）"
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1 \
+     && [[ -e "$path" ]]; then
+    echo "    ✓ ${desc} 已安装"
+    return 0
+  fi
+  echo "    [WARN] ${desc} 自动安装失败，请手动:  apt install -y ${pkg}"
+  return 1
+}
+
+# --- python3 (必需) ---
 if ! command -v python3 >/dev/null 2>&1; then
   if [[ "$AUTO_DEPS" == "1" ]] && command -v apt-get >/dev/null 2>&1; then
     echo "    (未检测到 python3 → 自动安装 python3)"
-    # P2-25(第九轮审查): 原 `|| true` 静默吞掉 apt-get update 失败, 网络/DNS 异常时
-    # 用户不知道索引已过期, 后续安装到过期包才报错。改为打印 WARN 但继续安装。
-    apt-get update -qq 2>/dev/null || echo "[WARN] apt-get update 失败，继续尝试安装（可能安装到过期包）"
+    _apt_update_once
     DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1 \
       || { echo "错误: 自动安装 python3 失败, 请手动执行:  apt install -y python3" >&2; exit 1; }
   else
@@ -60,9 +130,8 @@ if ! python3 -c 'import aioquic' 2>/dev/null; then
   echo "    (未检测到 aioquic, DoQ/DoH3 上游需要它)"
   if [[ "$AUTO_DEPS" == "1" ]]; then
     _aq_ok=0
-    # 优先 apt 系统包(与系统 python3 版本一致); 先 apt-get update 防索引过期
-    # P2-25(第九轮审查): 同上, update 失败打印 WARN 但继续, 不静默吞掉。
-    apt-get update -qq 2>/dev/null || echo "[WARN] apt-get update 失败，继续尝试安装（可能安装到过期包）"
+    # 优先 apt 系统包(与系统 python3 版本一致); 复用上面的"仅一次" update
+    _apt_update_once
     if command -v apt-get >/dev/null 2>&1 && apt-get install -y python3-aioquic >/dev/null 2>&1; then
       echo "    aioquic 已通过 apt 安装 (python3-aioquic)"
       _aq_ok=1
@@ -74,6 +143,18 @@ if ! python3 -c 'import aioquic' 2>/dev/null; then
       # --quiet 仍抑制正常安装进度与"Successfully installed"提示, 不会刷屏; 失败时用户能看到具体原因。
       python3 -m pip install --quiet --break-system-packages aioquic && _aq_ok=1 \
         || echo "    (python3 -m pip 安装失败, 详见上方 pip 错误输出)" >&2
+    fi
+    # v1.9.161: pip 自身可能缺失(Debian 最小安装无 pip)—— 先自动补齐 python3-pip 再重试
+    if [[ "$_aq_ok" == "0" ]] && command -v apt-get >/dev/null 2>&1; then
+      if ! python3 -m pip --version >/dev/null 2>&1; then
+        echo "    (未检测到 pip → 自动安装 python3-pip)"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip >/dev/null 2>&1 || true
+      fi
+      if python3 -m pip --version >/dev/null 2>&1; then
+        echo "    (重试: python3 -m pip 安装 aioquic)"
+        python3 -m pip install --quiet --break-system-packages aioquic && _aq_ok=1 \
+          || echo "    (python3 -m pip 安装失败, 详见上方 pip 错误输出)" >&2
+      fi
     fi
     if [[ "$_aq_ok" == "0" ]] && command -v pip3 >/dev/null 2>&1; then
       echo "    (最后尝试 pip3 安装)"
@@ -117,7 +198,7 @@ if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
   # (历史问题: 早期版本就地安装缺文件时 cp 报错, 用户 VM 上 systemd 启动失败)
   # v1.9.80: 关键文件清单补全到运行时实际依赖(入口/包核心模块/前端页面与图表/unit)
   for _req in bin/ebpdns ebpdns/__init__.py ebpdns/__main__.py ebpdns/cli.py ebpdns/api.py \
-              ebpdns/resolver.py ebpdns/server.py ebpdns/cache.py ebpdns/config.py \
+              ebpdns/bpf_loader.py ebpdns/resolver.py ebpdns/server.py ebpdns/cache.py ebpdns/config.py \
               ebpdns/telemetry.py ebpdns/upstream.py ebpdns/dnsmsg.py ebpdns/probe.py \
               ebpdns/quic_upstream.py web/index.html web/echarts.min.js web/favicon.svg systemd/ebpdns.service; do
     if [[ ! -e "${INSTALL_DIR}/${_req}" ]]; then
@@ -135,7 +216,7 @@ if [[ "$SRC_DIR" == "$INSTALL_DIR" ]]; then
   # 但若代码用 importlib.import_module("ebpdns." + name) 动态枚举会误加载, 且与异地
   # 升级行为漂移。这里用白名单对齐当前发布包的模块清单, 删除 ebpdns/ 下多余的 .py。
   # 维护提醒: 新增/删除模块时同步更新此白名单。
-  _whitelist_py="__init__.py __main__.py cli.py api.py resolver.py server.py cache.py config.py telemetry.py upstream.py dnsmsg.py probe.py quic_upstream.py"
+  _whitelist_py="__init__.py __main__.py cli.py api.py bpf_loader.py resolver.py server.py cache.py config.py telemetry.py upstream.py dnsmsg.py probe.py quic_upstream.py"
   if [[ -d "${INSTALL_DIR}/ebpdns" ]]; then
     ( cd "${INSTALL_DIR}/ebpdns" && \
       for _f in *.py; do
@@ -193,30 +274,41 @@ else
     rsync -a --ignore-missing-args \
       --exclude='*.pyc' --exclude='__pycache__' \
       "${SRC_DIR}/bpf/" "${INSTALL_DIR}/bpf/"
-    # etc/(配置模板) + 顶层 README/LICENSE: --delete 仅镜像 etc/ 内部陈旧模板
+    # etc/(配置模板) + 顶层 README/LICENSE/NOTICE: --delete 仅镜像 etc/ 内部陈旧模板
     rsync -a --delete --ignore-missing-args \
       --exclude='*.pyc' --exclude='__pycache__' --exclude='tools' \
       --exclude='deploy-test' --exclude='tests' \
       "${SRC_DIR}/etc/" "${INSTALL_DIR}/etc/"
-    # P3-11(R12): 原 `2>/dev/null || true` 静默吞掉 README/LICENSE 拷贝失败(磁盘满/只读挂载)。
+    # P3-11(R12): 原 `2>/dev/null || true` 静默吞掉 README/LICENSE/NOTICE 拷贝失败(磁盘满/只读挂载)。
     # 文档非运行时依赖, 缺失不影响 daemon, 故为非致命——改为显式 WARN(与同脚本 chown/chmod
     # 显式 WARN 风格对齐), 用户不再对文档缺失无感知。
-    cp -f "${SRC_DIR}/README.md" "${SRC_DIR}/LICENSE" "${INSTALL_DIR}/" \
-      || echo "[WARN] README/LICENSE 拷贝失败(不影响运行, 仅文档缺失)"
+    # R17 P3-1: NOTICE(第三方组件归属声明, Apache-2.0/GPL-2.0 随附声明)与 LICENSE/README 同等
+    # 拷贝——异地部署后若将 /opt/ebpdns 整体再分发(Docker/VM 模板), 归属声明必须随附, 否则
+    # 构成 Apache-2.0 合规缺失。
+    cp -f "${SRC_DIR}/README.md" "${SRC_DIR}/LICENSE" "${SRC_DIR}/NOTICE" "${INSTALL_DIR}/" \
+      || echo "[WARN] README/LICENSE/NOTICE 拷贝失败(不影响运行, 仅文档/归属声明缺失)"
   else
     # rsync 不可用 → 退回 cp。纯代码子目录(bin/ebpdns/web/systemd)先删旧再拷,
-    # 对齐 rsync --delete: 清除上版本已删除的陈旧 .py/入口文件。bpf/etc(模板)按覆盖拷贝。
+    # 对齐 rsync --delete: 清除上版本已删除的陈旧 .py/入口文件。bpf(用户就地 make 产物)按覆盖拷贝。
     # 用户数据目录 /etc/ebpdns 独立于 ${INSTALL_DIR}, 不受影响。
     for _d in bin ebpdns web systemd; do
       rm -rf -- "${INSTALL_DIR:?}/${_d}"
     done
+    # R18 P3-1: etc/(纯配置模板)与上方 rsync 分支 --delete(install.sh:197-200)口径对齐——
+    # 先清空目标 etc 再覆盖拷贝, 清除上版本已删除/改名的陈旧模板。原 cp 分支仅 mkdir+cp 覆盖,
+    # 与 rsync --delete 漂移(陈旧模板残留)。bpf/ 不删: rsync 分支 bpf 无 --delete(install.sh:193-195),
+    # 保留用户就地 make 出的 ebpdns_xdp.o / 自定义 .c; 用户真实数据在独立的 /etc/ebpdns, 不在
+    # ${INSTALL_DIR}/etc, 此处清空安全。
+    rm -rf -- "${INSTALL_DIR:?}/etc"
     mkdir -p "${INSTALL_DIR}"/bin "${INSTALL_DIR}"/ebpdns "${INSTALL_DIR}"/web \
              "${INSTALL_DIR}"/bpf "${INSTALL_DIR}"/etc "${INSTALL_DIR}"/systemd
     cp -r "${SRC_DIR}"/bin "${SRC_DIR}"/ebpdns "${SRC_DIR}"/web \
           "${SRC_DIR}"/bpf "${SRC_DIR}"/etc "${SRC_DIR}"/systemd "${INSTALL_DIR}/"
     # P3-11(R12): 同上方 rsync 分支, 移除 `2>/dev/null || true` 静默吞, 拷贝失败显式 WARN(非致命)。
-    cp -f "${SRC_DIR}"/README.md "${SRC_DIR}"/LICENSE "${INSTALL_DIR}/" \
-      || echo "[WARN] README/LICENSE 拷贝失败(不影响运行, 仅文档缺失)"
+    # R17 P3-1: NOTICE 与 LICENSE/README 同等拷贝(见上方 rsync 分支注释), 保证 cp 回退路径
+    # 异地部署后归属声明不缺失。
+    cp -f "${SRC_DIR}"/README.md "${SRC_DIR}"/LICENSE "${SRC_DIR}"/NOTICE "${INSTALL_DIR}/" \
+      || echo "[WARN] README/LICENSE/NOTICE 拷贝失败(不影响运行, 仅文档/归属声明缺失)"
     # R31 P3-4: rsync 路径有 --exclude(*.pyc / __pycache__ / tests), cp 回退路径无 exclude 能力。
     # 拷贝后置清理构建缓存与测试目录, 避免陈旧 .pyc/__pycache__/tests 进入 /opt/ebpdns,
     # 与 rsync 路径排除项行为对齐。失败(目录不存在等)静默忽略, 不影响主安装流程。
@@ -254,6 +346,129 @@ chmod 755 "${INSTALL_DIR}/web" 2>/dev/null || true
 # favicon.svg(P3-1 新增), 原大括号里的 .css/.png/.ico 永不命中(空 glob 被 || true 静默吞, 死 glob)。
 # 现仅 chmod 真实存在的三类扩展名; favicon.svg 纳入 644 保证 ebpdns 用户可读。
 chmod 644 "${INSTALL_DIR}/web/"*.{html,js,svg} 2>/dev/null || true
+
+# ---------- 1.5/4 eBPF 内核态缓存: 编译 XDP .o +  capabilities (v1.9.158 §8) ----------
+# 检测 clang/llvm/libbpf-dev。工具链齐全则编译 ebpdns_xdp.o; 缺失则跳过,
+# 服务以纯用户态运行(kernel_cache 默认 False, 不影响功能)。
+echo "==> 1.5/4 eBPF 内核态缓存检测与工具链自动安装"
+
+# ---------- 运行时必备工具(自动安装) ----------
+# iproute2(`ip`)  : bpf_loader 的 bpftool 降级路径需要它 attach XDP
+# libcap2-bin(setcap): 打印非 systemd 手动运行的能力授予指引
+_ensure_pkg ip      iproute2  "iproute2(网卡操作)"  || true
+_ensure_pkg setcap  libcap2-bin "libcap2-bin(setcap)" || true
+# rsync: 异地安装/升级用它做 --delete 同步(清除上版本已删除的陈旧 .py)。
+# 缺失时有 cp 回退可用, 不阻断安装; 但装上可保证升级语义与 rsync 分支一致。
+_ensure_pkg rsync   rsync     "rsync(增量同步)"   || true
+
+# ---------- eBPF 编译工具链(可选功能, 自动安装) ----------
+# bpf/Makefile 依赖: make clang llvm libbpf-dev linux-libc-dev bpftool
+#   * make         —— Makefile 的执行器(编译/clean/install 目标都靠它)
+#   * clang        —— 编译 .bpf.c 为 BPF 目标文件
+#   * llvm-strip   —— Makefile 校验/裁剪(BPF_TARGET=bpfel 需要 llvm 工具集)
+#   * libbpf-dev   —— <bpf/bpf_helpers.h> 等头文件
+#   * linux-libc-dev —— <linux/bpf.h> 等内核 UAPI 头(部分系统由 libc6-dev 提供)
+#   * bpftool      —— `gen skeleton` 目标(缺它只影响 .skel.h, 不阻塞 .o)
+# 说明: 这些是**可选加速层**的工具链。装不上不影响 DNS 服务(纯用户态 LRU 照常工作),
+# 故失败只提示不中断部署。
+_BPF_TOOLCHAIN_OK=1
+# v1.9.161 R-fix(用户实测): make 是 Makefile 执行器, 缺它则 `make: command not found`
+# —— 之前漏装了 make(仅装了 clang/llvm/头文件/bpftool)。干净机器上编译必然失败。
+_ensure_pkg make make "make(BPF 构建工具)" || _BPF_TOOLCHAIN_OK=0
+if ! command -v clang >/dev/null 2>&1; then
+  _ensure_pkg clang clang "clang(BPF 编译器)" || _BPF_TOOLCHAIN_OK=0
+fi
+if [[ "$_BPF_TOOLCHAIN_OK" == "1" ]] \
+   && ! { command -v llvm-strip >/dev/null 2>&1 || command -v llvm-objdump >/dev/null 2>&1; }; then
+  _ensure_pkg llvm-strip llvm "llvm(工具集)" || _BPF_TOOLCHAIN_OK=0
+fi
+if [[ "$_BPF_TOOLCHAIN_OK" == "1" ]]; then
+  _ensure_path /usr/include/bpf/bpf_helpers.h libbpf-dev "libbpf-dev(BPF 头文件)" \
+    || _BPF_TOOLCHAIN_OK=0
+fi
+if [[ "$_BPF_TOOLCHAIN_OK" == "1" ]]; then
+  _ensure_path /usr/include/linux/bpf.h linux-libc-dev "linux-libc-dev(内核 UAPI 头)" \
+    || _BPF_TOOLCHAIN_OK=0
+fi
+# bpftool: 只在需要 .skel.h 时必需; 但 loader 的降级路径也用它, 故一并装。
+_ensure_pkg bpftool bpftool "bpftool(BPF 工具)" || true
+
+if [[ "$_BPF_TOOLCHAIN_OK" == "1" ]]; then
+  echo "    工具链就绪, 编译 ebpdns_xdp.o ..."
+  # 只编 .o (loader 实际加载物); skel.h 需 bpftool, 缺失不阻塞 .o。
+  # v1.9.161 R-fix: 编译失败时**回显具体错误**。原实现 `>/dev/null 2>&1` 把
+  # clang 的错误输出彻底吞掉, 用户只看到一句"编译失败", 却不知是缺头文件、
+  # 语法错误还是架构不匹配 —— 必须手动跑 make 才能看, 徒增排查成本。
+  # 现在失败时把 make 日志打到 stderr, 一眼可见根因。
+  if make -C "${INSTALL_DIR}/bpf" ebpdns_xdp.o >/tmp/ebpdns_make.log 2>&1 \
+     || make -C "${SRC_DIR}/bpf" ebpdns_xdp.o >>/tmp/ebpdns_make.log 2>&1; then
+    rm -f /tmp/ebpdns_make.log
+    # SRC_DIR 构建时拷到 INSTALL_DIR (上面 cp 已发生, 这里补拷一次 .o)
+    if [[ -f "${SRC_DIR}/bpf/ebpdns_xdp.o" && ! -f "${INSTALL_DIR}/bpf/ebpdns_xdp.o" ]]; then
+      cp -f "${SRC_DIR}/bpf/ebpdns_xdp.o" "${INSTALL_DIR}/bpf/" 2>/dev/null || true
+    fi
+    if [[ -f "${INSTALL_DIR}/bpf/ebpdns_xdp.o" ]]; then
+      echo "    eBPF XDP 程序已编译: ${INSTALL_DIR}/bpf/ebpdns_xdp.o"
+    else
+      echo "    [WARN] eBPF 编译未见 .o 产物, 将以纯用户态运行"
+    fi
+  else
+    echo "    [WARN] eBPF 编译失败, 将以纯用户态运行（不影响 DNS）"
+    echo "    --- 编译错误详情 ---"
+    sed 's/^/    | /' /tmp/ebpdns_make.log 2>/dev/null | tail -20
+    rm -f /tmp/ebpdns_make.log
+    echo "    --- 排查提示 ---"
+    echo "    | 缺头文件: apt install -y libbpf-dev linux-libc-dev"
+    echo "    | 架构不匹配: 检查 uname -m 与 Makefile 的 -D__TARGET_ARCH_ / include 路径"
+  fi
+else
+  echo "    [提示] eBPF 工具链未齐全, 本机将以纯用户态运行（DNS 功能不受影响）"
+  echo "           如需内核态加速, 可手动补装后重跑本脚本:"
+  echo "             apt install -y clang llvm libbpf-dev linux-libc-dev bpftool"
+fi
+# eBPF 内核态缓存免 root 获取 BPF/NET_ADMIN/SYS_ADMIN/IPC_LOCK 能力(供 XDP attach)。
+# v1.9.158 修正: bin/ebpdns 是带 shebang 的 Python 脚本(文本文件, 非 ELF), 对它 setcap
+# 无效(能力只对 ELF 可执行文件生效)。推荐路径是 systemd 托管: ebpdns.service 已用
+# AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_IPC_LOCK + LimitMEMLOCK=infinity
+# 精确授予, 无需 setcap。下面仅打印手动(非 systemd)运行的可选做法, 不自动执行。
+echo "    eBPF 能力授予: 推荐走 systemd(ebpdns.service 已配 AmbientCapabilities + LimitMEMLOCK)。"
+if command -v setcap >/dev/null 2>&1; then
+  _PYELF="$(readlink -f "$(command -v python3)" 2>/dev/null || true)"
+  if [[ -n "${_PYELF}" && -f "${_PYELF}" ]]; then
+    echo "    若坚持非 systemd 手动运行, 需把能力打在 Python 解释器 ELF 上(脚本本身打 setcap 无效):"
+    echo "      sudo setcap cap_bpf,cap_net_admin,cap_sys_admin,cap_ipc_lock+ep '${_PYELF}'"
+    echo "    [警告] 这会给整机所有 python3 程序赋予上述特权能力, 安全面大, 不推荐; 请优先用 systemd。"
+  fi
+else
+  echo "    [提示] 未找到 setcap (libcap2-bin); systemd 托管方式无需 setcap。"
+fi
+
+# ---------- 兼容性检查（v1.9.163 新增）----------
+# 已存在的 config.json 可能来自**另一实现**：Rust 版用 `upstreams[].host`，本版用 `addr`；
+# 此时"保留不动"会让所有上游被 config.py 判为非法并**整体丢弃**（实测 22/22 被丢），
+# api.port / web_root / bootstrap_dns 也可能不是本版形态 → 表现为"服务起来了但一个上游都不通、
+# 控制台端口不对"。检测到即备份旧文件，改用本次发行模板。
+if [[ -f "${CONF_DIR}/config.json" ]]; then
+  if python3 - "${CONF_DIR}/config.json" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    c = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)                      # 解析失败/损坏 → 同样视为不兼容：备份并用发行模板重建
+up = c.get("upstreams") or []
+rust_schema = any(isinstance(u, dict) and ("host" in u) and ("addr" not in u) for u in up)
+api = c.get("api") if isinstance(c.get("api"), dict) else {}
+bad_api = api.get("port") not in (None, 8080)
+sys.exit(0 if (rust_schema or bad_api) else 1)
+PYEOF
+  then
+    _cfg_bak="${CONF_DIR}/config.json.incompat-$(date +%Y%m%d-%H%M%S).bak"
+    cp -f "${CONF_DIR}/config.json" "${_cfg_bak}" 2>/dev/null || true
+    echo "[WARN] 现有 ${CONF_DIR}/config.json 来自其它实现（Rust 版 schema 或非 8080 控制台端口）"
+    echo "       已备份到 ${_cfg_bak}；将按本次发行模板重建（如需保留旧设置请手动合并）。"
+    rm -f "${CONF_DIR}/config.json" 2>/dev/null || true
+  fi
+fi
 
 # ---------- 2/4 生成配置 ----------
 echo "==> 2/4 生成配置 ${CONF_DIR}/config.json"

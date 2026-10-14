@@ -96,6 +96,11 @@ class _UDPHandler:
         # 偶发错误不应 break 整个收包线程)。连续错误达阈值才重建 socket(置 stop 退出
         # serve_forever, 由上层重绑); 成功收包即清零。
         self._recv_errs = 0
+        # v1.9.161 审查修复: answer_fast 快路径异常计数器。快路径异常必须降级到
+        # 完整路径(fast=None), 绝不能让快路径 bug 阻断查询; 但历史上此处裸
+        # except 静默吞掉 _enc_owner 类系统性异常, 使所有查询无声退化为完整路径。
+        # 累计计数 + 前 3 次 WARNING + 之后每 100 次采样一次, 保证可观测又不刷屏。
+        self._fast_errs = 0
         # 致命回调: socket 连续接收失败判定网络栈不可用时, 由上层注入
         # (回调内先持久化缓存再非零退出, systemd Restart=on-failure 重启)。
         self.fatal_callback = None
@@ -163,7 +168,14 @@ class _UDPHandler:
             if msg is not None:
                 try:
                     fast = self.resolver.answer_fast(data, addr, msg=msg)
-                except Exception:
+                except Exception as e:
+                    # 必须降级(fast=None), 绝不能让快路径异常导致查询失败;
+                    # 但不能静默吞——累计计数并按阈值 WARNING, 避免系统性 bug
+                    # (历史 _enc_owner 类)无声让所有查询退化为完整路径。
+                    self._fast_errs += 1
+                    if self._fast_errs <= 3 or self._fast_errs % 100 == 0:
+                        log.warning("answer_fast 快路径异常(降级完整路径, 累计 %d 次): %r",
+                                    self._fast_errs, e)
                     fast = None
                 if fast is not None:
                     try:
@@ -293,6 +305,14 @@ class _TCPRequestHandler(socketserver.BaseRequestHandler):
 class TCPDNSServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # v1.9.161 R-fix(压测实测): 默认 backlog(request_queue_size) = 5, 高并发短连接下
+    # 内核只留 5 个"已完成握手但未被 accept"的连接, 其余连接被丢弃/挂起。
+    # 实测 200 并发短连接压测: 5% 请求 2s 超时、日志 0 条"槽位已满"(证明不是信号量),
+    # ss 显示近万 TIME_WAIT —— 根因就是 backlog 太小, accept 跟不上连接建立速度。
+    # 提到 256: 与 _conn_slots 额度一致, 让"已握手待处理"的连接在应用层排队
+    # 而非在内核被丢弃, 客户端不会误判超时。256 已是温和值(内核上限 net.core.somaxconn
+    # 通常 4096), 不会引入内存压力(每个待处理连接在 accept 前不占线程)。
+    request_queue_size = 256
     # 绑定失败重试: 重启时旧进程 socket 可能仍在 TIME_WAIT, 重试 3 次(间隔 200ms)
     # 覆盖绝大多数 systemd 快速重启场景, 避免 TCP6/TCP 端口冲突告警
     _bind_retries = 3
@@ -435,17 +455,27 @@ class DNSServer:
         udp6_spec = listen.get("udp6")
         tcp6_spec = listen.get("tcp6")
 
-        # UDP4（主服务，失败视为启动失败）
-        try:
-            self.udp_addr = self.udp.bind(udp_spec)
-            t = threading.Thread(target=self.udp.serve_forever, name="dns-udp", daemon=True)
-            t.start()
-            self._threads.append(t)
-        except OSError as e:
-            # v1.9.84 SV-01: bind 失败必须回收预创建的 ThreadPoolExecutor(最多 64 worker),
-            # 否则上层重试 start() 时线程会累积泄漏。
+        # UDP4（主服务，失败视为启动失败；显式 null/空 = 不监听，与 udp6/tcp6 同型跳过）
+        if udp_spec:
+            try:
+                self.udp_addr = self.udp.bind(udp_spec)
+                t = threading.Thread(target=self.udp.serve_forever, name="dns-udp", daemon=True)
+                t.start()
+                self._threads.append(t)
+            except OSError as e:
+                # v1.9.84 SV-01: bind 失败必须回收预创建的 ThreadPoolExecutor(最多 64 worker),
+                # 否则上层重试 start() 时线程会累积泄漏。
+                self.udp.stop()
+                raise RuntimeError("UDP 监听失败 (%s): %s" % (udp_spec, e))
+        else:
+            # R28/P3: 校验层 config.py 对 listen.udp 显式 null 保留 None 并承诺"不监听该
+            # 协议"; 运行层原无条件 bind(), udp_spec=None → parse_bind(None)→("0.0.0.0",53)
+            # 静默绑全网卡(与用户意图相反)。此处与 udp6/tcp6 同型: spec 为 None/空串时
+            # 不创建 socket、不绑定, 真正实现"null=不监听"。回收 __init__ 预创建的空线程池,
+            # self.udp 置 None(stop()/udp_dropped()/cli fatal_callback 已 None-safe)。
             self.udp.stop()
-            raise RuntimeError("UDP 监听失败 (%s): %s" % (udp_spec, e))
+            self.udp = None
+            log.info("listen.udp 为空(null/空串): 不监听 IPv4 UDP")
 
         # UDP6（可选：无 IPv6 栈时告警跳过）
         if udp6_spec:
@@ -455,12 +485,17 @@ class DNSServer:
                 self.udp6 = None
                 log.warning("UDP6 监听失败 (%s), IPv6 UDP 服务不可用: %s", udp6_spec, e)
 
-        # TCP4（失败降级为仅 UDP）
-        try:
-            self.tcp_addr = self._start_tcp(tcp_spec, "tcp", "dns-tcp")
-        except OSError as e:
-            self.tcp = None
-            log.warning("TCP 监听失败 (%s), 仅提供 UDP 服务: %s", tcp_spec, e)
+        # TCP4（显式 null/空 = 不监听, 与 tcp6 同型跳过；失败降级为仅 UDP）
+        if tcp_spec:
+            try:
+                self.tcp_addr = self._start_tcp(tcp_spec, "tcp", "dns-tcp")
+            except OSError as e:
+                self.tcp = None
+                log.warning("TCP 监听失败 (%s), 仅提供 UDP 服务: %s", tcp_spec, e)
+        else:
+            # R28/P3: 与 UDP4 同型, 显式 null/空串 = 不监听 IPv4 TCP, 不再 parse_bind(None)
+            # 静默绑全网卡。self.tcp 在 __init__ 已为 None, 无需额外清理。
+            log.info("listen.tcp 为空(null/空串): 不监听 IPv4 TCP")
 
         # TCP6（可选：无 IPv6 栈时告警跳过）
         if tcp6_spec:
@@ -472,7 +507,9 @@ class DNSServer:
         return self
 
     def stop(self):
-        self.udp.stop()
+        # R28/P3: self.udp 在 listen.udp=null 时为 None(不监听 IPv4 UDP), 与 udp6 同型守卫。
+        if self.udp:
+            self.udp.stop()
         if self.udp6:
             self.udp6.stop()
         for srv in (self.tcp, self.tcp6):

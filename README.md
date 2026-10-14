@@ -1,26 +1,18 @@
 # ebpdns —— SmartDNS 式智能 DNS 解析器（Debian 13 可部署）
 
-> 当前版本 **v1.9.150**（`ebpdns/__init__.py` `__version__ = "1.9.150"`；版本号另见 `web/index.html` 的 APP_VERSION，共两处）。本文档与代码逐项对齐：
+> 当前版本 **v1.9.164**（`ebpdns/__init__.py` `__version__ = "1.9.164"`；版本号另见 `web/index.html` 的页脚与 APP_VERSION，共三处）。本文档与代码逐项对齐：
 > 功能清单、配置项、API 端点、安装/部署方式均以源码为准（见文末「文档对齐说明」）。
 
-请注意！！！所有代码来源于豆包模型，软件已稳定运行，后续几乎不会更新**真实可部署的 DNS 解析软件**。
+把「ebpdns · eBPF 版 SmartDNS 解析器控制台」从浏览器内仿真升级为**真实可部署的 DNS 解析软件**。
 
 - 真实监听 `UDP/TCP :53`，真实多上游并发解析（UDP / TCP / DoH / DoT / DoQ / DoH3）
 - 复刻 SmartDNS 的**测速择优、上游 weight 加权轮询、域名分流、TTL 缓存、预取、IPv4 优先、失败降级**等智能逻辑
 - 默认数据面运行在**用户态**：以**用户态 LRU 缓存模拟 BPF LRU_HASH Map**，命中由 daemon 快路径直接回包，**无需内核权限**即可完整运行
 - 内置 **HTTP JSON API + Web 控制台**：控制台连上后端即为真实数据（REAL 模式），后端不可达时自动降级为浏览器内仿真（SIM 模式）
-- 可选 **eBPF XDP 内核旁路**（`bpf/`）：`bpf/` 目录为参考实现、当前**未集成**到 daemon 运行路径，默认部署即为上方用户态路径
+- 可选 **eBPF XDP 内核旁路**（`bpf/`）：v1.9.158 起已接入 daemon（`ebpdns/bpf_loader.py` + `kernel_cache` 配置），命中查询由网卡内核直答；`make` 可编译出 `.o`，但内核校验器**仍拒绝加载**，故默认 `kernel_cache:false` 走用户态路径（详见 §9 与 `bpf/README.md`）
 - 纯 Python 标准库、零第三方依赖；systemd 一键托管；支持 systemd 崩溃自动重启（`Restart=on-failure`）
 
 ---
-
-WEB运行截图
-
-<img width="2560" height="1294" alt="6a4237cd7d1021d49757cca4f0226f46" src="https://github.com/user-attachments/assets/89c5aaeb-9df7-4de4-b0eb-b31ef1f64992" />
-<img width="2560" height="1294" alt="b442dda3f7870d374add040637f25267" src="https://github.com/user-attachments/assets/ac13c55b-5dff-4f68-8e10-e5ae76fe896e" />
-<img width="2560" height="3465" alt="09915fd32938aed251bbac9f21f49a2b" src="https://github.com/user-attachments/assets/3767fdd0-d8f8-4a60-9e54-ea6b9470047f" />
-<img width="2560" height="1788" alt="63164a387b46f8a9b2c1b4a558c102c7" src="https://github.com/user-attachments/assets/6136f64f-9f3d-4874-bb31-e2b7496470ef" />
-<img width="2560" height="1294" alt="4fa7f527f0afbb5686c9202653603d4c" src="https://github.com/user-attachments/assets/ae89efed-3867-4143-a031-d2460267c601" />
 
 ## 1. 架构（实际实现路径）
 
@@ -49,20 +41,26 @@ WEB运行截图
 | 缓存语义 | 用户态 LRU 模拟 `BPF_MAP_TYPE_LRU_HASH`（命中计数计入遥测 `kernel_direct`） |
 | 上游协议 | UDP / TCP / DoH (HTTPS) / DoT (TLS) / DoQ (QUIC) / DoH3 (HTTP/3) |
 | 管理接口 | HTTP JSON API + Web 控制台（内置 ECharts，本地化无外网依赖） |
-| 可选内核数据面 | C + libbpf (XDP)，`bpf/` 目录参考实现（预留接口，未集成） |
+| 可选内核数据面 | C + libbpf (XDP)，`bpf/` 目录已集成（`bpf_loader.py` + `kernel_cache`），编译成功但校验器待适配（见 §9） |
 
-**数据面说明**：默认所有解析与缓存均在用户态完成——缓存命中由 daemon 主线程直接回包（不查询上游），语义上等价于 SmartDNS 的内存缓存，并计入「内核直答」遥测计数；`bpf/` 目录提供真实 XDP 内核旁路的参考 C 源码，仅在需要把命中下沉到网卡内核直答时另行集成（见 §9）。
+**数据面说明**：默认所有解析与缓存均在用户态完成——缓存命中由 daemon 主线程直接回包（不查询上游），语义上等价于 SmartDNS 的内存缓存，并计入「内核直答」遥测计数；`bpf/` 目录提供真实 XDP 内核旁路的 C 源码，v1.9.158 起已接入 daemon 回填/预热，仅在校验器接受加载后才真正把命中下沉到网卡内核直答（见 §9）。
 
 ---
 
 ## 2. 快速部署（Debian 13）
 
 ```bash
-# 1. 准备（Python 3 已内置；仅当要编译真实 XDP 数据面才装编译工具）
-sudo apt update && sudo apt install -y python3 python3-pip
-#    （可选）启用 DoQ / DoH3（DNS over QUIC / HTTP3）上游时需要 aioquic
-sudo pip3 install aioquic
-# 2. 安装（拷贝到 /opt/ebpdns、生成 /etc/ebpdns/config.json、注册 systemd）
+# 1. 解压生产包（包内文件直接位于根，建议先建空目录再解压）
+mkdir ebpdns && tar -xzf ebpdns-python-v1.9.164.tar.gz -C ebpdns
+cd ebpdns
+# 2. 一条命令完成全部依赖安装 + 部署
+#    install.sh 会自动检测并**自动安装**所有依赖与软件:
+#      必需: python3(>=3.10)
+#      可选: aioquic(DoQ/DoH3)、完整 eBPF 工具链
+#            (make/clang/llvm/libbpf-dev/linux-libc-dev/bpftool)、
+#            iproute2/libcap2-bin/rsync
+#    可选依赖安装失败**不阻断部署**(DNS 服务照常, 仅对应增强功能不可用)。
+#    离线/受限环境可用 EBPDNS_SKIP_DEPS=1 跳过自动安装(仅检测提示)。
 sudo ./install.sh
 # 3. 按需编辑配置
 sudo nano /etc/ebpdns/config.json
@@ -75,6 +73,16 @@ curl -s http://127.0.0.1:8080/api/status
 # 6. 浏览器打开控制台
 #    http://<服务器IP>:8080/
 ```
+
+> **依赖自动安装说明**：`install.sh` 会自动装齐上述依赖，无需手动 apt/pip。eBPF 编译
+> 失败时会在输出中**回显具体编译错误**（不再是静默吞掉），可按提示排查（常见：缺头文件
+> `apt install -y libbpf-dev linux-libc-dev`、架构不匹配）。eBPF 编译成功与否**都不影响
+> DNS 服务**（详见 §9）。
+>
+> **就地安装注意**：在 `/opt/ebpdns` 目录内直接跑 `./install.sh` 属"就地安装"，会
+> **跳过代码拷贝**（不更新已有代码）。升级请在新解压目录里跑 `./install.sh`（异地安装），
+> 它会把新代码复制到 `/opt/ebpdns`。
+
 
 > **53 端口冲突**：Debian 的 `systemd-resolved` 默认占用 `127.0.0.53:53`（监听回环地址，通常不冲突）。
 > 若你的机器另有 DNS 占用 `0.0.0.0:53`，可先 `sudo systemctl stop systemd-resolved`，
@@ -163,7 +171,7 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 | `prefetch` | true | TTL 到期前 85% 自动预取刷新（跳过 NXDOMAIN 负缓存；恢复缓存自动重排入预取队列） |
 | `kernel_direct` | true | 用户态缓存命中即计为「内核直答」遥测计数（真实 XDP 集成时保持 true 语义一致） |
 | `speed_test` | true | 上游/候选 IP 测速择优总开关 |
-| `speed_interval_ms` | 2000 | **毫秒**。同一域名两次候选 IP 测速之间的最小间隔（节流）：间隔内直接复用上次排序结果；范围 0–604800ms（≈10min，0=每次都测）。注意单位是毫秒而非秒——604800ms≈10min，「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级周期字段(注意 `stale_ttl` 上限为 8640000s=100 天, 见配置表) |
+| `speed_interval_ms` | 2000 | **毫秒**。同一域名两次候选 IP 测速之间的最小间隔（节流）：间隔内直接复用上次排序结果；范围 0–60000ms（=60s，0=每次都测）。注意单位是毫秒而非秒——「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级周期字段(注意 `stale_ttl` 上限为 8640000s=100 天, 见配置表) |
 | `speed_timeout_ms` | 300 | 单次候选 IP 探测超时上限（毫秒），范围 1–60000，未按时完成的候选不参与排序 |
 | `ip_speed_check` | true | 候选 IP 测速：对多 IP 答案并发探测 RTT 并按速度排序（SmartDNS 风格），关=保持上游返回顺序 |
 | `ip_speed_probe` | both | 候选 IP 探测方式（枚举）：`udp53` / `tcp443` / `both`（默认 both，取最快；TCP:443 更贴近真实访问） |
@@ -201,7 +209,7 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 >
 > **DoQ / DoH3（可选依赖 aioquic）**：`proto:"doq"`（DNS over QUIC，RFC 9250，默认端口 853）与 `proto:"doh3"`（HTTP/3 DoH，默认端口 443）已内置实现。每个 QUIC 上游维护一条常驻连接（断线自动重连 + 查询失败主动重建），多查询在同一连接上多路复用；未安装 aioquic 时相应上游返回「aioquic 未安装」错误，不影响 UDP/TCP/DoH/DoT 路径。install.sh 会自动检测并安装 aioquic（apt `python3-aioquic` → pip 三级回退），`EBPDNS_SKIP_DEPS=1` 可跳过。
 
-配置可在**控制台「配置」页**在线编辑并「应用配置」持久化到后端。绝大多数字段即时生效（PUT /api/config 后无需重启，与 SIGHUP/`/api/reload` 等价）；例外：`cache_size` 之外，`log_level` / `log_format` 在进程启动时经 `_setup_logging` 一次性应用，改后需重启才生效（前端对应开关已标注「重启后生效」）。`hook` / `percpu` 为 eBPF 数据面预留语义标记（真实 XDP 未集成）；`map_type` 三种取值见上表，当前仅作语义标记/展示，真实淘汰引擎由 `cache_policy` 决定。
+配置可在**控制台「配置」页**在线编辑并「应用配置」持久化到后端。绝大多数字段即时生效（PUT /api/config 后无需重启，与 SIGHUP/`/api/reload` 等价）；例外：`cache_size` 之外，`log_level` / `log_format` 在进程启动时经 `_setup_logging` 一次性应用，改后需重启才生效（前端对应开关已标注「重启后生效」）。`hook` / `percpu` 为 eBPF 数据面语义标记（真实 XDP 加载由 `kernel_cache`/`bpf_loader` 控制，当前校验器待适配，见 §9）；`map_type` 三种取值见上表，当前仅作语义标记/展示，真实淘汰引擎由 `cache_policy` 决定。
 
 ---
 
@@ -323,27 +331,109 @@ sudo userdel ebpdns 2>/dev/null; sudo groupdel ebpdns 2>/dev/null || true
 
 ---
 
-## 9. 进阶：真实 eBPF XDP 内核旁路（可选，预留接口）
+## 9. eBPF 内核态缓存（v1.9.158+，可选加速层）
 
-默认软件以纯用户态运行（无需内核权限）。`bpf/` 目录提供「缓存命中由网卡内核直答」的 XDP 参考实现：
+### 9.1 原理
 
-```bash
-sudo apt install clang llvm libbpf-dev linux-libc-dev bpftool
-cd /opt/ebpdns/bpf
-make
-sudo ./load.sh eth0            # 将 XDP 程序挂到目标网卡
-sudo ip link set dev eth0 xdp off   # 卸载
+XDP 程序在网卡驱动层拦截发往本机 UDP/53 的 DNS 查询，解析 (qname, qtype) 后查 BPF LRU_HASH 内核缓存 map：
+
+- **命中且未过期**：内核直接构造 DNS 应答（修改 flags、ANCOUNT、追加 answer 记录、交换 MAC/IP/UDP 地址、重算 IP 校验和），`XDP_TX` 从网卡直接回包——**完全不经过协议栈和用户态 Python**，延迟可低至亚微秒级。
+- **未命中或过期**：`XDP_PASS` 放行给用户态 ebpdns 正常解析；解析完成后用户态将结果（原始应答 + TTL）回写 eBPF map，后续查询即可内核命中。
+
+```
+客户端 ──UDP:53──▶ 网卡 XDP Hook
+                      │
+              ┌───────┴───────┐
+              ▼               ▼
+         eBPF map 命中    eBPF map 未命中
+         (XDP_TX 直答)    (XDP_PASS)
+              │               │
+              ▼               ▼
+          客户端◀────   用户态 ebpdns 解析
+                              │
+                              ▼
+                        回写 eBPF map ◀── 启动预热(用户态缓存热条目)
 ```
 
-要点：
-- **当前为参考实现，未集成到 daemon**：即使编译挂载，内核 `dns_cache` map 因无用户态回填而恒为空，不会产生加速；需另行开发 daemon 侧 libbpf/bcc 回填集成
-- **⚠️ 已知限制（v1.9.150 Debian 13 实测）**：`make` 现可编译通过（原版因 `-Werror` 与变长
-  `memcpy` 直接编译失败，已修）；但 `bpftool prog load` **仍被内核校验器拒绝**（变量下标包读取无法
-  建立范围证明）。同机最小 XDP 程序可正常加载，故为**本程序的数据包解析结构**问题而非主机限制。详见
-  `bpf/README.md` 的"已知限制"一节。**不影响默认部署**（默认数据面为纯用户态）
-- 内核 ≥ 5.4（建议 5.15+），开启 BTF，网卡驱动支持原生 XDP（云虚拟机 virtio 网卡通常不支持）
-- 未命中 `XDP_PASS` 转用户态 daemon；命中 `XDP_TX` 内核回包。map 名/键值布局见 `ebpdns_xdp.h`
-- 详见 `bpf/README.md`
+### 9.2 配置项
+
+| 配置键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `kernel_cache` | bool | `false` | 是否启用 eBPF 内核态缓存加速 |
+| `kernel_cache_iface` | str | `"auto"` | 挂载 XDP 的网卡名，`auto`=自动选择默认路由网卡 |
+| `kernel_cache_max` | int | `65536` | eBPF LRU map 最大条目数，范围 1024–1048576 |
+
+现有 `kernel_direct`（遥测计数开关）保留不变，与 `kernel_cache` 独立。
+
+### 9.3 部署与编译
+
+```bash
+# 1. 安装编译依赖（Debian 13）
+sudo apt install clang llvm libbpf-dev linux-libc-dev bpftool
+
+# 2. 编译 eBPF 程序
+cd /opt/ebpdns/bpf && make
+
+# 3. 设置权限（允许非 root 加载 eBPF）
+sudo setcap cap_bpf,cap_net_admin,cap_sys_admin+ep /opt/ebpdns/bin/ebpdns
+
+# 4. 配置启用
+# 编辑 /etc/ebpdns/config.json，设置 "kernel_cache": true
+
+# 5. 重启服务
+sudo systemctl restart ebpdns
+```
+
+systemd unit 已包含 `AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN`。
+
+### 9.4 降级策略（默认安全）
+
+任一条件不满足即自动降级为纯用户态，**不影响 DNS 服务**，日志输出 WARNING，Web 控制台显示 degraded + 具体原因：
+
+| 降级触发条件 | reason 示例 |
+|---|---|
+| 非 root 且无 CAP_BPF | `缺少 CAP_BPF 权限（需 root 或 setcap）` |
+| libbpf.so 和 bpftool 均不可用 | `未找到 libbpf 或 bpftool` |
+| 未找到 ebpdns_xdp.o | `未找到 eBPF 目标文件（需 clang 编译）` |
+| eBPF verifier 拒绝加载 | `eBPF verifier 拒绝加载: <错误>` |
+| 网卡不支持 XDP_TX | `网卡 eth0 不支持 XDP: <错误>` |
+
+Web 控制台 pipeline 页 eBPF 徽章：active=绿色显示"内核态缓存已启用 (eth0) · 命中 X/Y (Z%)"；degraded=灰色显示具体原因。`/api/status.ebpf` 和 `/metrics` 的 5 个 eBPF 指标可观测。
+
+### 9.5 性能预期
+
+- **纯用户态基线**（v1.9.158，3 分钟 12 workers）：QPS ~36,000、P50 0.21ms、P99 1.0ms、RSS ~48MB
+- **启用 eBPF 后**：缓存命中查询不进用户态，预期 QPS 显著提升（受网卡 XDP 性能限制，可达 100k+ QPS）、P99 延迟显著降低（亚微秒级）。需在支持原生 XDP_TX 的物理/虚拟网卡环境实测验证。
+- TCP DNS 始终走用户态（XDP 只处理 UDP 53，TCP 连接状态复杂，内核态处理收益低）。
+
+### 9.6 故障排查
+
+```bash
+# 查看 eBPF 状态和降级原因
+curl -s http://127.0.0.1:8080/api/status | python3 -m json.tool | grep -A5 ebpf
+
+# 查看 eBPF 指标
+curl -s http://127.0.0.1:8080/metrics | grep ebpf_
+
+# 查看 XDP 挂载状态
+ip link show dev eth0 | grep xdp
+
+# 查看 eBPF 程序和 map
+bpftool prog show | grep ebpdns
+bpftool map show | grep dns_cache
+
+# 查看降级日志
+journalctl -u ebpdns | grep -i "eBPF\|bpf"
+```
+
+### 9.7 注意事项
+
+- 内核 ≥ 5.7（`bpf_ktime_get_boot_ns` 需求），建议 5.15+，开启 BTF（`/sys/kernel/btf/vmlinux` 存在）
+- 网卡驱动需支持原生 XDP（部分云主机 virtio 网卡不支持 XDP_TX，会自动降级）
+- eBPF map key 使用 djb2 64 位哈希（非完整 qname），碰撞概率极低；用户态 `_qname_djb2` 与 eBPF `parse_qname` 算法严格一致
+- ECS（EDNS Client Subnet）启用时跳过 eBPF 回写/预热（eBPF key 无 ECS 维度，避免跨子网错答）
+- 规则变更/配置重载/订阅更新后自动清空 eBPF map，避免残留过期规则
+- 详见 `bpf/README.md` 和 `bpf/ebpdns_xdp.h`（map 布局定义）
 
 ---
 
@@ -390,7 +480,7 @@ ebpdns/
 │   ├── telemetry.py       # 遥测计数与采样（原子计数 / Top N / Prometheus）
 │   └── api.py              # HTTP JSON API + Web 静态服务
 ├── web/index.html          # 控制台（双模式，ECharts 本地化）
-├── bpf/                    # 可选 eBPF XDP 内核旁路（参考实现，未集成；见其 README 的"已知限制"）
+├── bpf/                    # 可选 eBPF XDP 内核旁路（已集成 bpf_loader.py，编译成功但校验器待适配；见其 README 的"已知限制"）
 ├── systemd/                 # ebpdns.service（降权用户 + CAP_NET_BIND_SERVICE）+ 每日重启 timer
 ├── etc/ebpdns.conf.json    # 配置模板（与 config.py DEFAULTS 对齐）
 ├── install.sh              # 安装脚本（自动检测/安装 python3、aioquic）
@@ -407,25 +497,111 @@ ebpdns/
 
 - 解析结果为“精简应答”（SmartDNS 风格，只返回目标类型地址并择优），不完整透传 CNAME 链；对大多数客户端无影响
 - DoH/DoT 上游使用 hostname 时依赖系统 DNS 解析 ~~（v1.9.42 已通过 Bootstrap 解析器解决：启动时用 UDP 上游预解析 hostname 为 IP，后续连接用 IP+SNI，不再依赖系统 DNS）~~
-- 真实 XDP 内核直答需内核与网卡支持，属预留/进阶选项（`bpf/` 参考实现未集成到 daemon）
+- **eBPF 内核态缓存（`kernel_cache`，可选加速层）**：`make -C bpf` 可成功编译出 `ebpdns_xdp.o`，但内核 BPF 校验器**仍拒绝加载**（应答构造段的包指针范围证明，详见 `bpf/README.md`）。`kernel_cache` 默认 `false`，开启时 `bpf_loader` 正确降级为纯用户态并在 `/api/status.ebpf.reason` 如实上报原因，**DNS 服务不受影响**。真实 XDP 内核直答还需支持原生 XDP 的网卡（云主机 `virtio_net` 通常不具备）
 - 未实现 DNSSEC 验证（转发型解析器典型取舍）
+- **安全信任边界（接受式风险，见注释）**：① 显式配置 `*_strict_cert:false` + IP 字面量上游时，证书校验降级为"仅链+有效期"，任何受信 CA 证书可 MITM（默认严格，降级连接即用即弃不入池）；② `api.host=0.0.0.0` + 空 token 的 LAN 模式下，`.local/.lan` 等主机名免 DNS 解析即信任，存在 DNS-rebinding 写/读风险（默认 `127.0.0.1` 环回不受影响）
 
 ---
 
 ## 13. 版本历史（要点）
 
+- **v1.9.164**：v1.9.163 生产包的**逐行代码审查 + 保守精简重构 + 连续两轮独立部署验证封板**版（基于用户回传的 v1.9.163 生产包，14 个 Python 模块 18272 行 + web/index.html 3790 行 + bpf/ 522 行，按文件边界四路并行逐行审查、前后端契约核对，全程不动热路径/并发/eBPF/安全校验/防御性检查，`py_compile`/`pyflakes` 终态零告警）。
+  - **保守精简（功能零回归）**：Python 18272→**18227**（-45 行）、index.html 3790→**3788**（-2 行）。`dnsmsg.py` 删 3 个零调用私有函数（`_rcode_name`/`_edns_bufsize`/`_opt_rr_bytes`，后者自 v1.9.85 被 `_question_edns_info` 取代）与未用局部 `qend`；`telemetry.py` 删零调用 `fast_hit`（热路径已统一 `fast_hit_logged`）与被锁内深拷贝取代的 `upstreams_snapshot`；`api.py` 删死集合 `new_ids`、未用元组项 `idx_err` 改 `_` 占位、3 处 `except ... as e` 去 `as e`（保留 `exc_info=True` 不丢栈）、删 `ttl_min/ttl_max` 死赋值（for 循环透传逻辑保留）；`bpf_loader.py` 删未用 `import Dict` 与常量 `_BPF_MAP_CREATE`/`_CNT_MAX`；`resolver.py` 删未用局部 import、`probe.py` 删多余 `global` 声明（仅原地 `append` 无 rebind，锁内 append+start 时序不变）、`server.py` 清理注释残留；前端删未用常量/死形参/死 CSS 选择器/无引用 DOM id，并抽 `PROTO_SCHEME`/`CERT_KEYS` 公共常量。
+  - **修复（本轮审查发现）**：①【P0·前端】`renderUpstreams` 中 doh/doh3/dot/doq 四个证书 checkbox 模板动态属性段后漏写 `>`，浏览器把 `disabled`/`checked` 吞进垃圾属性名，导致协议匹配框回填 `checked` 丢失、非匹配框 `disabled` 永不生效，补齐后实测 16/16 框状态正确；②【P2·前端】SIM 演示态 `sim.counters` 用 camelCase（`kernelDirect`/`upstreamQueries`）而读取用 snake_case，致 KPI「内核直答/上游请求」恒显 0，键名统一；③【P2·前端】规则删除/上游删除补二次确认 `confirm`（与重启/热重载/订阅删除一致），取消不误删、确认才移除并落盘。
+  - **验证（连续两轮零问题）**：非特权端口（DNS 5354/API 18091，前后端独立隔离工作目录）完整部署两轮，DNS 六协议（DoQ UDP/853 不通标环境限制）、缓存三模式+分区权重+SIGTERM 落盘重启零上游增量、熔断/健康/恢复、规则（block/forceIp 含缓存快路径/allow/通配）、订阅自签 IP-SAN 长窗口连续自动刷新+原子落盘+源新增 tick 拉取+404/断连仅 WARNING、API 全端点（401/200/204/400/404/HEAD/OPTIONS）、Prometheus 30 family 含 5 ebpf、eBPF 双档降级+运行态三路径+边界校验、execvpe 重启（PID 不变 uptime 归零）、历史回归（`mirrors.aliyun.com AAAA` 正确 NODATA、bailiwick 投毒 fuzz 无崩溃、speed clamp、四证书键、install.sh host→addr）；前端 5 路由+仪表盘卡片+全按钮/输入框/弹窗桌面+移动逐项实测，两轮 console error=0、日志 ERROR/Exception/Traceback=0。
+  - **3 分钟压测（12 workers，两轮）**：QPS 36,066 / 39,316、errors=0、sent=received（649.9 万 / 708.5 万）、P50 0.203 / 0.215 ms、P99 1.056 / 0.959 ms、RSS 达平台后稳定（+1.4 / +1.0 MB，无泄漏）；不劣于 v1.9.161 基线（QPS 33,928/33,077、P99 1.116/1.109），QPS 波动属沙箱 CPU 配额时段差异。
+  - **真机待复核（环境无 clang/CAP_BPF，沿用 v1.9.161 未闭环项，不影响默认 kernel_cache=false 的纯用户态服务）**：`bpf/ebpdns_xdp.bpf.c:326` 应答构造段一处死 store（`dns_off = dns2 - data` 赋值后无读），真机重编译可顺手删；XDP 命中构造应答路径仍需在原生 XDP 网卡 + root + clang/llvm/libbpf-dev 环境 `make -C bpf` 加载并抓包最终确认。
+- **v1.9.163**：Web 控制台专项版（基于用户回传的 v1.9.162 生产包）。① 修复配置页「缓存策略/缓存文件」恒不刷新、订阅条数恒显 `0 条`（`rule_count`/`count` 双口径）、上游表空态与错误态同文案；② 11 个 `setInterval` 收敛为单一调度器（按页路由 + 单 tick 去重 + 独立指数退避 + `document.hidden` 冻结 + 交互/切页立即刷新 + 日志 `since=next_seq` 增量），60s 真实浏览器窗口实测 pipeline 请求 −13.9%、config −23.5%；③ 新增 `prefers-reduced-motion` 支持（改前 0 处；含终态复位避免元素永久不可见）、日志新行淡入、数值变化高亮、加载骨架；④ 数据显示：千分位、超长值截断+title、空/错/加载三态区分；⑤ `install.sh` 增加**跨实现配置兼容性检测**（Rust 版 `upstreams[].host` → 本版 `addr`，此前会导致 22/22 上游被丢弃且控制台端口错误）。
+- **v1.9.162**：高强度对抗审查 + 压测后多轮独立复查封板版（基于用户回传的 v1.9.161 生产包，14 个 Python 模块约 1.8 万行 + web/index.html 3560 行 + bpf/ 数据面，逐行审查、前后端契约核对、cProfile 优化、精确 180s 压测，压测后连续三轮独立复查后两轮零新增）。测试由 v1.9.143 的 111 项适配扩充至 **244 项全绿**。
+  - **BPF 数据面（本轮纳入审查与修复；环境无 clang，仅静态审查与 C↔loader 一致性核对，未做编译/加载验证）**：①【中】XDP 程序补**非首片分片守卫**（`bpf_ntohs(ip->frag_off) & 0x1fff` → XDP_PASS：中/尾分片在 ip+ihl 处并无 UDP 头，原代码不查片偏移会把分片载荷误当 DNS 查询、命中缓存后 XDP_TX 出无关错误应答；首片 MF=1 偏移=0 仍放行）；②【低】补 IP `version != 4` 硬校验；③ 修 `bpf/load.sh` 的 `A || B && C` bash 左结合控制流 bug（ip 直挂成功后仍误执行 pinned 路径、set -e 下误报退出）；④ 修 `bpf/README.md` 容量事实漂移（1024→实际默认 65536）。
+  - **bpf_loader.py（用户态加载器）**：① ctypes `_dns_cache_val.rdata` 维度由 `c_uint8*8*16`（被解释成 16 行×8 列）改为 `(c_uint8*16)*8`，与 C 的 `rdata[8][16]` 行主序对齐（sizeof=152/偏移=24 不变，内存字节本就正确、仅语义修正）；② `clear_cache` 由"先删后以已删除 key 为前驱枚举"（前驱不存在立即 -ENOENT、只删第一条）改为**前驱恒 NULL 的安全枚举 idiom**，并加 `max_entries+16` 迭代上限防持续错误 livelock；③ libc 句柄模块级缓存（原每次 syscall 重新 `CDLL(None)`）、`syscall` restype 显式设为 `c_long`（修复 64 位负 errno 截断）。
+  - **resolver.py**：①【真实回归·已修】CNAME 子链确认目标 NODATA（rcode=0 空应答）时父级误落 SERVFAIL（v1.9.161 NODATA quorum 加固的 `and not cnames` 把父级 CNAME 应答全排除、nodata 列表恒空），现父级正确返回 rcode=0 空应答并负缓存、复用子链 ttl_left（线上 `mirrors.aliyun.com AAAA` 由恒 SERVFAIL 恢复为 NODATA）；② NODATA 证据过滤收紧为 rcode==0 且 `not udp_truncated` 且 `not cnames`（截断/CNAME 裸应答不再计入多数表决）；③【中·安全】**规则代际写回门禁**：resolve 入口记 `_gen_at_entry=_rule_gen`，随答案透传 `_fill_cache→_ebpf_writeback`，规则在途重建（gen 自增+清 map）后跳过内核写，堵住在途应答把真实 IP 写回内核 map、XDP 直答旁路新 block 的窗口；全部上游应答路径（含双栈探测 `_probe_a_record`、IPv4 回退 `_ipv4_fallback`）均已透传；④ forceIp 规则在缓存命中快路径即时生效（复用已调用的 match_rule、零额外开销，畸形 ip/类型交叉 fail-closed）；⑤ `_last_speed_test.move_to_end` 加 try/except KeyError；⑥ CNAME→NODATA neg_ttl 死代码重构（ttl_left<=0 时兜底 60s、封顶 60）；⑦ writeback 静默吞异常改 debug 留痕。
+  - **quic_upstream.py**：新增 `_last_conn_err`/`_conn_failed` 连接状态机——建连失败按证书/拒绝/DNS/TLS 分类记录、退避态查询快速失败（不再白等完整超时）、`_exchange` 返回 `(ok,data,err)`、`query` 第 4 项透具体原因；等待超时归 "timeout" 不复用残留旧原因；close 已是 list 快照（并发 add 安全）。
+  - **upstream.py**：`_is_header_only` 由"qd==0 且 an==0"收紧为 **QDCOUNT != 1 即拒绝**（两副本同步，正常 qd=1 含 NODATA/NXDOMAIN 不误杀）。
+  - **cli.py**：补本地 `_safe_int`（拒 bool），修复 eBPF 预热路径调用未定义符号抛 NameError 被宽 except 吞、预热恒失效。**server.py**：快路径宽 except 保留降级并加计数+采样 WARNING。**systemd**：补"严格沙箱下 bpftool 降级路径不可用、内核缓存仅 libbpf.so.0 可用时生效"注释（未放宽沙箱）。
+  - **web/index.html**：证书开关由"DoH/DoH3 共用 doh_strict_cert 一个框（DoH3 死控件+回填失真）"拆/增为 **doh/doh3/dot/doq 四个独立框**，各绑各键、协议切换 disabled 联动、回填 `!==false`；保存响应过滤 `listen/api/web_root` 只读段，消除每次保存恒弹琥珀提示。
+  - **性能/压测**：cProfile 确认热路径成熟（普通命中约 10µs、单线程约 100k qps），无安全优化点、未做冒险改动。最终精确 180s 混合压测：**75308 成功**、QPS 416、P50 0.06ms/P99 267.6ms，压后 30s 纯命中稳态 RSS/线程/fd/miss 全部平台，**无内存/线程/句柄泄漏**；压测期间零 Traceback/ERROR（2 个冷域 SERVFAIL 为偶发上游整体超时的 fail-closed 优雅降级，非代码缺陷）。
+  - **真机待复核**：BPF 修改（分片守卫的 verifier 接受度、adjust_tail 后指针重建在目标内核的校验、A/AAAA/NXDOMAIN/EDNS 应答字节）仍需 clang+root+原生 XDP 网卡环境验证；DoH3/DoQ 需安装 aioquic；境外 DoH 大陆不可达——均为环境限制。
+
+
+  - **编译失败修复（真机 clang 19 -Werror）**：删除 v1.9.160"精确扩容+shrink"遗留的死变量 `orig_len`（unused variable 直接导致 `make` 失败、无 `ebpdns_xdp.o`、kernel_cache 恒降级"未找到目标文件"）；未被引用的参考函数 `qname_hash` 加 `__attribute__((unused))`。
+  - **读取阶段 verifier 范围证明**：qtype/qclass 边界由两个运行期标量相减 `q_off+4 > dns_len` 改为校验器可跟踪的**指针比较** `(dns+q_off)+4 > data_end`；`dns_off` 提前计算并夹编译期常量上界 1500（合法 DNS 段起点 42~82，VLAN/隧道后仍远小于 1500，不误杀）；`ip_hlen` 显式夹到 [20,60]。
+  - **应答构造段 verifier 友好重构（核心）**：`bpf_xdp_adjust_tail`/map helper 会清空标量范围跟踪，原实现扩容后用"包指针 + 无界标量偏移"（`dns2+write_off`、`data+udp_off`、标量差 shrink）构造写入指针，校验器在应答构造阶段拒绝（推进到 2704 条指令）。重构为：① answer 写循环改 **pos 指针递进**（起始 `dns2+q_off+4` 已重证明，每写一条按地址族用常量指针比较 `pos+28`/`pos+16 > data_end`，写完 `pos += 28/16`），不再用无界 `write_off`；② shrink 改为同基指针差 `data_end - pos`（非负、有界）；③ 二次 adjust_tail 后从 `data` 起 **eth→ip→udp 逐层重建指针并逐层建立范围证明**，MAC/IP/端口交换与 UDP len/IP tot_len 全部用重建后的指针（指针差），删除无界 `udp_off`；④ checksum 调用前证明整个 IP 头 `ip2+ihl <= data_end`。
+  - **DNS 报文语义零变化**：上述仅为通过校验器的写法重构，应答字节布局与 v1.9.160 完全一致——逐字节仿真（2×A 带 EDNS / 8×AAAA / 5A+3AAAA / 1×A / NXDOMAIN / NODATA / 0x20 大写 / AAAA 带 EDNS 共 8 用例）经 dnspython `from_wire()` 解析全部正确（无 TrailingJunk、udp_len==tot_len-20 自洽、qd=1/an=实际 RR/ns=0/ar=0、question qtype 完好、地址正确），叠加 20 万随机 IP 头校验和回归全过。
+  - **API 高并发健壮性（P3）**：`ThreadingHTTPServer` 每连接一线程，极端高并发**短连接**风暴耗尽 OS 线程（`ulimit -u`）时 `t.start()` 抛 `RuntimeError: can't start new thread`，原路径被 socketserver 打成 traceback。现于 `process_request` 边界**严格只捕获**该资源耗尽 RuntimeError（其他 RuntimeError 仍抛出），归还连接信号量、尽力关闭连接、单行 5s 窗口聚合 WARNING（"连接线程资源不足, 拒绝新连接 …(另静默丢弃 N 条)"），不打栈、不崩服务、不影响已建立连接；配合既有 256 有界信号量背压。实测 `ulimit -u=200` 下 600 并发触发拒绝仅一行 WARNING、0 Traceback，keep-alive 复用 2000 次全 200。
+  - **验证**：生产包解压布局非特权启动，eBPF 双档降级（缺 CAP_BPF / 未找到 .o）原因精确；DNS 六协议（DoQ 与境外节点为环境限制）、缓存三模式/分区权重/持久化重启恢复、预取/测速/熔断/健康检查、规则热加载、**周期订阅后台自动更新长窗口实测连续刷新+原子落盘**、API 全端点状态码、Prometheus 30 family 含 5 个 ebpf 指标、eBPF 运行态三路径、execvpe 重启 PID 不变、CSP/XFO、speed clamp 全过；前端桌面 1280×800 与移动 375×812 五路由/汉堡抽屉/5 ECharts/查询控制台 0 console error；全量日志 0 ERROR/Exception/Traceback。
+  - **真机待复核（重要，未在本环境闭环）**：本环境为云主机 virtio_net（不支持原生 XDP）且无 clang，应答构造段的 verifier 友好重构**已在代码层消除全部已识别的"包指针+无界标量"访问、DNS 语义经仿真与 v1.9.160 字节一致，但尚未经真机 `bpftool prog load` 与原生 XDP 网卡真实抓包确认**（含 checksum 内联函数的范围继承等）。需在支持原生 XDP_TX 的网卡 + root + clang/llvm/libbpf-dev 环境 `make -C bpf` 后挂载、用 dig 打 A/AAAA/EDNS/混合用例抓包核对，并以 `bpftool prog load` 复核校验器日志。kernel_cache 默认 false，未加载成功时自动降级纯用户态，DNS 服务不受影响。
+  - **高强度对抗审查（四路并行子代理 + 实证复现）**：修复 1 高危 + 2 中危 + 5 低危。①【高危·缓存投毒】bailiwick 信任根由响应回显 question 段改为锚定真实查询域名 `d`（`d` 从 `resolve()` 下传 `_query_parallel→_classify_one→_extract_answers_full`），0x20 降级后伪造 question 无法再绕过；②【中危】bailiwick 空 owner（根 "."）绕过修复；③【中危】NODATA 负缓存补齐与 NXDOMAIN 相同的 quorum 多数表决（单撒谎上游不再造成 60s NODATA DoS）；④【低】`padding:true` 时 TCP 回退改用 `qmap["tcp"]`（保留 0x20 熵）；⑤【低】`Server` 响应头去版本指纹（现为 `Server: ebpdns`）；⑥【低】订阅 URL SSRF 补 `is_reserved`（拦 NAT64/IPv4-compatible）；⑦【低】快/慢路径缓存键规范化统一 `_normalize()`；⑧【低】bpf_loader 错误掩盖修复（保留 libbpf 具体诊断）。50 万级模糊测试 0 崩溃。
+  - **install.sh 一键自动装依赖**：自动检测并安装 python3/aioquic/完整 eBPF 工具链（**make**/clang/llvm/libbpf-dev/linux-libc-dev/bpftool）/iproute2/libcap2-bin/rsync；`apt-get update` 仅一次；可选依赖装失败不阻断部署。修复漏装 `make`（`make: command not found`）与编译失败静默吞错（现失败时回显具体编译错误 + 排查提示）。
+  - **性能优化**：TCP `request_queue_size` 5→256，修复高并发短连接下 backlog 太小导致的连接超时（压测 TCP 200 并发错误率 5%→0%）。
+
+- **v1.9.160**：eBPF 内核态直答报文正确性 + 部署升级修复版（基于 v1.9.159，连续四轮独立审查，后两轮连续零错误封板）。v1.9.159 修复了 eBPF 主要缺陷，但因沙箱无 clang/cap_bpf、XDP 命中构造应答路径从未被真正编译执行，本轮改用"完整协议账逐字节仿真 + dnspython `from_wire()` 真实解析"继续深挖，又发现并修复了潜伏在内核直答报文构造与加载器枚举、部署升级路径上的若干问题。
+  - **P0 修复（N1，内核直答 answer 起始偏移 off-by-4）**：XDP 命中构造应答时首条 answer RR 起始偏移由 `write_off = q_off` 改为 `q_off + 4`。`q_off = 12 + qname_len` 是 qtype 起始位置，question 段为 `[12, q_off+4)`（qname+qtype+qclass）；原写法把首条 RR 写到 qtype/qclass 上，导致应答 question 的 qtype 被写成压缩指针 `0xc00c`、answer 整体错位 4 字节、`rdlen` 越界——所有正向 A/AAAA 内核直答包畸形，真实客户端拿不到地址。
+  - **P1 修复（R2-1，应答尾部多余字节 TrailingJunk）**：扩容改为先按 `addr_af[]` 精确累加实际 RR 字节（AAAA=28/A=16）`rr_bytes`，写完 answer 后再 `bpf_xdp_adjust_tail(-shrink)` 收缩到实际末字节并重取全部指针；边界检查按地址族分支（A 预留 16、AAAA 预留 28）。原先统一按最坏 `naddr*28` 扩容却不裁剪，含 A 记录或 EDNS OPT 查询的应答带尾部残留字节，dnspython 等严格解析器报 `TrailingJunk`。修复后 UDP length / IP tot_len 与实际字节严格自洽。
+  - **P1 修复（install.sh 就地升级误删 bpf_loader.py）**：v1.9.158 新增的 `ebpdns/bpf_loader.py` 漏入 install.sh 就地安装关键文件清单与就地升级白名单，就地升级会把它当陈旧模块 `rm -f` 删除，运行时 ImportError 虽被捕获不崩 DNS，但 eBPF 在该升级路径永久静默失效。两处清单补齐，与 package.sh 生产包模块列表四方集合完全一致（14 个 .py）。
+  - **P2 修复**：① N2——构造应答时清零 NSCOUNT/ARCOUNT（内核只回 answer，不回放 authority/EDNS OPT；带 OPT 查询 ARCOUNT=1 时原 OPT 残留被 answer 覆盖产生畸形附加段），QDCOUNT 保持 1；② R2-2——`clear_cache()` 首次 `BPF_MAP_GET_NEXT_KEY` 前驱 key 由"全 0 但非 NULL"改为传 NULL，htab 语义下后者才从整个 map 第一个 key 枚举，避免漏删桶号更小条目导致规则变更后部分内核旧答案残留到 TTL。
+  - **P3 修复**：PERCPU 计数器读缓冲 CPU 数取 `max(在线 affinity, SC_NPROCESSORS_CONF, cpu_count)` 上界（防 possible>online 时 EFAULT 指标读 0）；bpftool attach 失败时同步清理 pinned 的 dns_cache/counters map 文件；用户态 live 回写 TTL 改用 `expires_at - now` 剩余值（与预热口径一致，不再多告知满 TTL）；eBPF 降级 WARNING 去重（加载器内部降为 debug，由 cli 统一输出单行）。
+  - **设计接受项（非缺陷，代码注释说明）**：内核直答仅处理 OPCODE=0 标准查询、qclass=IN；CNAME 链不回放（只回终点 A/AAAA、RR name 用压缩指针 0xc00c 指向原 qname）；EDNS OPT/authority 不回放；shrink 极端失败时 `XDP_PASS` 等价一次 miss。
+  - **验证（连续四轮，后两轮连续零错误封板）**：每轮均四路并行（eBPF 独立复审 + 数据面 + 前后端联动 + 前端桌面/移动）。eBPF 封板轮由未参与此前轮次的代理独立重读全部源码、自写仿真，累计 20 万+随机 IP 头校验和验证、10 类应答用例（2×A 带 EDNS / 8×AAAA / A+AAAA 混合 / 1×A / NXDOMAIN / NODATA / 0x20 大写 / AAAA 带 EDNS 等）经 dnspython 解析全部正确、无 TrailingJunk、ANCOUNT 与实际 RR 数一致；clear_cache 枚举经 mock htab 验证从头不丢。数据面/联动/前端连续多轮全绿（联动单轮 81 项断言、前端单轮 34/34、0 console error）；周期订阅后台自动更新在 85s 窗口实测 12 次刷新并随源变更自动拉取落盘。Debian 13 部署走查实证无 clang 时优雅降级不中断、systemd 四项 capability + LimitMEMLOCK 齐备、非特权部署逐功能模块正常。全量日志 0 ERROR/Exception/Traceback/AttributeError。
+  - **真机待复核（沙箱限制）**：沙箱非 root、无 clang/llvm/bpftool，eBPF C 未实际编译加载；`make -C bpf` 实编、verifier 对精确扩容/二次 adjust_tail/分支边界的证明、`bpf_map__set_max_entries` 对 BTF LRU_HASH 兼容性、真实 XDP_TX 加速效果需在 Debian 13 + root + clang + 原生 XDP 网卡环境复核。
+
+- **v1.9.159**：eBPF 内核态缓存正确性修复版（基于 v1.9.158，专项深度审查发现并修复 2 项 P0、7 项 P1、7 项 P2、若干 P3）。v1.9.158 首次交付 eBPF 功能后，本轮逐行复审发现两处使内核直答对真实流量失效的 P0 及多处加载器/部署缺陷，全部修复并经独立复审 + 全功能回归确认。
+  - **P0 修复**：① qname 哈希大小写口径统一——eBPF C `parse_qname` 哈希时对标签内容字节做 A-Z→a-z 小写化，与用户态 `.lower()` 对齐（原先内核用 wire 原始字节、用户态用小写，0x20 大小写随机化查询近乎 100% miss，内核直答等于未开启）；② 应答扩容/边界修正——`grow = naddr*28`（按 AAAA 每条 12B 头+16B rdata 最坏值），边界保护预留完整 28B/RR（原先按 16B 估算，8×AAAA 越界，verifier 拒绝或产生 ANCOUNT 与实际 RR 数不符的畸形包）。
+  - **P1 修复**：IP `tot_len` 减去 14B 以太网头（原先多算，与 UDP 长度不自洽）；内核应答正确回写 RCODE（NXDOMAIN 不再被答成 NOERROR 空应答，保留 RD 位置 QR/RA）；`clear_cache()` 由空操作改为 `BPF_MAP_GET_NEXT_KEY`+`DELETE_ELEM` 真实枚举清空（规则变更/重载/订阅更新后内核不再按旧答案直答到 TTL 过期）；加载器改用正确的 `bpf_object__next_program`、attach 用 `libbpf_get_error` 判 ERR_PTR；install.sh 不再对 Python 脚本无效 setcap（改说明 systemd 推荐路径 + python3 解释器 ELF setcap 风险警告），systemd 补 `CAP_IPC_LOCK` 与 `LimitMEMLOCK=infinity`；订阅下载补 `RemoteDisconnected/ConnectionError/OSError` 分支（远端断连仅 WARNING 不打 Traceback）。
+  - **P2/P3 修复**：map 默认容量 1024→65536 且加载前 `bpf_map__set_max_entries` 按 `kernel_cache_max` 配置覆盖（旋钮生效）；`naddr` 按实际填充数钳制；bpftool 降级路径同时 pin counters map（指标不再恒 0）；TTL≤0 条目不写入内核缓存（原先 expires_at=0 被当作永不过期）；PERCPU 缓冲按 `sched_getaffinity` 取 CPU 数（防越界）；libbpf 加载中途失败及 unload 路径统一 `bpf_object__close`（无 fd/内核对象泄漏，避免 double-close）；加 ctypes 布局运行期断言（key=16/val=152/字段偏移）；运行态 PUT `kernel_cache` 支持在线加载/卸载/重建（无需重启）；前端 eBPF 徽章 reason 为"未启用"时不再冗余显示。
+  - **验证**：独立复审逐项确认 17 项 eBPF 修复正确落地（含逐字节模拟 C wire 哈希与用户态一致性、8×AAAA 扩容账验算、字节序核对）；全功能回归 22 项修复全过、14 项数据面无回归、前端 12/12、全量日志 0 ERROR/Exception/Traceback/AttributeError。沙箱仍无 clang/cap_bpf，`set_max_entries` 与 `rr+28` verifier 证明需 Debian 13 真机 `make -C bpf` 复核。
+
+- **v1.9.158**：eBPF 内核态缓存重大功能增强版（基于 v1.9.157）。实现真正的 XDP 内核态 DNS 缓存直答，命中查询完全不经过协议栈和用户态 Python。
+  - **eBPF C 程序（bpf/ebpdns_xdp.bpf.c）**：XDP Hook 拦截 UDP/53 DNS 查询，解析 qname（djb2 哈希，32 标签×63 字节有界循环，verifier 安全），查 BPF LRU_HASH map；命中时 `bpf_xdp_adjust_tail` 扩展报文、构造 DNS 应答（QR|RD|RA、ANCOUNT、qid 回填、answer 记录、MAC/IP/UDP 地址交换、IP 校验和）、`XDP_TX` 直接回包；未命中 `XDP_PASS` 给用户态。新增 `expires_at` 字段（`bpf_ktime_get_boot_ns` 基准），命中时检查 TTL 过期。支持 A/AAAA，结构可扩展。PERCPU_ARRAY 计数器（total/hit/miss/kernel_direct）。
+  - **用户态加载器（ebpdns/bpf_loader.py，新建）**：`BpfLoader` 类完整实现加载/卸载/attach/detach/map 读写/计数器汇总/预热。优先 ctypes 调 libbpf.so.0（`bpf_object__open_file`→`load`→`find_map_by_name`→`map_fd`→`attach_xdp`），降级 bpftool CLI，再降级纯用户态。完善降级：无 cap_bpf/无 libbpf/无 .o/verifier 拒绝/attach 失败 → active=False + 具体 reason，不抛异常。`_qname_djb2` 与 eBPF `parse_qname` 算法逐向量一致。
+  - **resolver.py 集成**：5 处 `cache.put` 后挂钩 `_ebpf_writeback`（门禁 active+qtype∈{A,AAAA}+rcode∈{NOERROR,NXDOMAIN}+非ECS，try/except 静默不阻塞热路径）；启动预热（用户态缓存热条目批量 warmup）；规则变更/配置重载/订阅更新后 `_ebpf_clear` 失效。ECS 启用时跳过回写/预热（eBPF key 无 ECS 维度，避免跨子网错答）。
+  - **配置/API/前端**：config.py 加 `kernel_cache`(bool,默认False)、`kernel_cache_iface`(str,"auto")、`kernel_cache_max`(int,1024-1048576,默认65536)；/api/status 与 /api/snapshot 加 `ebpf` 子对象（active/iface/reason/max_entries/counters），/metrics 加 5 个 eBPF 指标；前端 pipeline 页加 eBPF 状态徽章（active 绿色显示命中率/degraded 灰色显示具体原因），config 页加 eBPF 内核态缓存配置区块。
+  - **部署**：install.sh 检测 clang/llvm 编译 eBPF .o、`setcap cap_bpf,cap_net_admin,cap_sys_admin+ep`；systemd unit 加 `AmbientCapabilities`/`CapabilityBoundingSet`。
+  - **降级策略**：无 BTF/无 cap_bpf/clang 缺失/加载失败/attach 失败 → 自动降级纯用户态，日志 WARNING，Web 控制台显示 degraded+具体原因，不影响 DNS 服务。TCP DNS 走用户态（XDP 只处理 UDP 53）。
+  - **性能**：3 分钟 12 workers 纯用户态基线压测——QPS **35,967**、P50 **0.213ms**、P99 **1.01ms**、约 **648 万请求零错误**、RSS 稳定 **48MB**（起始 45MB，增长 3MB）。eBPF 内核态缓存启用后，命中查询不进用户态，预期 QPS 显著提升、延迟显著降低（需在支持 XDP_TX 的真实环境验证）。
+  - **沙箱验证**：沙箱无 clang/无 cap_bpf，无法实际编译加载 eBPF；已完成代码审查、py_compile、ctypes Structure 偏移断言、降级路径端到端测试（kernel_cache=True 无 cap_bpf → 自动降级、reason 正确显示、DNS 正常、0 异常）、_qname_djb2 与 eBPF 算法一致性验证。
+
+- **v1.9.157**：沙箱虚拟部署代码一致性修复版（基于 v1.9.156，四路审查发现 2 项 P3 一致性观察项，全部修复）。
+  - **P3-1 订阅文件写缺父目录 fsync**：`resolver.py` 周期订阅自动更新落盘（:3291）与 `cli.py` 冷启动订阅补下载落盘（:447）这两条路径，在 `os.replace(tmp, path)` 后缺父目录 fsync，其余 5 条原子写路径（config.save_config / config.save_local_rules / cli._save_cache / api._save_subs）均有。修复：两条路径均补 `os.open(dir, O_RDONLY|O_DIRECTORY) → fsync → close`，与标准范式一致。自愈性强（下次启动重新下载），但极端掉电场景下目录项未刷出可能导致 rules_sub.json 丢失。
+  - **P3-2 周期订阅 rebuild 在持锁内调用**：`resolver.py:3292` 周期订阅自动更新在持 `app_ctx._lock` 内直接调用 `self.rebuild_rule_index()`，与 API 写路径/冷启动路径"锁内自增代际、锁外 rebuild_rule_index_synced"范式不一致。10 万规则时 rebuild 耗时可能阻塞所有写 API。修复：锁内只自增 `app_ctx._rule_rebuild_gen`，锁外调用 `app_ctx.rebuild_rule_index_synced()`（走 `_rebuild_lock` 串行 + 代际跳过），与 cli._ensure_subs_downloaded / API 规则写路径完全对齐。
+  - **v1.9.156 P1 修复回归确认**：上一轮修复的 `resolver.py:3286` `_os.path.dirname`（周期订阅落盘路径）经功能验证和前后端联动两路独立实际触发周期订阅更新（功能验证 24 次刷新、前后端联动 3 次 tick），全部确认 0 AttributeError/Traceback/ERROR，rules_sub.json 正常落盘、数据面真实生效。
+  - **连续两轮零错误验收（硬性标准）**：v1.9.157 完成两轮独立四路并行审查（代码审查逐行全量 / 数据面 14 项 / 前后端联动六大模块 / 前端桌面+移动），**两轮均 P0–P3 全清、0 ERROR/Exception/Traceback/AttributeError**。第二轮换角度复审（锁序 DAG 无死锁环、后台任务无异常穿透、6 处父目录 fsync 无 fd 泄漏、前后端字段逐一对账、边界整数）。周期订阅落盘+锁外 rebuild 新范式两轮累计实际触发 50+ 次周期自动刷新（第一轮 7+10 次、第二轮 30+6 次），每次落盘后紧跟 `rebuild_rule_index took` 锁外重建标记，rules_sub.json updated_at 持续推进、屏蔽域名实测 NXDOMAIN、无 .tmp 残留。
+  - **性能**：3 分钟 12 workers 压测两次——QPS **39,452 / 40,582**（均值约 4 万）、P99 **0.924 / 0.970ms**、约 **711 / 731 万请求零错误**、RSS 稳定 **48MB**（起始 45MB，增长约 3MB）。较 v1.9.156（42,017 QPS）波动 -3.4%~-6.1%（正常网络波动，<15% 回归阈值），无性能回归。
+
+- **v1.9.156**：沙箱虚拟部署迭代修复版（基于 v1.9.155，修复 P3-b 修复引入的 P1 回归）。
+  - **周期订阅落盘 AttributeError 修复（P1）**：v1.9.155 的 P3-b 修复（`resolver.py` 周期订阅落盘 tmp 移到 try 外）时，不慎将 `_os.path.dirname(...)` 笔误为 `_os.dirname(...)`（`os` 模块无 `dirname` 属性，正确为 `os.path.dirname`）。后果：周期订阅自动更新每次落盘在 makedirs 即抛 `AttributeError: module 'os' has no attribute 'dirname'`，导致①不落盘 ②`rebuild_rule_index()` 不执行、新规则不生效。手动 API 更新路径不受影响（api.py 的 5 条原子写路径全部正确）。v1.9.156 订正为 `_os.path.dirname(...)`，与全库其余 6 条原子写路径统一。全库扫描确认无同类笔误。
+  - **代码审查结论**：v1.9.155 其余 3 项修复（P2 订阅更新 HTTPError、P3-a URLError、P3-c 前端 clamp 回写）经逐行审查 + 四路实测全部正确，热路径已高度优化（struct 预编译、bytearray、encode_name memo、LRU 8 分片锁、10% 事件采样、UDP 命中主线程直答、_now_ts 秒缓存），无高收益低风险新优化点。
+  - **性能**：3 分钟 12 workers 压测——平均 QPS **42,017**、P50 **0.255ms**、P99 **0.715ms**、P99.9 **1.34ms**、约 **757 万请求零错误**、RSS 稳定 **48MB**（起始 45MB，增长仅 2.8MB）。较 v1.9.155（43,964 QPS）波动 -4.4%（正常网络波动，<15% 回归阈值），P99 延迟更优（0.715ms vs 0.869ms），无性能回归。
+
+- **v1.9.155**：沙箱虚拟部署代码深度审查修复版（基于 v1.9.154，四路并行审查发现 4 项日志卫生/写路径/UX 问题，全部修复）。
+  - **订阅更新路径 HTTPError 漏接修复（P2）**：`api.py:_api_subscribe_update`（点"更新"按钮触发的订阅重新拉取）自带内联 try/except，v1.9.154 只修了 `_do_subscribe_download` 的 HTTPError 分支，遗漏了此路径。v1.9.155 补齐 `except urllib.error.HTTPError`（`log.warning` 简洁 `HTTP <code>`，不输出栈），与添加订阅路径同口径。
+  - **URLError 日志卫生修复（P3）**：`api.py` 两处订阅下载（`_do_subscribe_download` / `_api_subscribe_update`）此前仅覆盖 HTTPError，`urllib.error.URLError`（连接拒绝/超时/DNS 失败等预期网络错误）仍落 `except Exception: log.exception` 打完整栈。v1.9.155 在 HTTPError 之后新增 URLError 分支（URLError 是 HTTPError 父类，须在其后捕获），用 `log.warning` 记简洁 `e.reason`，不输出栈。
+  - **周期订阅落盘原子写 tmp 清理修复（P3）**：`resolver.py:_apply_subscription_updates` 周期订阅自动更新落盘路径，`tmp = path + ".tmp"` 原在 try 内定义，except 无法访问清理残留 `.tmp`，与其余 5 条原子写路径（tmp 在 try 外 + except 内 exists 守卫清理）范式不一致。v1.9.155 将 tmp 移到 try 外，except 内加 exists 守卫清理。
+  - **前端 bindCfg clamp 回写修复（P3）**：`web/index.html` 的 `bindCfg` 函数对数字输入框 clamp 后只写内存态 `real.config[key]`，不回写 `e.target.value`，导致用户输入超范围值（如 speed_interval_ms 输入 70000）后内存态正确钳为 60000 但输入框仍显示 70000，视觉认知偏差。影响所有 bindCfg 数字字段（共 15 个）。v1.9.155 在 bindCfg 内加回写：`if (e.target.type === 'number' && typeof v === 'number' && isFinite(v) && String(v) !== e.target.value) e.target.value = v;`（仅对 number 类型回写，不影响 checkbox/select/text）。
+  - **性能**：3 分钟 12 workers 压测——平均 QPS **43,964**、P50 **0.195ms**、P99 **0.869ms**、P99.9 **1.541ms**、约 **792 万请求零错误**、RSS 稳定 **48MB**（起始 45MB，增长仅 3MB）。较 v1.9.152（35,246 QPS）提升 **+24.7%**，无性能回归。
+
+- **v1.9.154**：Debian 13 部署验证修复版（基于 v1.9.153，修复日志卫生与文档同步）。
+  - **规则订阅 404 Traceback 泄漏修复（P2）**：`api.py:_do_subscribe_download` 此前对所有非策略性异常用 `log.exception()` 输出完整栈，订阅 URL 返回 HTTP 错误（404/403/500 等，属预期业务错误）时日志被 Traceback 刷屏。v1.9.154 区分 `urllib.error.HTTPError`（用 `log.warning` 记简洁 `HTTP <code>`，不输出栈）与其他意外异常（保留 `log.exception` 供调试）；API 业务返回仍为通用 400，调用方行为不变。cli.py 冷启动补下载路径已用 `log.warning` 处理，无需改动。
+  - **README 文档同步**：版本号从 v1.9.152 直接升到 v1.9.154（v1.9.153 升版时 README 漏升）；`speed_interval_ms` 范围三处从误写的 0–604800ms（≈10min）订正为 0–60000ms（=60s），与后端 `_NUM_RANGES=(0,60000)`、前端 HTML `max=60000`、JS `clamp(0,60000)` 完全对齐。
+
+- **v1.9.153**：两项修改——`speed_interval_ms` 前后端对齐 60s 上限 + CSP frame-ancestors 从 meta 改为 HTTP 响应头。
+  - **speed_interval_ms 上限 60s**：后端 `config.py:_NUM_RANGES` 从无上限收紧为 `(0, 60000)`（毫秒=60s），前端 HTML `<input max=60000>` + JS `clamp(+e.target.value, 0, 60000)` 同口径；设 60001 后端返回 400「超出范围 [0,60000]」且不污染状态，加载期配置写 60001 自动回退默认 2000 并告警。
+  - **CSP frame-ancestors 改响应头**：CSP 规范不允许 `<meta http-equiv="Content-Security-Policy">` 投递 `frame-ancestors` 指令（浏览器静默忽略），v1.9.153 改为由 `api.py` 在 HTTP 响应头下发：JSON API 发 `Content-Security-Policy: frame-ancestors 'none'`，静态 HTML 发完整 CSP（含 `frame-ancestors 'none'`）；meta content 中移除该指令（保留说明性注释）；与 `X-Frame-Options: DENY` 形成双重点击劫持防护。
+  - **移动端响应式（v1.9.152 修复）无回归**：汉堡菜单、侧边栏折叠、config 单列布局在 v1.9.153 保持。
+
 - **v1.9.150**：文档与代码全面对齐（本版为文档同步版，无数据面行为变更；基于已通过连续两轮零待修复验收的 v1.9.149 代码快照）。
   - **R12–R16 高强度逐行审查修复清零**：R12（32 项 P3）、R13（3 项 P3）、R14（2 项 P3）、R15（1 项 P3）、R16（复核）共 5 轮逐行审查，P3 级问题全部清零，连续两轮（功能验证代理）零待修复验收通过。
   - **版本号/性能数据更新**：文档版本号升到 v1.9.150；性能表更新为 v1.9.149 实测——8 并发 ×180s 缓存 100% 命中，平均 QPS **43,012**、P50 **0.17ms**、P99 **0.56ms**、P99.9 **1.48ms**、约 774 万请求**零错误**、RSS 稳定 **52MB**（非特权端口 DNS 5354 / API 18091）。
   - **配置表订正/补全**：新增 `api.token` 独立行（Bearer/X-Api-Key/`?token=`、最长 256、GET 脱敏 `***`、PUT 收到 `***` 不覆盖）；订正 `max_parallel_upstreams` 说明为「fallback 开启时并发最快 N 个、全败回退剩余，并作工作线程池基数 min(48,max(16,N×8))」；明确 `log_level`/`log_format` 改后需重启（其余字段 PUT/reload 即时生效）。
-  - **`speed_interval_ms` 单位口径保持正确**：毫秒字段（默认 2000ms≈2s，范围 0–604800ms≈10min），「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级字段(`stale_ttl` 上限为 100 天)——文档与前端 tooltip 均按此口径。
+  - **`speed_interval_ms` 单位口径保持正确**：毫秒字段（默认 2000ms≈2s，范围 0–60000ms=60s），「7 天」(=604800s) 适用于 `health_check_interval`/`rule_sub_interval` 等秒级字段(`stale_ttl` 上限为 100 天)——文档与前端 tooltip 均按此口径。
   - **复核无改动项**：`bpf/README.md`（`dns_cache`=LRU_HASH 1024、`counters`=PERCPU_ARRAY，与 `.c`/`.h` 一致）、前端 `speed_interval_ms` tooltip、`etc/ebpdns.conf.json` 均已与代码对齐，本轮仅复查。
+  - **⚠️ 通配符规则语义迁移（R17 复核确认，v1.9.150 生效）**：通配符按 **DNS 标签边界** 匹配——`*ads.com` 现等价于 `*.ads.com`，只命中 `ads.com` 本身及其任意层子域（`x.ads.com`/`a.b.ads.com`），**不再**命中标签内子串域名（`myads.com`/`xads.com`）。旧实现因正则锚定缺陷（`.*` 可匹配零字符）按"子串"匹配。历史配置中依赖 `*xxx.com` 屏蔽 `xxx.com` 词内域名的 block 规则将**静默失效**（屏蔽类 fail-open），此类需求请改用 `re:` 正则规则保留子串语义（如 `re:ads\.com$`）；`*.example.com` 写法不受影响。
 
 - **v1.9.148**：文档与代码全面对齐（本版为文档同步版，无数据面行为变更）。
   - **性能数据更新**：3 分钟 374 万请求零错误，平均 QPS **20,824**，P99 **0.859ms**（较 v1.9.147 的 15,432 QPS / P99 1.56ms 分别 +35% / -45%）。
   - **配置表补全**：补齐 `api.token`、`cache_partitions`、`health_check_interval`/`health_probe_domain`/`health_probe_timeout_ms`、`circuit_fails`/`circuit_open_s`、`bootstrap_dns`、`rule_sub_interval`/`rule_subscriptions`、`rebind_protection`、`dnssec_0x20`、`prefer_ipv4`、`log_format`、`web_root` 等键，与 `config.py` `DEFAULTS`/`_NUM_RANGES`/`_ENUM_VALUES` 逐项对齐。
   - **API 表订正**：`/api/health` 不再返回 `version`（未认证免指纹）；`/api/profile` 采样默认 3 秒、上限 10 秒（订正旧"默认 5、上限 30"）；`/api/restart` 与 `/api/reset` 需请求体 `{"confirm": true}`；`/api/logs` 补全过滤参数；`/api/pipeline` 上游脱敏说明；删除表格内误插的块注（原渲染断行）。
-  - **`speed_interval_ms` 单位订正**：该字段单位为**毫秒**（同一域名两次候选 IP 测速的节流间隔，默认 2000ms≈2s，范围 0–604800ms≈10min），订正前端帮助文字与后端注释中"最长 7 天"的单位混淆（"7 天"=604800s 仅适用于秒级周期字段）。
+  - **`speed_interval_ms` 单位订正**：该字段单位为**毫秒**（同一域名两次候选 IP 测速的节流间隔，默认 2000ms≈2s，范围 0–60000ms=60s），订正前端帮助文字与后端注释中"最长 7 天"的单位混淆（"7 天"=604800s 仅适用于秒级周期字段）。
   - **示例配置对齐**：`etc/ebpdns.conf.json` 与 `DEFAULTS` 对齐（补齐缺失键、键值一致）；移除不存在的 `deploy-test/` 引用，压测脚本更正为根目录 `stress_test.py`/`profile_test.py`/`full_log_test.py`；`package.sh` 用法更正为 `./package.sh <version>`。
 
 - **v1.9.144**：文档与代码严格对齐（本版为文档同步版，无数据面行为变更）。

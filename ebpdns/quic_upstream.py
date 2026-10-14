@@ -33,6 +33,15 @@ try:
     _HAVE_AIOQUIC = True
 except Exception:  # pragma: no cover - 依赖缺失路径
     _HAVE_AIOQUIC = False
+# R17 P2-1: H3 RESET_STREAM 错误码。客户端在放弃一个尚未完成的请求时, 按
+# RFC 9114 §8.1 应发 RESET_STREAM(H3_REQUEST_CANCELLED=0x10C)通知对端取消本流,
+# 否则服务端须等 60s idle_timeout 才回收流状态。优先取 aioquic.h3.connection.ErrorCode
+# (模块级 IntEnum, 半公开), 取不到则回退字面量, 保证跨版本不致 ImportError 拖垮模块。
+try:
+    from aioquic.h3.connection import ErrorCode as _H3ErrorCode
+    _H3_REQUEST_CANCELLED = int(_H3ErrorCode.H3_REQUEST_CANCELLED)
+except Exception:
+    _H3_REQUEST_CANCELLED = 0x10C
 _MAX_MSG = 65535
 _STABLE_SEC = 60.0      # 连接存活达到该秒数才视为"稳定"并复位退避(60s 内断开均视为不稳定)
 _FAIL_RECONNECT = 3     # 连续查询失败达该次数才触发连接重建
@@ -53,10 +62,32 @@ def _verify_chain_only(proto):
     把内建校验整体关掉(verify_mode=CERT_NONE)再手工补上链校验, 否则该开关会退化成
     "完全不校验证书"。
     返回 (ok, err)。取不到证书时返回 (False, 原因) —— fail-closed。
+
+    R18 P1-1 —— 对 aioquic 内部 API 的依赖声明(本机实测基于 aioquic 1.3.0):
+      本函数经 getattr(..., None) 逐层读取以下 aioquic 私有属性取对端证书:
+        proto._quic                                  (aioquic.quic.connection.QuicConnection)
+        proto._quic.tls                              (aioquic.tls.Context; QuicConnection 在
+                                                     _initialize() 中赋 self.tls, 客户端
+                                                     connect() 后即存在)
+        tls._peer_certificate                        (cryptography x509.Certificate)
+        tls._peer_certificate_chain / _peer_certificates  (备用链来源)
+      R17 误写为 proto._tls —— 实测 QuicConnectionProtocol 仅有 ._quic, 无 ._tls 且无
+      __getattr__ 转发, 旧路径恒取到 None, 使 strict_cert=false 的 IP 字面量 DoQ/DoH3
+      手工链校验恒 fail-closed(该上游永久连不上)。R18 已更正为 proto._quic.tls。
+      上述均为非公开属性, 跨 aioquic 版本可能重命名/移除。一旦升级后某属性消失,
+      getattr 落回 None, 函数返回 (False, "未取得对端证书") —— 方向恒为 fail-closed
+      (拒绝连接), 不会退化为放行。故本函数无需随版本强同步, 仅在升级后回归确认
+      证书校验仍生效即可。公开 API 中无等价"取已握握手对端证书"的接口, 暂不替换。
     """
     if not _HAVE_AIOQUIC:
         return False, "aioquic 未安装"
-    tls = getattr(proto, "_tls", None)
+    # R18 P1-1: 正确取值路径为 proto._quic.tls(本机实测 aioquic 1.3.0)。
+    #   QuicConnectionProtocol 仅持 ._quic(无 ._tls / 无 __getattr__ 转发);
+    #   QuicConnection 在 _initialize() 赋 self.tls = tls.Context(...)(属性名无下划线);
+    #   tls.Context 持 _peer_certificate / _peer_certificate_chain。
+    #   逐层 getattr(..., None) 防御: 任一层缺失即落回 None -> fail-closed。
+    quic = getattr(proto, "_quic", None)
+    tls = getattr(quic, "tls", None) if quic is not None else None
     cert = getattr(tls, "_peer_certificate", None) if tls is not None else None
     if cert is None:
         return False, "未取得对端证书(peer_certificate 为空)"
@@ -66,13 +97,20 @@ def _verify_chain_only(proto):
         if got:
             chain = list(got)
             break
-    # 系统 CA 来源与 aioquic 默认一致(certifi); 取不到则退回 aioquic 默认 cafile 逻辑。
+    # R17 P2-2 —— cafile=None 的 fail-closed 行为已实测确认(aioquic 1.3.0):
+    #   aioquic.tls.verify_certificate 源码: 当 cadata/cafile/capath 全为 None 时,
+    #   store.load_locations(certifi.where()) 自动加载 certifi 默认根; 且无论 CA 来源
+    #   如何, 末尾 store_ctx.verify_certificate() 恒被调用, 从不"跳过校验"。
+    #   实测: 自签证书 / 私有根签发证书在 cafile=None 下均被拒(AlertBadCertificate:
+    #   self-signed / unable to get local issuer certificate); 同一私有根证书传入对应
+    #   cafile 则通过 —— 证明校验真实执行、不 fail-open。另: aioquic.tls 模块级即
+    #   `import certifi`, 故 aioquic 可用则 certifi 必装。下列 try 仅为 belt-and-suspenders。
     cafile = None
     try:
         import certifi
         cafile = certifi.where()
     except Exception:
-        cafile = None
+        cafile = None  # 实测确认: None 时 aioquic 内部仍加载 certifi 根并做链校验, fail-closed
     try:
         from aioquic.tls import verify_certificate
         # server_name=None => 只校验证书链与有效期, 跳过主机名/IP SAN 匹配
@@ -88,15 +126,17 @@ def available():
 
 
 def _is_header_only(data):
-    """R-fix: 与 upstream._is_header_only 同口径的本地副本(避免模块级循环 import)。
+    """与 upstream._is_header_only 同口径的本地副本(避免模块级循环 import)。
 
-    判据: 长度 >=12 且 QDCOUNT==0 且 ANCOUNT==0 —— 合法 DNS 响应恒 echo 我们查询的
-    question(QDCOUNT==1), 故该形状是畸形帧。DoQ/DoH3 原先只判 len<12, 会把它当成功
-    上交, 下游按 NODATA 写负缓存。"""
+    判据(v1.9.161 收紧): len>=12 且 QDCOUNT!=1 即视为畸形/header-only 拒绝。
+    合法 DNS 响应恒 echo 我们查询的 question(QDCOUNT==1), 故 qd!=1 本身即结构异常;
+    旧判据 "qd==0 且 an==0" 会放过 qd==0 却塞答案的畸形帧。NODATA/NXDOMAIN 这类
+    qd=1/an=0 的合法响应不受影响。len<12 的短帧由调用方前置长度判断兜底。"""
     try:
-        return (len(data) >= 12
-                and bytes(data[4:6]) == b"\x00\x00"
-                and bytes(data[6:8]) == b"\x00\x00")
+        if len(data) < 12:
+            return False
+        qdcount = struct.unpack(">H", bytes(data[4:6]))[0]
+        return qdcount != 1
     except Exception:
         return False
 def _host_port(up):
@@ -305,6 +345,14 @@ class _QuicUpstream:
         # R1 P3-3: 跟踪在途查询 fut, close() 时逐个 cancel, 使上游删除瞬间飞行中的
         # 查询以 CancelledError 干净收尾(而非依赖 loop.close() 兜底)。
         self._inflight_futs = set()
+        # v1.9.161 R-fix(问题1): 记录"最近一次建连失败"的具体原因(证书/拒绝/DNS/TLS),
+        # 供健康检查/诊断与 query() 第4项透出。成功建连后清空。
+        self._last_conn_err = None
+        self._last_conn_err_at = 0.0   # monotonic 时间戳(诊断用)
+        # v1.9.161 R-fix(问题2): "建连失败退避中"状态。_maintain 在建连阶段失败时
+        # set, 开始新一轮重连尝试/成功时 clear。_exchange 见该状态即快速失败, 不再白等
+        # 完整超时; 重连进行中(已 clear)则正常等待, 避免误杀即将成功的重连。
+        self._conn_failed = None  # 在 _ensure_started 与 _conn_ready 一并创建
     # ---- 线程与 loop ----
     def _ensure_started(self):
         if self._started:
@@ -324,6 +372,9 @@ class _QuicUpstream:
             # 窗口, stats()(:757)与 _exchange 的 await 都要额外判空, 改动面与回归
             # 风险大于收益, 故采用文档化 + 部署要求标注的最小改动。
             self._conn_ready = asyncio.Event()
+            # v1.9.161(问题2): 与 _conn_ready 同处创建、同环绑定语义。失败退避标志,
+            # 由 loop 线程(_maintain/_exchange)读写; is_set() 为 GIL 保护的 bool 读。
+            self._conn_failed = asyncio.Event()
             self._thread = threading.Thread(
                 target=self._run_loop, name="quic-%s-%s" % (self.proto, self.host), daemon=True)
             # R17 P3-1: 仅在 thread.start() 成功后才置 _started=True。
@@ -343,6 +394,7 @@ class _QuicUpstream:
                 self._loop = None
                 self._thread = None
                 self._conn_ready = None
+                self._conn_failed = None
                 self._started = False
                 raise
             self._started = True
@@ -389,6 +441,12 @@ class _QuicUpstream:
         while True:
             if self._closing:
                 return
+            # v1.9.161(问题2): 本迭代开始一次新的 connect/重连尝试。清除"失败退避"
+            # 标志, 使此期间到达的查询正常等待 _conn_ready(重连可能即将成功);
+            # 仅当本次尝试再次建连失败时, except 分支才会重新 set 并进入退避快败态。
+            _failed_ev = self._conn_failed
+            if _failed_ev is not None:
+                _failed_ev.clear()
             # R8 P2-2: 标记本次迭代是否已成功建连。仅建连阶段(connect/handshake)
             # 失败才说明 bootstrap IP 可能已坏需 invalidate; 连接建立后进入保活
             # while 循环, 传输阶段网络抖动导致的异常不应判定 bootstrap IP 已坏。
@@ -438,6 +496,16 @@ class _QuicUpstream:
                                 "(aioquic 不支持仅关主机名校验, 故改由手工校验实现)。"
                                 "建议改用 hostname 上游或为服务器配置含 IP SAN 的证书。",
                                 self.proto, self.host)
+                    elif _quic_is_hostname is not None and _quic_is_hostname(self.host):
+                        # R23 P3: hostname 上游 + strict_cert=false 时, 原实现保持
+                        # conf.server_name=None, 被 aioquic connect() 兜底为
+                        # connect_host(bootstrap 预解析后的 IP), 证书按 IP-SAN 而非
+                        # hostname DNS-SAN 校验, 与 DoH/DoT(hostname 上游恒做严格
+                        # 主机名/SAN 校验)不对称, 导致该非推荐组合无法正常工作。
+                        # 显式把 server_name 设为域名, 使证书按 hostname DNS-SAN
+                        # 校验; kill switch 只放宽 IP 字面量, hostname 不放宽。
+                        # IP 字面量上游保持 None(上方 CERT_NONE + 手工链校验)。
+                        conf.server_name = self.host
                 # 复用 bootstrap 预解析的 IP 直连(与 DoH/DoT 同源), 彻底摆脱
                 # 系统 getaddrinfo 依赖; conf.server_name 仍为原始 hostname,
                 # SNI 与证书名校验不受影响。
@@ -506,6 +574,10 @@ class _QuicUpstream:
                     self._conn_start = time.monotonic()
                     self._ever_connected = True
                     fail_seq = 0
+                    # v1.9.161(问题1): 成功建连即清除历史失败原因, 后续查询/诊断
+                    # 不再拿到过期的连接错误文案。
+                    self._last_conn_err = None
+                    self._last_conn_err_at = 0.0
                     log.info("QUIC %s/%s 连接建立", self.proto, self.host)
                     self._protocol = proto
                     self._conn_gen += 1
@@ -529,6 +601,7 @@ class _QuicUpstream:
                 # v1.9.145 P2: 与 DoH/DoT 修复对齐——证书校验失败时不清 bootstrap
                 # 缓存(IP 正确, 证书本身有问题, 清缓存只会导致下次回退到阻塞 DNS)。
                 # aioquic 将 TLS Alert 包装为裸 ConnectionError, 需回查 close_event。
+                close_ev = None
                 _cert_error = isinstance(e, ssl.CertificateError)
                 if not _cert_error:
                     inst = _proto_ref.get("inst")
@@ -557,6 +630,16 @@ class _QuicUpstream:
                     log.warning("QUIC %s/%s 连接失败: %r", self.proto, self.host, e)
                 else:
                     log.debug("QUIC %s/%s 连续失败 %d 次, 退避重连中", self.proto, self.host, fail_seq)
+                # v1.9.161(问题1+问题2): 仅建连阶段(handshake 未完成)失败才记录具体
+                # 原因并进入"快速失败"态。established=True 的传输期抖动不视为已知坏:
+                # 保留旧 _last_conn_err(此处不覆盖、不 set 失败态), 让查询正常等待重连。
+                if not established:
+                    reason = self._classify_conn_error(e, _cert_error, close_ev)
+                    self._last_conn_err = reason
+                    self._last_conn_err_at = time.monotonic()
+                    _failed_ev = self._conn_failed
+                    if _failed_ev is not None:
+                        _failed_ev.set()
             self._protocol = None
             # P3-19: clear 后不主动唤醒等待者(_conn_ready.wait() 的查询需等自身超时)。
             # 这是合理折中——重连通常很快成功, 成功后 _conn_ready.set() 会让等待者
@@ -650,6 +733,39 @@ class _QuicUpstream:
                 pass
         # 线程为 daemon, 维护循环检测到 _closing 后自行退出并关闭 loop
 
+    @staticmethod
+    def _classify_conn_error(e, cert_error, close_ev):
+        """v1.9.161(问题1): 把建连异常归纳为可观测的原因文案。
+
+        目标是让健康检查/诊断能区分"连接拒绝 / 证书错误 / DNS 解析失败 / TLS alert"。
+        返回的字符串会作为 query() 4 元组的第4项透出。优先级:
+          证书/校验错误(含 certificate/verification 字样) > 连接拒绝(refused) >
+          DNS 解析失败 > 其他 TLS alert > 异常 str/repr。
+        """
+        import socket as _sock
+        estr = str(e) or ""
+        elow = estr.lower()
+        # 1) 证书/校验错误(已由 ssl.CertificateError 或 close_event alert code 判定)
+        if cert_error:
+            detail = estr or "tls certificate alert"
+            return "certificate verification failed: %s" % detail
+        # 2) 连接被拒绝
+        if isinstance(e, ConnectionRefusedError) or "refused" in elow:
+            return "connection refused"
+        # 3) DNS 解析失败
+        if isinstance(e, _sock.gaierror) or any(
+                k in elow for k in ("name or service not known", "getaddrinfo",
+                                    "nodename nor servname", "no address associated",
+                                    "temporary failure in name resolution")):
+            return "dns resolution failed: %s" % (estr or type(e).__name__)
+        # 4) 其他 TLS alert(CRYPTO_ERROR range, 非证书类 alert)
+        ec = getattr(close_ev, "error_code", 0) if close_ev is not None else 0
+        if 0x100 <= ec <= 0x1ff:
+            alert = ec - 0x100
+            return "tls alert 0x%x: %s" % (alert, estr or "handshake failed")
+        # 5) 兜底: 异常 str; aioquic 常抛裸 ConnectionError(str 为空), 此时给类型名
+        return estr if estr else "%s" % type(e).__name__
+
     # ---- 同步查询入口 ----
     def query(self, query_bytes, timeout_ms):
         # P3-8(第八轮): close() 与在途 query() 竞态致假性超时。已关闭的上游立即
@@ -685,9 +801,11 @@ class _QuicUpstream:
             self._inflight_futs.discard(fut)
             return False, None, 0, "upstream closed"
         try:
-            ok, data = fut.result(timeout_ms / 1000.0 + 0.5)
+            ok, data, err = fut.result(timeout_ms / 1000.0 + 0.5)
             lat = int((time.monotonic() - t0) * 1000)
-            return ok, data, lat, (None if ok else "query failed")
+            # v1.9.161(问题1): 连接级失败时 _exchange 已带回具体原因(证书/拒绝/...);
+            # 业务级失败 err=None → 回退 "query failed"。保持成功路径 4 元组签名不变。
+            return ok, data, lat, (None if ok else (err or "query failed"))
         except (asyncio.TimeoutError, _cf.TimeoutError):
             # 关键: 取消悬挂在 loop 上的协程——否则超时后协程仍持有旧连接
             # proto 引用, 重连多次后旧连接对象无法被 GC, 长期累积成内存泄漏
@@ -701,9 +819,14 @@ class _QuicUpstream:
         finally:
             self._inflight_futs.discard(fut)
     async def _exchange(self, query, timeout):
-        """单次查询。返回 (ok, data)。
+        """单次查询。返回 (ok, data, err)。
         连接级失败(未就绪/已关闭)才触发重建; 业务失败(超时/非200)不关连接,
         连续 _FAIL_RECONNECT 次业务失败才触发重建(防死连接长期阻塞)。
+        v1.9.161(问题1): 连接级失败时把 _last_conn_err(证书/拒绝/DNS/TLS 具体原因)
+        作为第3项 err 带回 query(), 透传到 query_upstream 4 元组第4项; 业务级失败
+        err=None(由 query() 回退 "query failed")。
+        v1.9.161(问题2): 处于"建连失败退避态"(_conn_failed 已 set)时立即返回, 不白等
+        完整超时; 重连进行中(_conn_failed 已 clear)仍正常等待 _conn_ready。
         v1.9.84 QUIC-01: 用累计 deadline 替代两次独立 timeout, 避免 conn_ready
         等待消耗大部分预算后 stream 等待被外层 fut.result() 过早 cancel。
         P3-06(R2): deadline 用 time.monotonic() 而非 self._loop.time(), 与外层
@@ -720,20 +843,34 @@ class _QuicUpstream:
         有外层兜底, 不构成实际 bug。
         """
         deadline = time.monotonic() + timeout
+        # v1.9.161(问题2): 已知建连失败且处于退避窗口 → 立即带原因返回, 不再死等。
+        # _conn_failed 在新一轮重连尝试开始时已被 _maintain clear, 故此处 set 仅当
+        # "上一次建连失败、正在 backoff sleep" 时成立; 重连进行中不会误快败。
+        _failed_ev = self._conn_failed
+        if _failed_ev is not None and _failed_ev.is_set():
+            return False, None, (self._last_conn_err or "query failed")
         try:
             await asyncio.wait_for(self._conn_ready.wait(), timeout)
         except (asyncio.TimeoutError, _cf.TimeoutError):
-            return False, None
+            # v1.9.161 复查(低危): 等待建连就绪超时 = "新一轮重连仍在进行中",
+            # 直接归 "timeout", 不再复用 self._last_conn_err。
+            # 根因: 新一轮 connect 较慢、超过查询等待 timeout 时, _conn_failed 已在本轮
+            # 维护迭代开头被 clear(否则上方退避快败路径已先返回), 但 _last_conn_err 仍是
+            # 上一次建连失败残留(成功建连才在 _maintain 里清空)。若透出旧
+            # "connection refused" 等文案, 真实语义其实是"仍在重连中", 还可能引发不必要
+            # 的故障转移。明确失败原因只在 _conn_failed 退避快败路径(上方)透出; 成功路径
+            # err=None 不变。
+            return False, None, "timeout"
         proto = self._protocol
         if proto is None or _is_conn_closed(proto):
             # 连接已失效: 触发重建
             self._request_reconnect()
-            return False, None
+            return False, None, (self._last_conn_err or "query failed")
         # v1.9.84 QUIC-01: 计算剩余时间传给 stream 等待
         # P3-06(R2): 用 time.monotonic() 与上面的 deadline 同源。
         remain = deadline - time.monotonic()
         if remain <= 0:
-            return False, None
+            return False, None, (self._last_conn_err or "timeout")
         try:
             if self.proto == "doq":
                 ok, data = await self._doq_exchange(proto, query, remain)
@@ -749,7 +886,8 @@ class _QuicUpstream:
                 self._request_reconnect()
         else:
             self.fail_seq = 0
-        return ok, data
+        # 业务级失败(err=None): 连接本身就绪, 失败在流/HTTP 层, 不透出建连原因。
+        return ok, data, None
     async def _doq_exchange(self, proto, query, timeout):
         # 底层 QUIC 双向流: 2 字节长度前缀 + DNS 消息, 不用 asyncio StreamWriter
         sid = proto._quic.get_next_available_stream_id()
@@ -788,6 +926,13 @@ class _QuicUpstream:
             # 补齐 12 字节 DNS 报文头下限。原仅判 n<=0(拒绝空帧), 不拒绝
             # n=1..11 的畸形短帧; 补后 qid 校验(:647)的 len>=2 短路恒为真。
             if len(resp) < 12:
+                return False, None
+            # R17 P1-1: 补 header-only(QDCOUNT==0 且 ANCOUNT==0)结构闸。六条协议路径中
+            # 唯独 DoQ 此前遗漏: 恰好 12 字节、qid 匹配、但无 question 段的畸形 DoQ 响应
+            # 会通过长度下限与 qid 校验被当成功上交, 下游 parse_message 得
+            # rcode=0/answers=[], resolver 按 NODATA 写负缓存。与 DoH3/明文 DoT/DoH/UDP/
+            # 明文 TCP 五条路径口径统一, 命中即判失败走备用上游。
+            if _is_header_only(resp):
                 return False, None
             # P1-4: 与 DoT/UDP/TCP 路径对称, 校验响应 DNS qid 与查询一致。
             # QUIC stream 隔离虽提供传输层请求/响应绑定, 但行为异常的服务器
@@ -832,6 +977,18 @@ class _QuicUpstream:
             try:
                 await asyncio.wait_for(st["done"].wait(), timeout)
             except (asyncio.TimeoutError, _cf.TimeoutError):
+                # R17 P2-1: DoH3 超时/放弃本流时, 与 DoQ(:773)对称, 通过 QUIC 层发
+                # RESET_STREAM 通知对端取消本流(错误码 H3_REQUEST_CANCELLED=0x10C,
+                # RFC 9114 §8.1)。原实现仅 return, 不发任何流取消信号, 服务端须等
+                # 60s idle_timeout 才回收流状态; 上游故障高频超时场景下服务端侧流
+                # 状态累积, 可能触发其流并发上限或过早关连接。aioquic 1.3.0 的
+                # H3Connection 未暴露公开 abort 接口, 直接在 QUIC 层 reset_stream 是
+                # 其官方传输语义; 失败(连接已在关闭中)忽略, 由 finally pop 收尾。
+                try:
+                    proto._quic.reset_stream(sid, _H3_REQUEST_CANCELLED)
+                    proto.transmit()
+                except Exception:
+                    pass
                 return False, None
             # R3-NET-P2-1: 与明文 DoH(:1158/:1242)/DoQ 对称, 补 12 字节 DNS
             # 报文头下限。原 `not st["body"]` 仅拒空 body, 不拒 1~11 字节畸形短 body;

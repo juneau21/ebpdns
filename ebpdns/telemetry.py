@@ -46,7 +46,7 @@ class Telemetry:
             self.counters[name] += n
 
     def inc_rule(self, cat, n=1):
-        """分流规则命中统计: cat ∈ domestic / global / block / forceIp"""
+        """分流规则命中统计: cat ∈ domestic / global / block / forceIp / allow"""
         with self._lock:
             self.rule_hits[cat] = self.rule_hits.get(cat, 0) + n
 
@@ -233,19 +233,12 @@ class Telemetry:
             avg_lat = (sum(self.latency_window) / alen) if alen else None
             return counters, rule_hits, hit_rate, qps, avg_lat
 
-    def upstreams_snapshot(self):
-        """per_upstream.items() 的加锁拷贝。直接在锁外 .items() 迭代时, 并发
-        upstream_ok() 的 setdefault 新增 key 会抛 RuntimeError: dictionary
-        changed size during iteration (Prometheus /metrics 抓取 500)。"""
-        with self._lock:
-            return list(self.per_upstream.items())
-
     def upstreams_snapshot_copy(self):
-        """P3(R1-11): per_upstream 的全量深拷贝。upstreams_snapshot() 返回的
-        (uid, st) 中 st 是 live dict 引用, /metrics 在锁外读 st.get("ok")/fail/
-        lat_sum 时, 虽 CPython 单字段 store 原子不致撕裂, 但 ok 与 fail 可能来自
-        相邻两次 upstream_ok/fail 之间的不同时刻, avg 计算有微小误差。本方法在
-        锁内拷贝每个 st dict, 返回独立副本, 调用方可安全锁外读取。"""
+        """P3(R1-11): per_upstream 的全量深拷贝。/metrics 与 /api/upstreams 在锁外读
+        st.get("ok")/fail/lat_sum 时, 虽 CPython 单字段 store 原子不致撕裂, 但 ok 与 fail
+        可能来自相邻两次 upstream_ok/fail 之间的不同时刻, avg 计算有微小误差。本方法在
+        锁内拷贝每个 st dict, 返回独立副本, 调用方可安全锁外读取。直接锁外 .items()
+        迭代还会与并发 setdefault 新增 key 竞态抛 RuntimeError。"""
         with self._lock:
             return {uid: dict(st) for uid, st in self.per_upstream.items()}
 
@@ -292,19 +285,6 @@ class Telemetry:
         if level in ("hit", "miss"):
             return random.random() < 0.1
         return True
-
-    def fast_hit(self, qtype, raw_len, resp_len, lat_ms, kernel_direct=False):
-        with self._lock:
-            self.counters["total"] += 1
-            self.counters["hit"] += 1
-            if kernel_direct:
-                self.counters["kernel_direct"] += 1
-            self.counters["bytes_in"] += raw_len
-            self.counters["bytes_out"] += resp_len
-            self.qtype_dist[self.qtype_cat(qtype)] += 1
-            # P3-13: latency_window.append 移入锁内(与 clear/快照并发一致)
-            self.latency_window.append(lat_ms)
-        self.qps_window.append(time.time())
 
     def fast_hit_logged(self, qtype, raw_len, resp_len, lat_ms, domain, msg,
                         upstream, answer, kernel_direct=False, level="hit"):

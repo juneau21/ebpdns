@@ -232,7 +232,8 @@ def start_first_probe(cfg, config_path=None, app_ctx=None):
     """
     if not _needs_probe(cfg):
         return
-    global _first_probe_threads
+    # 注: 对模块级 list _first_probe_threads 仅做原地切片/append(不重新绑定名字),
+    # 无需 global 声明; 锁内 append+start 的时序(R5-P3-1/R12-P3-3)保持不变。
     t = threading.Thread(target=lambda: probe_enabled_upstreams(cfg, config_path, app_ctx),
                          name="first-probe", daemon=True)
     # R5-P3-1: 先在锁内把线程句柄加入 list, 再 t.start()。原实现 t.start() 在

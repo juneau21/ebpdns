@@ -105,7 +105,7 @@ def _validate_upstream_dict(u):
         return "port 不允许是布尔值: %r" % (_raw_port,)
     try:
         port = int(_raw_port)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "port 必须是整数: %r" % (u.get("port"),)
     if not (1 <= port <= 65535):
         return "port 必须在 1-65535 之间 (got %r)" % (u.get("port"),)
@@ -159,7 +159,13 @@ def _validate_upstream_dict(u):
     # 不应比不传更不安全(关闭严格校验)。allow_private_ip 缺省 False 是安全方向, 保持不变。
     for _bk, _bd in (("allow_private_ip", False),
                      ("doh_strict_cert", True),
-                     ("dot_strict_cert", True)):
+                     ("dot_strict_cert", True),
+                     # R17 P3-1: doq/doh3 strict_cert 此前只在 POST 新建分支归一,
+                     # bulk PUT /api/config 内嵌 upstreams[] 漏掉 → 字符串 "false"
+                     # 原样落库("false" is not False → 严格校验保持开启), 与 doh/dot
+                     # 路径行为不一致。补齐与 POST/单条 PUT 同型归一(兜底 True 安全方向)。
+                     ("doq_strict_cert", True),
+                     ("doh3_strict_cert", True)):
         if _bk in u:
             u[_bk] = _as_bool(u[_bk], _bd)
     return None
@@ -334,7 +340,7 @@ def _normalize_rule_ttl(r):
             return "%s 必须是非负整数，不能是布尔值" % k
         try:
             r[k] = max(0, int(v))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return "%s 必须是非负整数" % k
     # 两者都提供(且未被上面的 None/空跳过)时检查顺序, 与单条路径一致。
     _tmin = r.get("ttl_min")
@@ -383,18 +389,49 @@ def _conn_key(u):
                              u.get("addr", ""), u.get("port", ""), u.get("url", ""))
 
 
+# R18 P2-1: 布尔字符串 token 归一表。已识别真值/假值分别落 True/False;
+# 无法识别的畸形串("maybe"/"enable"/乱码)不再一律 False, 而是回落 default。
+# 旧实现对字符串分支只判真值表, 任何非真值串都返回 False —— strict_cert 类
+# default=True 的安全字段收到畸形值会被静默关成 False(上游 TLS 证书校验被关),
+# 与本文件多处注释承诺的"畸形兜底 True(安全方向)"相反, 且比不传(运行时缺省 True)
+# 更不安全。回落 default 后: default=True 字段畸形→True(安全), default=False 字段
+# (allow_private_ip/ipv6 等)畸形→False, 行为与旧实现一致不受影响。
+_BOOL_TRUTHY = ("1", "true", "yes", "on")
+_BOOL_FALSY = ("0", "false", "no", "off")
+
+
 def _as_bool(v, default=True):
     """宽松布尔解析。JSON/表单里字符串 "false"/"0"/"off"/"no" 必须判为 False,
-    不能用裸 bool("false") (恒 True)。None 走 default 缺省。"""
+    不能用裸 bool("false") (恒 True)。None 走 default 缺省。
+    R18 P2-1: 无法识别的畸形字符串同样回落 default(而非一律 False), 使 strict_cert
+    类安全字段的 default=True 兜底生效 —— 显式传畸形值不应比不传更不安全。
+    R19 P2: 走到末行的只剩 list/dict 等非标量容器(bool/None/int/float/str 已被前序
+    分支拦截), 同样一律回落 default, 不空容器借 Python 真值语义翻安全键。"""
     if isinstance(v, bool):
         return v
     if v is None:
         return default
     if isinstance(v, (int, float)):
+        # R20 P3: NaN/Infinity 非有限值不是合法布尔输入, 回落 default。否则
+        # float('nan')!=0 与 float('inf')!=0 恒 True, 会把 default=False 安全键
+        # (allow_private_ip/padding/prefer_ipv4/serve_stale) 畸开为 True, 与加载端
+        # config.py isinstance(bool) 回退默认产生双入口漂移。bool 已被首分支拦截,
+        # 此处 int 恒有限无需守卫; 仅 float 需挡 NaN/Inf。
+        if isinstance(v, float) and not math.isfinite(v):
+            return default
         return v != 0
     if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on")
-    return bool(v)
+        t = v.strip().lower()
+        if t in _BOOL_TRUTHY:
+            return True
+        if t in _BOOL_FALSY:
+            return False
+        return default
+    # R19 P2: list/dict 容器对 bool 字段属畸形输入, 一律回落 default(与畸形串对称)。
+    # 否则空容器 []/{} 恒假会把 default=True 的安全键(rebind_protection/dnssec_0x20/
+    # doh_strict_cert 等)关成 False, 非空容器 [1] 恒真会把 default=False 字段
+    # (allow_private_ip 等)打开 —— 正是 R18 要消除的"畸形值比不传更危险"。
+    return default
 
 
 def _upstream_optional_fields(body):
@@ -471,11 +508,18 @@ def _sub_url_blocked(url):
     if not ips:
         return "订阅主机名无可用 IP", []
     for ip in ips:
-        # R-fix: 改用 ipaddress.is_global 作为唯一判据。原先的显式枚举漏掉了
+        # R-fix: 改用 ipaddress.is_global 作为主判据。原先的显式枚举漏掉了
         # 100.64.0.0/10(RFC 6598, 运营商级 NAT / 部分云内网互联段): 该段
         # is_private/is_loopback/is_link_local/is_reserved 全为 False 而 is_global
         # 亦为 False, 于是被当公网放行。is_global 覆盖全部"非全球可路由"空间。
-        if not ip.is_global:
+        # R17 P2-1: 但 is_global 把多播段(224.0.0.0/4、ff00::/8)判为 True ——
+        # 实测 224.0.0.1 / 239.255.255.250(SSDP) / ff02::1 的 is_global 均为 True,
+        # 若只看 not is_global 会把多播当公网放行, 形成控制面静默回归。此处把多播
+        # 显式补回拒绝(CGNAT 等其余非全球段已由 not is_global 覆盖)。
+        # v1.9.161 R-fix(对抗审查): 补 is_reserved —— 与 resolver._is_private_ip 口径
+        # 对齐。实测 Python 3.12: IPv4-compatible ::127.0.0.1(::7f00:1) 与 NAT64
+        # 64:ff9b::127.0.0.1 均 is_global=True 但 is_reserved=True, 原判据会放行。
+        if not ip.is_global or ip.is_multicast or ip.is_reserved:
             return "订阅地址指向内网/保留地址, 已拒绝(SSRF 防护)", []
     return None, [str(ip) for ip in ips]
 
@@ -623,12 +667,6 @@ _CFG_WRITABLE_KEYS = (
 # ignored_keys 会每次保存都提示用户"未保存", 纯 UX 噪音。过滤 ignored_keys 时跳过。
 _RUNTIME_KEYS = {"cache_file", "rule_sub_file", "rule_local_file"}
 
-# P3-5(第七轮): 需重启生效的服务器绑定键(listen/api/web_root)被 _CFG_WRITABLE_KEYS
-# 白名单主动排除(防注入), 但前端每次保存都会把它们一起回传, 此前每次都落入 dropped
-# 弹琥珀色"忽略未保存的键: listen, api, web_root"提示, 纯 UX 噪音。它们不是用户
-# 误填的键, 而是设计上不可热写的键, 从 dropped 中排除。
-_SERVER_KEYS = {"listen", "api", "web_root"}
-
 # R-fix: 单条 PUT /api/upstreams/<id> 与 bulk PUT /api/config 的 upstreams[] 共用同一份
 # 可写字段白名单(此前 bulk 路径无未知键检查, 同一条目经两条路径行为不一致:
 # 单条 400 拒绝、bulk 却把任意键永久固化进 config.json 并回显)。
@@ -717,7 +755,6 @@ class AppContext:
         # 导致文件/SIGHUP 反复增删改上游后这些条目缓慢残留。
         try:
             new_ups = new_cfg.get("upstreams", [])
-            new_ids = {u.get("id") for u in new_ups}
             new_by_id = {u.get("id"): u for u in new_ups}
             for o in old_cfg.get("upstreams", []):
                 uid = o.get("id")
@@ -885,7 +922,15 @@ class AppContext:
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "ebpdns/" + __version__
+    # v1.9.161 R-fix(对抗审查): Server 头不再泄露精确版本与 Python 版本。
+    # 原 server_version="ebpdns/"+__version__ 使 /api/health 的 body 去指纹硬化
+    # (body 不返 version) 被响应头抵消 —— 任何未认证请求(含 401/403/404/静态)都能
+    # 读到 "Server: ebpdns/1.9.161 Python/3.x"。重写 version_string() 返回不带版本
+    # 的固定串, 彻底去掉 ebpdns 与 Python 双版本指纹。
+    server_version = "ebpdns"
+
+    def version_string(self):
+        return self.server_version
 
     # ---------- helpers ----------
     @property
@@ -904,9 +949,12 @@ class _Handler(BaseHTTPRequestHandler):
         # R2-P2-1 / R2-P3-2: 安全响应头统一收口。
         # - X-Frame-Options: DENY —— <meta> 里的 frame-ancestors 被浏览器忽略(CSP 规范
         #   不允许 meta 投递 frame-ancestors), 改由 HTTP 头真正闭合点击劫持。
+        # - Content-Security-Policy: frame-ancestors 'none' —— CSP 标准点击劫持防护,
+        #   与 X-Frame-Options 双重保险; JSON API 只需 frame-ancestors, 不加 script-src 等。
         # - X-Content-Type-Options: nosniff —— 防 MIME 嗅探。
         # - Referrer-Policy: no-referrer —— 不外泄跳转来源。
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
@@ -940,8 +988,13 @@ class _Handler(BaseHTTPRequestHandler):
             pass
         except Exception:
             try:
+                # R21 P3: self.path 含查询串, 调用方走 ?token=<secret> 认证且命中
+                # 未预期异常时会把凭据原文写进 journal(含完整 traceback)。记录前
+                # 掩码查询串中的 token 值, 保留路径与其余查询参数便于定位(与
+                # _presented_api_token 从 ?token= 取凭据的口径一致)。
+                _p = re.sub(r'([?&])token=[^&]*', r'\1token=***', self.path)
                 logging.getLogger("ebpdns.api").exception(
-                    "API 处理未预期异常, 已回 500: %s %s", self.command, self.path)
+                    "API 处理未预期异常, 已回 500: %s %s", self.command, _p)
             except Exception:
                 pass
             try:
@@ -1094,7 +1147,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return _hit
             ok = False
             try:
-                _infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+                # R22 P3: 模块仅 `import socket as _socket`, 此处裸用 socket.* 恒抛
+                # NameError 被下方 except 吞成 ok=False, FQDN 解析分支成死代码。改用别名。
+                _infos = _socket.getaddrinfo(h, None, proto=_socket.IPPROTO_TCP)
                 _ips = []
                 for _f, _t, _p, _c, _sa in _infos:
                     try:
@@ -1224,6 +1279,33 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return self._bound_to_loopback()
 
+    def _presented_api_token(self):
+        """从请求中提取 presented API token(已 strip), 依次尝试:
+        Authorization: Bearer <tok> → X-Api-Key: <tok> → ?token=<tok>(查询串第一个值)。
+        读/写两条认证门控(_check_api_token 与 _token_authenticated)共用本函数,
+        保证 README 承诺的 ?token= 在两条路径口径一致: 此前只在 _check_api_token
+        (读路由)里读查询串, _token_authenticated(_csrf_ok 写门控)不读, 导致
+        api.host=LAN + 已配 token 时 curl 仅用 ?token=xxx 写操作在到达
+        _check_api_token 之前就被 _csrf_ok 403。提取失败统一返回空串。"""
+        presented = ""
+        auth = self.headers.get("Authorization", "") or ""
+        if auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+        if not presented:
+            presented = (self.headers.get("X-Api-Key", "") or "").strip()
+        if not presented:
+            # README:135/240/249/253 把 `?token=<token>` 列为与 Bearer/X-Api-Key 等价的
+            # 第三种认证方式。与 Bearer 相同的 strip/常量时间比较语义, 取第一个值。
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query,
+                                           keep_blank_values=False)
+                _qt = qs.get("token") or []
+                if _qt:
+                    presented = str(_qt[0]).strip()
+            except Exception:
+                presented = ""
+        return presented
+
     def _token_authenticated(self):
         """请求是否凭有效 token 通过认证。未配置 token 时返回 False(与
         _check_api_token 的'未启用即放行'不同, 此处必须区分是否真的持凭据)。"""
@@ -1231,12 +1313,7 @@ class _Handler(BaseHTTPRequestHandler):
         expected = str(api_cfg.get("token") or "").strip()
         if not expected:
             return False
-        presented = ""
-        auth = self.headers.get("Authorization", "") or ""
-        if auth.lower().startswith("bearer "):
-            presented = auth[7:].strip()
-        if not presented:
-            presented = (self.headers.get("X-Api-Key", "") or "").strip()
+        presented = self._presented_api_token()
         if not presented:
             return False
         return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
@@ -1267,8 +1344,8 @@ class _Handler(BaseHTTPRequestHandler):
             return False
 
     def _check_api_token(self):
-        """P2-24: 可选 API token 认证。配置了 api.token(非空)时, 校验请求头
-        Authorization: Bearer <token> 或 X-Api-Key: <token>。使用 hmac.compare_digest
+        """P2-24: 可选 API token 认证。配置了 api.token(非空)时, 校验请求中提供的
+        token(Authorization: Bearer / X-Api-Key / ?token=, 三者等价)。使用 hmac.compare_digest
         常量时间比较防时序攻击。返回 True=放行, False=未授权(调用方回 401)。
         未配置 token(空串)时始终放行。"""
         api_cfg = self.app.cfg.get("api", {}) or {}
@@ -1277,26 +1354,9 @@ class _Handler(BaseHTTPRequestHandler):
         expected = str(api_cfg.get("token") or "").strip()
         if not expected:
             return True   # 未启用认证
-        # 取 Authorization: Bearer xxx 或 X-Api-Key: xxx
-        presented = ""
-        auth = self.headers.get("Authorization", "") or ""
-        if auth.lower().startswith("bearer "):
-            presented = auth[7:].strip()
-        if not presented:
-            presented = (self.headers.get("X-Api-Key", "") or "").strip()
-        if not presented:
-            # R-fix: README 与配置表把 `?token=<token>` 列为与 Bearer/X-Api-Key 等价的
-            # 第三种认证方式(README:135/240/249/253), 但代码从不读查询串 —— 按文档
-            # 照抄 curl 的用户一律拿到 401。此处补齐该途径(取第一个值, 保持与
-            # Bearer 相同的 strip/常量时间比较语义)。
-            try:
-                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query,
-                                           keep_blank_values=False)
-                _qt = qs.get("token") or []
-                if _qt:
-                    presented = str(_qt[0]).strip()
-            except Exception:
-                presented = ""
+        # R17 P2-2: presented 提取(Bearer/X-Api-Key/?token=)下沉到 _presented_api_token,
+        # 与 _token_authenticated(_csrf_ok 写门控)共用, 保证读/写两条路径口径一致。
+        presented = self._presented_api_token()
         if not presented:
             return False
         # P2-1(R5): hmac.compare_digest 对 str 形式要求两端均为 ASCII-only, 任一含
@@ -1355,7 +1415,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return ""
 
         def _trusted_host(h):
-            """host 是否可信: 回环 / 等于配置 api.host / 可信本地名字 / 私网 IP。"""
+            """host 是否可信: 回环 / 等于配置 api.host / 可信本地名字 / 私网 IP。
+
+            R17 P3-3(记录在案, 非新回归): 命中 .local/.lan/.home/.internal/.intranet/
+            .localdomain 后缀或无点短名的主机名, 此处**不做 DNS 解析即信任**。这与既有
+            _csrf_ok 的 _is_private_or_loopback_ip LAN 信任模型完全同型——写操作早已如此,
+            本轮读端点 _origin_ok 只是与之对齐。在 api.host=0.0.0.0 的 LAN 模式下,
+            攻击者若控制一个 *.lan 名字并经 DNS rebinding 指向本服务(Origin 与 Host 同为
+            evil.lan:8080), 读端点会放行; 这是被接受的 LAN 信任边界, 环回绑定(默认)
+            不受影响。若未来要加固, 可对后缀命中的 FQDN 追加 getaddrinfo 并要求全为私网
+            地址, 但会引入性能/缓存复杂度, 本轮按设计保留。"""
             if not h:
                 return False
             if h == "localhost":
@@ -1533,7 +1602,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict) or body.get("confirm") is not True:
                 return self._send(400, {"error": "需要请求体 {\"confirm\": true} 确认清空遥测与缓存"})
             self.app.telemetry.reset()
-            self.app.resolver.cache.clear()
+            # 问题2: 对称清理——resolver.reset_runtime_state() 同时清空用户态缓存、
+            # eBPF 内核 map(复用 _ebpf_clear, inactive/无 loader 安全 no-op)与熔断器
+            # 内部状态。原仅 cache.clear() 导致 kernel_direct=true 时内核仍按旧答案
+            # XDP 直答到 TTL, 且 telemetry 清零后熔断开启态残留、状态不自洽。
+            self.app.resolver.reset_runtime_state()
             return self._send(200, {"ok": True})
         if path == "/api/reprobe" and method == "POST":
             return self._api_reprobe()
@@ -1555,6 +1628,57 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     # ---------- handlers ----------
+    # ---------- eBPF 内核态缓存状态(v1.9.158) ----------
+    def _ebpf_status_dict(self):
+        """组装 /api/status|snapshot 的 ebpf 子对象。
+
+        BpfLoader 由 cli/resolver 侧在 cfg.kernel_cache=True 时构造并挂到
+        app_ctx._bpf(bpf_loader.py 由其他代理实现)。这里用 getattr 安全读取:
+        loader 不存在(默认 kernel_cache=False)/未激活/status()/get_counters()
+        抛错, 一律降级为 active=false + 零计数, 绝不因 eBPF 模块异常打断
+        /api/status 主响应。字段契约(设计文档第 6 节):
+          {active, iface, reason, max_entries, counters{total,hit,miss,kernel_direct}}
+        """
+        fallback = {
+            "active": False,
+            "iface": "",
+            "reason": "未启用",
+            "max_entries": 0,
+            "counters": {"total": 0, "hit": 0, "miss": 0, "kernel_direct": 0},
+        }
+        loader = getattr(self.app, "_bpf", None)
+        try:
+            if loader is not None and getattr(loader, "active", False):
+                st = loader.status() or {}
+                ct = loader.get_counters() or {}
+                return {
+                    "active": True,
+                    "iface": str(st.get("iface", "") or ""),
+                    "reason": str(st.get("reason", "") or ""),
+                    "max_entries": int(st.get("max_entries", 0) or 0),
+                    "counters": {
+                        "total": int(ct.get("total", 0) or 0),
+                        "hit": int(ct.get("hit", 0) or 0),
+                        "miss": int(ct.get("miss", 0) or 0),
+                        "kernel_direct": int(ct.get("kernel_direct", 0) or 0),
+                    },
+                }
+            # loader 存在但未激活(降级): 显示具体降级原因, 便于 Web 控制台排查
+            if loader is not None:
+                st = loader.status() or {}
+                _reason = str(st.get("reason", "") or "") or "未启用"
+                return {
+                    "active": False,
+                    "iface": str(st.get("iface", "") or ""),
+                    "reason": _reason,
+                    "max_entries": int(st.get("max_entries", 0) or 0),
+                    "counters": {"total": 0, "hit": 0, "miss": 0, "kernel_direct": 0},
+                }
+        except Exception:
+            # eBPF loader 状态读取失败不阻断 status 主响应(与 cache.summary 同型防御)
+            log.exception("读取 eBPF loader 状态失败, 降级为未启用")
+        return fallback
+
     def _status(self):
         app = self.app
         tel = app.telemetry
@@ -1602,6 +1726,9 @@ class _Handler(BaseHTTPRequestHandler):
             "endpoints": app.dns_server.endpoints() if app.dns_server else None,
             # #6 UDP 池满丢弃计数(udp4+udp6), 前端遥测页展示
             "udp_dropped": app.dns_server.udp_dropped() if app.dns_server else 0,
+            # v1.9.158: eBPF 内核态缓存状态(设计文档第 6 节)。loader 未挂载时
+            # 返回 active=false + 零计数降级字典, 前端据此显示"未启用"徽章。
+            "ebpf": self._ebpf_status_dict(),
         }
 
     def _snapshot(self):
@@ -1636,6 +1763,8 @@ class _Handler(BaseHTTPRequestHandler):
             "ipv4_first": cfg.get("ipv4_first"),
             "percpu": cfg.get("percpu"),
         }
+        # v1.9.158: 与 /api/status 同步 ebpf 子对象(设计文档第 6 节: snapshot 同步加 ebpf 字段)
+        s["ebpf"] = self._ebpf_status_dict()
         return s
 
     def _api_query(self):
@@ -1887,6 +2016,17 @@ class _Handler(BaseHTTPRequestHandler):
                 _bs_ok = _bp is not None and 1 <= _bp["port"] <= 65535
             if not _bs_ok:
                 return "bad bootstrap_dns: 必须是 host:port (got %r)" % (_bs,)
+        # v1.9.158: kernel_cache_iface 必须是非空字符串(网卡名或 "auto")。
+        # 与 config._validate_cfg 加载期校验双入口对齐: 加载期非法回退默认 "auto",
+        # 此 API 写入路径对非法值直接 400 拒绝(与 health_probe_domain/bootstrap_dns 同型)。
+        # kernel_cache(bool) 与 kernel_cache_max(int 范围) 已由上方 _BOOL_KEYS /
+        # _NUM_RANGES 循环自动归一校验, 无需在此重复。
+        if "kernel_cache_iface" in data:
+            _kif = data["kernel_cache_iface"]
+            if not isinstance(_kif, str) or not _kif.strip():
+                return ("bad kernel_cache_iface: 必须是非空字符串(网卡名或 auto) "
+                        "(got %r)" % (_kif,))
+            data["kernel_cache_iface"] = _kif.strip()
         for k, allowed in config_mod._ENUM_VALUES.items():
             if k not in data:
                 continue
@@ -2054,7 +2194,6 @@ class _Handler(BaseHTTPRequestHandler):
         # P1-4/P1-6: 在锁外初始化保存/索引重建状态, 供锁后判断回 500
         saved = None
         idx_ok = True
-        idx_err = ""
         saved_rules_ok = True   # R2-P1: bool 成功/失败, True=本次无 rules 需保存或已成功
         policy_warn = None      # R3 P3-1: 缓存策略切换失败原因, 随响应透出(用户可感知)
         derived_changed = []    # R4 P2: 派生态刷新结果(ECS/stale_window/分区/bufsize), 随响应透出
@@ -2335,9 +2474,9 @@ class _Handler(BaseHTTPRequestHandler):
         # R3 P3-3: 与上方 gen 递增同条件 —— 无 rules 回传时磁盘规则未变, 跳过 rebuild。
         # (rules 写盘失败也跳过: 磁盘仍是旧规则, 全量重建是无意义 I/O。)
         if isinstance(data_rules, list) and saved_rules_ok:
-            idx_ok, idx_err = self._rebuild_rule_index_outside_lock()
+            idx_ok, _ = self._rebuild_rule_index_outside_lock()
         else:
-            idx_ok, idx_err = True, ""
+            idx_ok, _ = True, ""
         # 新增上游自动实测延迟: 只测启用且未实测过的上游(新添加的), 后台线程不阻塞响应
         try:
             from . import probe
@@ -2353,6 +2492,16 @@ class _Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_probe, daemon=True, name="newup-probe").start()
         except Exception:
             pass
+        # v1.9.158: eBPF 内核态缓存运行态重建。save_config 已成功、内存与磁盘一致后,
+        # 按新旧 kernel_cache/iface/max 差异在线卸载/加载/重建 BpfLoader(此前仅启动期
+        # _boot_ebpf 加载, 运行态开关需重启才生效且 status 误导为"未启用")。全程 best-effort:
+        # 任何异常只 WARNING, 不阻断配置保存响应; 无 CAP_BPF 时 loader 挂 app_ctx 显示降级
+        # reason 但 resolver._bpf=None(不回写)。old_cfg 为锁内 deep_merge 前的旧配置引用。
+        try:
+            from .cli import reconfigure_ebpf
+            reconfigure_ebpf(old_cfg, self.app.cfg, self.app)
+        except Exception as e:
+            log.warning("eBPF 运行态重配置钩子异常(忽略, 配置已保存): %r", e)
         # R26 P2-1 / P2-1(R1): save_config 写盘失败 500 兜底已上移进锁内、stale_victims
         # 清理循环之前, 并在失败时回滚内存(见上方 with self.app._lock 内)。能走到这里
         # 说明 save 已成功、内存与磁盘一致。
@@ -2506,7 +2655,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "port 不允许是布尔值"})
                 try:
                     _bpv = int(_bp)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return self._send(400, {"error": "port 必须是整数"})
                 if not (1 <= _bpv <= 65535):
                     return self._send(400, {"error": "port 必须在 1-65535 之间 (got %d)" % _bpv})
@@ -2584,7 +2733,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "port/latency 不能是布尔值"})
             port = int(_pv) if _pv is not None else _default_port.get(proto, 53)
             int(_lv or 20)  # 仅校验合法性; 新上游延迟统一 0=待后台实测写回
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return self._send(400, {"error": "port/latency 必须是整数"})
         if not (1 <= port <= 65535):
             return self._send(400, {"error": "port 必须在 1-65535 之间 (got %d)" % port})
@@ -2739,7 +2888,7 @@ class _Handler(BaseHTTPRequestHandler):
                         return self._send(400, {"error": "%s 不允许是布尔值" % k})
                     try:
                         v = int(v)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         return self._send(400, {"error": "%s 必须是整数" % k})
                 # R18 P3-5: weight 与 bulk _validate_upstream_dict 对齐——允许 int/float
                 # (weight 用于加权轮询, float 有意义), 排除 bool, 不再强制 int 转换。
@@ -2766,7 +2915,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # R-review P-low: 兜底 True(安全方向)——畸形值("maybe"/[])解析失败时
                 # 保持严格证书校验, 与运行时 upstream.py up.get(..., True) 缺省一致;
                 # 显式传畸形值不应比不传更不安全。
-                if k in ("doh_strict_cert", "dot_strict_cert"):
+                # R17 P3-1: doq/doh3 与 doh/dot 同型, 此前漏归一致使字符串 "false"
+                # 原样落库, 与 bulk/POST 路径漂移。补齐。
+                if k in ("doh_strict_cert", "dot_strict_cert",
+                         "doq_strict_cert", "doh3_strict_cert"):
                     v = _as_bool(v, True)
                 if k == "proto" and str(v).lower() not in _ALLOWED_UPSTREAM_PROTO:
                     return self._send(400, {"error": "proto 必须是 %s 之一" % "/".join(sorted(_ALLOWED_UPSTREAM_PROTO))})
@@ -2941,6 +3093,25 @@ class _Handler(BaseHTTPRequestHandler):
             # 内网 IP, 可安全透出给调用方说明被拒原因; 其它异常(网络/socket/磁盘)
             # 含内部细节, 只记日志并回通用文案。
             return 400, {"error": str(e)}
+        except urllib.error.HTTPError as e:
+            # v1.9.154: 订阅 URL 返回 HTTP 错误(404/403/500 等)属预期业务错误,
+            # 记简洁警告不输出 Traceback(此前 log.exception 会把完整栈泄漏到日志,
+            # 业务返回仍为通用 400, 不影响调用方)
+            log.warning("订阅下载失败(HTTP %s): %s", e.code, url)
+            return 400, {"error": "订阅下载失败"}
+        except urllib.error.URLError as e:
+            # v1.9.155: 连接拒绝/超时/DNS 失败等预期网络错误, 同属日志卫生范畴,
+            # 记简洁警告不输出 Traceback(URLError 是 HTTPError 父类, 须在其后捕获)
+            log.warning("订阅下载失败(%s): %s", e.reason, url)
+            return 400, {"error": "订阅下载失败"}
+        except (http.client.RemoteDisconnected, ConnectionError, OSError) as e:
+            # v1.9.158: 远端在返回状态行前直接断连(http.client.RemoteDisconnected)、
+            # ConnectionResetError/ConnectionAbortedError 等低层网络错误, 不经 urllib
+            # 包装、不是 URLError 子类, 此前穿透下方 log.exception 打完整 Traceback。
+            # URLError 是 OSError 子类, 已在上方先捕获; 此处兜住其余网络层异常, 与
+            # HTTPError/URLError 同型: 只记简洁警告不打栈, 业务仍回通用 400。
+            log.warning("订阅下载失败(连接中断): %s: %s", e, url)
+            return 400, {"error": "订阅下载失败"}
         except Exception:
             log.exception("订阅下载失败: %s", url)
             return 400, {"error": "订阅下载失败"}
@@ -3002,7 +3173,7 @@ class _Handler(BaseHTTPRequestHandler):
                         _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
                                     "的一致性(详情见服务端日志)")
                         log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
-                except Exception as e:
+                except Exception:
                     _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
                     log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
                 if existed and old_meta_entry is not None:
@@ -3089,8 +3260,6 @@ class _Handler(BaseHTTPRequestHandler):
         if rerr:
             return self._send(400, {"error": rerr})
         # 规则级 TTL 透传(可选): 命中规则时覆盖全局 ttl_min/ttl_max
-        ttl_min = body.get("ttl_min")
-        ttl_max = body.get("ttl_max")
         for k in ("ttl_min", "ttl_max"):
             v = body.get(k)
             if v is not None and v != "":
@@ -3100,7 +3269,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "%s 必须是非负整数，不能是布尔值" % k})
                 try:
                     r[k] = max(0, int(v))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     # v7 P3-3: 此前非法值静默丢弃(pass), 与 PUT 路径(返回 400)不一致,
                     # 手构造 body 可注入 "abc"/null 类值而不报错。对齐 PUT 路径返回 400。
                     return self._send(400, {"error": "%s 必须是非负整数" % k})
@@ -3317,6 +3486,20 @@ class _Handler(BaseHTTPRequestHandler):
             # v1.9.146 P1-2: 策略性拒绝(仅 https/SSRF/上限)为安全常量文案, 透出;
             # 其它异常含内部网络/socket 细节, 只记日志回通用文案。
             return self._send(400, {"error": str(e)})
+        except urllib.error.HTTPError as e:
+            # v1.9.155: 与 _do_subscribe_download 同口径, HTTP 错误记简洁警告不打栈
+            log.warning("订阅更新下载失败(HTTP %s): %s", e.code, url)
+            return self._send(400, {"error": "订阅更新失败"})
+        except urllib.error.URLError as e:
+            # v1.9.155: 连接拒绝/超时/DNS 失败等预期网络错误, 记简洁警告不打栈
+            log.warning("订阅更新下载失败(%s): %s", e.reason, url)
+            return self._send(400, {"error": "订阅更新失败"})
+        except (http.client.RemoteDisconnected, ConnectionError, OSError) as e:
+            # v1.9.158: 与 _do_subscribe_download 同型: 远端断连(RemoteDisconnected)等
+            # 低层网络错误不经 urllib 包装、非 URLError 子类, 此前穿透打完整 Traceback。
+            # URLError 已是 OSError 子类且在上方先捕获, 此处兜住其余网络层异常, 仅 WARNING。
+            log.warning("订阅更新下载失败(连接中断): %s: %s", e, url)
+            return self._send(400, {"error": "订阅更新失败"})
         except Exception:
             log.exception("订阅更新下载失败: %s", url)
             return self._send(400, {"error": "订阅更新失败"})
@@ -3359,7 +3542,7 @@ class _Handler(BaseHTTPRequestHandler):
                         _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
                                     "的一致性(详情见服务端日志)")
                         log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
-                except Exception as e:
+                except Exception:
                     _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
                     log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
                 if old_meta_entry is not None:
@@ -3419,7 +3602,7 @@ class _Handler(BaseHTTPRequestHandler):
                         _rb_warn = ("回滚 rules_sub.json 写盘失败, 请人工核对其与 config.json "
                                     "的一致性(详情见服务端日志)")
                         log.error("回滚 rules_sub.json 写盘失败(明细/元信息可能错位): %s", _rb_err)
-                except Exception as e:
+                except Exception:
                     _rb_warn = ("回滚 rules_sub.json 异常, 请人工核对其与 config.json 的一致性(详情见服务端日志)")
                     log.error("回滚 rules_sub.json 异常(明细/元信息可能错位)", exc_info=True)
                 cfg["rule_subscriptions"] = old_meta
@@ -3517,7 +3700,7 @@ class _Handler(BaseHTTPRequestHandler):
                             return self._send(400, {"error": "%s 必须是非负整数，不能是布尔值" % k})
                         try:
                             v = max(0, int(v))
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError, OverflowError):
                             return self._send(400, {"error": "%s 必须是非负整数" % k})
                     if k == "match" and not str(v).strip():
                         return self._send(400, {"error": "match 不能为空"})
@@ -3732,6 +3915,28 @@ class _Handler(BaseHTTPRequestHandler):
             "# HELP ebpdns_kernel_direct_total 内核/eBPF 直通应答数",
             "# TYPE ebpdns_kernel_direct_total counter",
             "ebpdns_kernel_direct_total %d" % c.get("kernel_direct", 0),
+            # v1.9.158: eBPF 内核态缓存指标(设计文档第 6 节)。ebpf_active 为 gauge
+            # (0/1 开关态), 其余 4 个为累计 counter。loader 未挂载时全部导出 0,
+            # 保证 Prometheus 抓取不因指标缺失而告警, 默认部署即可 scrape。
+        ]
+        _ebpf = self._ebpf_status_dict()
+        _ebpf_ct = _ebpf.get("counters", {})
+        lines += [
+            "# HELP ebpdns_ebpf_active eBPF 内核态缓存是否已加载(1=已启用 0=未启用)",
+            "# TYPE ebpdns_ebpf_active gauge",
+            "ebpdns_ebpf_active %d" % (1 if _ebpf.get("active") else 0),
+            "# HELP ebpdns_ebpf_total eBPF 内核态缓存累计查询数",
+            "# TYPE ebpdns_ebpf_total counter",
+            "ebpdns_ebpf_total %d" % int(_ebpf_ct.get("total", 0) or 0),
+            "# HELP ebpdns_ebpf_hit eBPF 内核态缓存命中数",
+            "# TYPE ebpdns_ebpf_hit counter",
+            "ebpdns_ebpf_hit %d" % int(_ebpf_ct.get("hit", 0) or 0),
+            "# HELP ebpdns_ebpf_miss eBPF 内核态缓存未命中数(转交用户态)",
+            "# TYPE ebpdns_ebpf_miss counter",
+            "ebpdns_ebpf_miss %d" % int(_ebpf_ct.get("miss", 0) or 0),
+            "# HELP ebpdns_ebpf_kernel_direct eBPF 内核态直答数(XDP_TX, 不进用户态)",
+            "# TYPE ebpdns_ebpf_kernel_direct counter",
+            "ebpdns_ebpf_kernel_direct %d" % int(_ebpf_ct.get("kernel_direct", 0) or 0),
             "# HELP ebpdns_ipv4_fallback_total IPv6 无连通性回退 IPv4 数",
             "# TYPE ebpdns_ipv4_fallback_total counter",
             "ebpdns_ipv4_fallback_total %d" % c.get("ipv4_fallback", 0),
@@ -3838,10 +4043,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Expires", "0")
         # R2-P2-1 / R2-P3-2: 与 _send() 对齐的安全响应头(静态首页/JS 直接由这里下发,
         # 不经过 _send, 必须单独补)。X-Frame-Options: DENY 真正闭合点击劫持。
+        # Content-Security-Policy 完整指令由响应头投递(frame-ancestors 在 meta 中无效,
+        # 必须走响应头); 与 index.html meta 中剩余指令一致, 双重生效取交集。
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "font-src 'self'; connect-src 'self'; object-src 'none'; "
+                         "base-uri 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
+        # R17 P3-2: do_HEAD 置 _head_only=True 后走 GET 路由, 静态资源(_serve_static)此前
+        # 无条件写 body, 导致 HEAD /、/echarts.min.js、/favicon.svg 多传 ~1MB 字节。
+        # 与 _send()行为对齐: Content-Length 已在上头发送, HEAD 只回首部不写 body, 符合 RFC 7231。
+        # 错误分支(403/404/413)走 _send(), 已自带 _head_only 检查, 无需在此重复。
+        if getattr(self, "_head_only", False):
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, OSError):
@@ -3911,6 +4129,27 @@ class APIServer(ThreadingHTTPServer):
         if _host not in ("127.0.0.1", "::1", "localhost"):
             log.warning("API 绑定非回环地址 %s —— 局域网/公网主机可访问写接口, 请确保网络隔离", host)
 
+    # 资源耗尽限流: OS 线程/MEM 耗尽时 t.start() 抛 RuntimeError, 极端风暴下
+    # 若每连接都打 WARNING 会刷屏。5s 窗口合并, 仅打一行并计数静默丢弃数。
+    _thread_exh_lock = threading.Lock()
+    _thread_exh_last = 0.0
+    _thread_exh_suppressed = 0
+
+    @classmethod
+    def _log_thread_exhausted(cls, client_address):
+        now = time.monotonic()
+        with cls._thread_exh_lock:
+            if now - cls._thread_exh_last >= 5.0:
+                extra = f" (另静默丢弃 {cls._thread_exh_suppressed} 条)" if cls._thread_exh_suppressed else ""
+                try:
+                    log.warning("连接线程资源不足, 拒绝新连接: %s%s", client_address, extra)
+                except Exception:
+                    pass
+                cls._thread_exh_last = now
+                cls._thread_exh_suppressed = 0
+            else:
+                cls._thread_exh_suppressed += 1
+
     def process_request(self, request, client_address):
         self._conn_slots.acquire()
         try:
@@ -3923,6 +4162,21 @@ class APIServer(ThreadingHTTPServer):
             except Exception:
                 pass
             super().process_request(request, client_address)
+        except RuntimeError as e:
+            # P3 0-Traceback 验收: ThreadingMixIn.process_request 内部 t.start() 在
+            # OS 线程/MEM 资源耗尽时抛 RuntimeError("can't start new thread")。
+            # 严格只吞这一类资源耗尽异常: 关断该新连接(尽力而为)、归还信号量、
+            # 打单行限流 WARNING, 不 re-raise(避免 socketserver.handle_error 打 traceback),
+            # 不影响已建立连接与服务进程。其他 RuntimeError(编程 bug)继续抛出。
+            if "can't start new thread" not in str(e):
+                self._conn_slots.release()
+                raise
+            self._conn_slots.release()
+            try:
+                request.close()
+            except Exception:
+                pass
+            self._log_thread_exhausted(client_address)
         except Exception:
             self._conn_slots.release()
             raise
