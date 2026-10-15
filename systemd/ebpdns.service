@@ -1,5 +1,5 @@
 [Unit]
-Description=ebpdns local recursive DNS (Rust v2.1.17)
+Description=ebpdns local recursive DNS (Rust v2.1.18)
 Documentation=https://github.com/ebpdns/ebpdns
 After=network-online.target
 Wants=network-online.target

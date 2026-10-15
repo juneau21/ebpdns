@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ebpdns v2.1.17 安装脚本（Rust 版；以 Python v1.9.162 为行为参照）
+# ebpdns v2.1.18 安装脚本（Rust 版；以 Python v1.9.162 为行为参照）
 # 用法：
 #   sudo ./install.sh            # 安装并 enable（不自动 start）
 #   sudo ./install.sh start      # 安装、enable 并立即 start
@@ -42,11 +42,11 @@ preflight_layout() {
   err ""
   err "正确做法二选一："
   err "  1) 用预编译包（推荐）："
-  err "       tar xzf ebpdns-2.1.17-prod.tar.gz && cd ebpdns-2.1.17 && sudo ./install.sh start"
+  err "       tar xzf ebpdns-2.1.18-prod.tar.gz && cd ebpdns-2.1.18 && sudo ./install.sh start"
   err "  2) 从源码树构建并打包（源码树里本来就没有 bin/ebpdns）："
   err "       make wasm && cargo build --release --bin ebpdns --features embed-frontend"
   err "       ./scripts/make_packages.sh      # 生成 dist/ebpdns-*-prod.tar.gz"
-  err "       tar xzf <生成的 prod 包> && cd ebpdns-2.1.17 && sudo ./install.sh start"
+  err "       tar xzf <生成的 prod 包> && cd ebpdns-2.1.18 && sudo ./install.sh start"
   err ""
   err "（若确实只想在源码树里装：install -m0755 target/release/ebpdns /usr/local/bin/ebpdns）"
   exit 2
@@ -59,7 +59,8 @@ require_root() {
   fi
 }
 
-# **2.1.17（修复项 1③）**：安装前调用 `ebpdns check-config` 预检待安装的配置。
+# **2.1.17（修复项 1③）/ 2.1.18（修复项 1①）**：安装前调用 `ebpdns check-config`
+# 预检待安装的配置。
 #
 # 为什么需要它：2.1.16 的 `check-config` 子命令已经能给出**类型 / 范围 / 枚举 /
 # 未知键 / config_version 过高**的诊断，但**没有任何调用点** —— 安装脚本直接把包内
@@ -76,19 +77,70 @@ require_root() {
 #      硬阻断会把"能装但配置有警告"变成"完全装不了"。
 #   因此：**显著 WARN + 打印原始诊断 + 给出修法与开关**，把决定权交给运维；
 #   需要 CI/生产强一致时用 `--strict-config` 让它变成硬门（退出码 2）。
+#
+# **2.1.18（修复项 1①）：不得因"包内二进制缺少执行位"而静默跳过。**
+#
+# 用户实测的缺陷：从 Windows/非 Unix 环境解包（zip、Windows 资源管理器、
+# `python -m tarfile`、某些 SFTP 客户端）后 `bin/ebpdns` **没有执行位**，
+# 于是 2.1.17 的实现走到 `[ ! -x "$bin_src" ]` 分支、只打一句
+# `[warn] 跳过 check-config 预检` —— 预检**静默失效**，而安装本身照样成功，
+# 运维会以为"配置已经检查过了"。
+# 现在：
+#   - `bin/ebpdns` 存在但不可执行 ⇒ **`install -m 0755` 到临时路径后照常预检**
+#     （明确打印"已用临时副本预检"），临时副本用完即删；
+#   - 只有当**根本没有**可用的二进制时才算"跳过"，并且**必须**打印：
+#     ① 跳过原因、② 补救命令（`chmod +x bin/ebpdns install.sh`）、
+#     ③ 这次安装少了哪一道检查。
+# 另：`--migrate-config` / `--adopt-new-defaults` 两条补救路径也在这里提示。
 preflight_config() {
   local bin_src conf strict=0
   bin_src="$(cd "$(dirname "$0")" && pwd)/bin/ebpdns"
   conf="$(dirname "$0")/etc/ebpdns/config.json"
   [ "${STRICT_CONFIG:-0}" = "1" ] && strict=1
   [ -f "$conf" ] || return 0
-  if [ ! -x "$bin_src" ]; then
-    warn "跳过 check-config 预检（未找到可执行的 $bin_src）"
+  if [ ! -f "$bin_src" ]; then
+    warn "跳过 check-config 预检：包内**没有** $bin_src"
+    warn "  少做的检查：配置文件的类型 / 范围 / 枚举 / 未知键 / config_version 校验。"
+    warn "  补救：确认包完整（prod 包应含 bin/ebpdns）；或安装后手工执行"
+    warn "        /usr/local/bin/ebpdns check-config --config $conf"
     return 0
   fi
+  # 组装"可执行的包内二进制"：直接可用就用它；不可执行（跨平台解包丢执行位）
+  # 就复制一份 0755 的临时副本 —— **不修改包内文件**（包可能只读/已签名）。
+  local exec_bin="$bin_src" tmpdir="" used_tmp=0
+  if [ ! -x "$bin_src" ]; then
+    if tmpdir="$(mktemp -d 2>/dev/null)"; then
+      if install -m 0755 "$bin_src" "$tmpdir/ebpdns" 2>/dev/null; then
+        exec_bin="$tmpdir/ebpdns"
+        used_tmp=1
+        warn "包内二进制缺少执行位（$bin_src）—— 典型的**跨平台解包丢权限**"
+        warn "  已用临时副本预检（install -m 0755 → $exec_bin），安装行为不变"
+        warn "  建议修复包内权限（否则手工执行 bin/ebpdns 仍会失败）："
+        warn "      chmod +x bin/ebpdns install.sh"
+        warn "      # 或重新用 Linux tar 解包：tar -xzf ebpdns-*-prod.tar.gz"
+      else
+        rmdir "$tmpdir" 2>/dev/null || true
+        tmpdir=""
+      fi
+    fi
+    if [ "$used_tmp" = "0" ]; then
+      err "════════════════════════════════════════════════════════════════"
+      err "⚠️  跳过 check-config 预检：$bin_src 不可执行，且无法创建临时副本"
+      err "════════════════════════════════════════════════════════════════"
+      err "原因：跨平台解包（Windows/zip/SFTP 客户端）会丢失执行位。"
+      err "补救（任一即可）："
+      err "  1) chmod +x bin/ebpdns install.sh     # 就地修复后重跑本脚本"
+      err "  2) tar -xzf ebpdns-*-prod.tar.gz      # 用 Linux tar 重新解包"
+      err "本次安装**少做了**配置预检（类型/范围/枚举/未知键/config_version）——"
+      err "请安装后手工复核：/usr/local/bin/ebpdns check-config --config $conf"
+      return 0
+    fi
+  fi
+
   local out rc
   # 用包内二进制校验包内配置（发布前一致性），失败不因 set -e 中断。
-  out="$("$bin_src" check-config --config "$conf" 2>&1)" && rc=0 || rc=$?
+  out="$("$exec_bin" check-config --config "$conf" 2>&1)" && rc=0 || rc=$?
+  [ "$used_tmp" = "1" ] && rm -rf "$tmpdir"
   if [ "$rc" -eq 0 ]; then
     # 退出码 0 仍可能有 WARN（未知键 / 缺 config_version）→ 原样打印，别吞掉。
     case "$out" in
@@ -119,6 +171,129 @@ preflight_config() {
   return 0
 }
 
+# **2.1.18（修复项 1②）**：目标配置已存在时的**迁移/校验提示**。
+#
+# 2.1.17 的缺陷：保留已有配置时只打一句
+# `[warn] 已存在 /etc/ebpdns/config.json，保留不覆盖。` —— 既不说这份配置**能不能用**，
+# 也不说它**缺了本版本新增的哪些键**（旧配置缺键时，ebpdns 会按内置默认值运行，
+# 页面上的开关/字段可能与 config.json 不一致，运维无从发现）。
+#
+# 现在打印三件事（判据全部来自**已安装的二进制**，不依赖脚本自己维护键表）：
+#   ① `check-config` 对该文件的结果（0 / 2 + 逐条诊断）；
+#   ② 缺失的顶层键**个数与名字**（= `default_config()` 键集差集，由
+#      `ebpdns migrate-config --dry-run` 计算）；
+#   ③ 两条可采用的新旗标：
+#      - `--migrate-config`：**只做加法**补齐缺失键（写前备份 `config.json.bak.<ts>`）；
+#      - `--adopt-new-defaults`：用包内模板**覆盖**（同样先备份，会丢本地改动）。
+inspect_existing_config() {
+  local bin_dst="$1" conf="$2"
+  warn "已存在 $conf，保留不覆盖（本地改动不会被冲掉）。"
+  warn "  ① 用**已安装的二进制**复核这份配置："
+  local out rc
+  out="$("$bin_dst" check-config --config "$conf" 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out" | sed 's/^/      /' >&2
+  if [ "$rc" -ne 0 ]; then
+    warn "      ⇒ check-config 退出码 $rc（配置**未通过**校验，见上面逐条 ERROR）"
+  else
+    warn "      ⇒ check-config 退出码 0（通过；WARN 只提示不阻断）"
+  fi
+  warn "  ② 与包内默认键集的差集（缺失键会让服务按内置默认值运行）："
+  local mig
+  mig="$("$bin_dst" migrate-config --config "$conf" --dry-run 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$mig" | grep -E '^MIGRATE-SUMMARY|^MIGRATE:' | sed 's/^/      /' >&2 || true
+  case "$mig" in
+    *"missing_keys: 0"*)
+      warn "      ⇒ 该配置已含本版本全部顶层键，**无需迁移**。" ;;
+    *)
+      warn "      ⇒ 存在缺失键：可**只做加法**补齐（写前自动备份）："
+      warn "           sudo $0 --migrate-config"
+      warn "         或先用包内模板**整体覆盖**（同样先备份，会丢本地改动）："
+      warn "           sudo $0 --adopt-new-defaults"
+      warn "         也可只预览不改动：$bin_dst migrate-config --config $conf --dry-run" ;;
+  esac
+  warn "  ③ 语义与退出码见 README「安装与升级」/ PACKAGING 文档。"
+}
+
+# **2.1.18（修复项 1②）**：`--migrate-config` —— 只做加法补齐缺失键（写前备份）。
+apply_migrate_config() {
+  local bin_dst="$1" conf="$2"
+  log "--migrate-config：对 $conf 执行**只做加法**的键补齐（写前备份）……"
+  local out rc
+  out="$("$bin_dst" migrate-config --config "$conf" 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  case "$rc" in
+    0) log "--migrate-config 完成（退出码 0）" ;;
+    2) err "--migrate-config 失败：配置不可迁移（退出码 2，文件未被改动）" ;;
+    *) err "--migrate-config 失败：IO/备份失败（退出码 $rc）" ;;
+  esac
+  return 0
+}
+
+# **2.1.18（修复项 1②）**：`--adopt-new-defaults` —— 用包内模板覆盖（写前备份）。
+apply_adopt_new_defaults() {
+  local conf="$1" tpl="$2"
+  if [ ! -f "$tpl" ]; then
+    err "--adopt-new-defaults：包内模板不存在（$tpl）—— 包不完整，已跳过。"
+    return 0
+  fi
+  local ts bak
+  ts="$(date +%Y%m%d%H%M%S 2>/dev/null || echo 0)"
+  bak="$conf.bak.$ts"
+  log "--adopt-new-defaults：备份 $conf → $bak，然后用包内模板覆盖。"
+  cp -p "$conf" "$bak" || { err "备份失败：未覆盖 $conf"; return 0; }
+  install -m 0640 -o "$RUN_USER" -g "$RUN_GROUP" "$tpl" "$conf" || {
+    err "覆盖失败：已保留备份 $bak（原文件可能仍完好）"
+    return 0
+  }
+  log "--adopt-new-defaults 完成（旧配置在 $bak；本地改动**不会**被保留）"
+}
+
+# **2.1.18（修复项 1①）**：安装完成后、`systemctl enable` **之前**，用**已安装的
+# 二进制**对**目标配置**再跑一次 check-config。
+#
+# 为什么必须有第二道：第一道（`preflight_config`）校验的是**包内**配置、
+# 用的是**包内**二进制，而且"包内二进制缺执行位"时还要走临时副本 —— 三种情形都
+# 可能让"预检"与"真正要跑的那份配置/那个二进制"不是同一个东西。安装后复核则
+# **恒等于服务将要面对的现场**（`$BIN_DST` + `$CONF_FILE`），因此预检**永不**因
+# 源权限、包布局或路径差异被绕过。
+#
+# 语义：与第一道一致 —— 默认**非阻断但显著打印**；`--strict-config` /
+# `STRICT_CONFIG=1` 时以退出码 2 中止（此时二进制已装好、配置已就位，
+# 中止只是不 enable/start，便于修好后重跑）。
+postinstall_check_config() {
+  local strict=0
+  [ "${STRICT_CONFIG:-0}" = "1" ] && strict=1
+  [ -x "$BIN_DST" ] && [ -f "$CONF_FILE" ] || return 0
+  local out rc
+  out="$("$BIN_DST" check-config --config "$CONF_FILE" 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    case "$out" in
+      *WARN:*)
+        warn "安装后复核：$CONF_FILE 通过但有告警（来自**已安装**的二进制）："
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        ;;
+      *)
+        log "安装后复核通过（已安装二进制 + 目标配置）：$(printf '%s' "$out" | tail -n1)"
+        ;;
+    esac
+    return 0
+  fi
+  err "════════════════════════════════════════════════════════════════"
+  err "⚠️  安装后复核未通过：$BIN_DST check-config --config $CONF_FILE → 退出码 $rc"
+  err "     （这是服务**将要面对**的那一份二进制与配置，不是包内副本）"
+  err "════════════════════════════════════════════════════════════════"
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  err "修法：① 修正 $CONF_FILE 中的 ERROR；或"
+  err "      ② sudo $0 --migrate-config        # 只做加法补齐缺失键（先备份）"
+  err "      ③ sudo $0 --adopt-new-defaults    # 用包内模板覆盖（先备份）"
+  if [ "$strict" = "1" ]; then
+    err "STRICT_CONFIG=1：已在 enable/start **之前**中止（二进制与配置已就位）。"
+    exit 2
+  fi
+  warn "继续（默认非阻断）：服务可能因该配置异常而启动失败，请留意 journalctl -u $SERVICE。"
+  return 0
+}
+
 uninstall() {
   require_root
   log "停止并禁用服务……"
@@ -134,16 +309,26 @@ uninstall() {
 main() {
   require_root
   # `--strict-config` 等价于 `STRICT_CONFIG=1`（**2.1.17 修复项 1③**）。
-  # 放在 action 解析**之前**：允许 `./install.sh --strict-config start` 与
-  # `./install.sh start --strict-config` 两种写法。
+  # `--migrate-config` / `--adopt-new-defaults`（**2.1.18 修复项 1②**）也会被消费掉，
+  # 不参与 action 解析。放在 action 解析**之前**：允许
+  # `./install.sh --strict-config start` 与 `./install.sh start --strict-config` 两种写法。
   local args=() a
+  local DO_MIGRATE=0 DO_ADOPT=0
   for a in "$@"; do
     case "$a" in
       --strict-config) STRICT_CONFIG=1 ;;
+      --migrate-config) DO_MIGRATE=1 ;;
+      --adopt-new-defaults) DO_ADOPT=1 ;;
       *) args+=("$a") ;;
     esac
   done
   local action="${args[0]:-install}"
+  # **2.1.18（修复项 1②）**：两条旗标都只对"安装/升级已有配置"有意义。
+  # 冲突时以 `--migrate-config` 为准（加法优先，避免误覆盖）。
+  if [ "$DO_MIGRATE" = "1" ] && [ "$DO_ADOPT" = "1" ]; then
+    warn "--migrate-config 与 --adopt-new-defaults 同时给出：以**只做加法**的 --migrate-config 为准。"
+    DO_ADOPT=0
+  fi
   # 卸载不需要产物（BIN_DST/LIB_DIR 是固定系统路径），故预检只对安装路径生效。
   if [ "$action" = "uninstall" ]; then uninstall; exit 0; fi
   preflight_layout
@@ -181,14 +366,31 @@ main() {
   fi
 
   # 4) 配置（不覆盖已有配置）。
+  #
+  # **2.1.18（修复项 1②）**：保留已有配置时不再"只说一句保留"，而是给出
+  # ① `check-config` 结果 ② 缺失键个数/名字 ③ 两条新旗标的用法（见
+  # `inspect_existing_config`）。`--migrate-config` / `--adopt-new-defaults` 在
+  # **这里**执行（要等 `$BIN_DST` 装好、`$CONF_DIR` 属主设好之后）。
+  local tpl_cfg
+  tpl_cfg="$(dirname "$0")/etc/ebpdns/config.json"
   if [ ! -f "$CONF_FILE" ]; then
-    if [ -f "$(dirname "$0")/etc/ebpdns/config.json" ]; then
+    if [ -f "$tpl_cfg" ]; then
       log "安装默认配置 -> $CONF_FILE"
-      install -m 0640 -o "$RUN_USER" -g "$RUN_GROUP" \
-        "$(dirname "$0")/etc/ebpdns/config.json" "$CONF_FILE"
+      install -m 0640 -o "$RUN_USER" -g "$RUN_GROUP" "$tpl_cfg" "$CONF_FILE"
+    fi
+    if [ "$DO_MIGRATE" = "1" ] || [ "$DO_ADOPT" = "1" ]; then
+      warn "本次是**全新安装**（$CONF_FILE 不存在）：迁移/覆盖旗标无事可做（已装包内默认配置）。"
     fi
   else
-    warn "已存在 $CONF_FILE，保留不覆盖。"
+    if [ "$DO_MIGRATE" = "1" ]; then
+      apply_migrate_config "$BIN_DST" "$CONF_FILE"
+      inspect_existing_config "$BIN_DST" "$CONF_FILE"
+    elif [ "$DO_ADOPT" = "1" ]; then
+      apply_adopt_new_defaults "$CONF_FILE" "$tpl_cfg"
+      inspect_existing_config "$BIN_DST" "$CONF_FILE"
+    else
+      inspect_existing_config "$BIN_DST" "$CONF_FILE"
+    fi
   fi
 
   # 5) 状态目录属主。
@@ -224,6 +426,13 @@ main() {
   else
     warn "未找到 setcap，跳过文件能力设置（systemd 单元已含 AmbientCapabilities）。"
   fi
+
+  # 6.5) **2.1.18（修复项 1①）**：安装后、enable/start **之前**的配置复核。
+  #
+  # 用**已安装的二进制**（$BIN_DST）对**目标配置**（$CONF_FILE）再跑一次
+  # `check-config`：这才是服务将要面对的现场。即使前面因为"包内二进制缺执行位"
+  # 走了临时副本、或包内配置与目标配置不是同一份，这一步也**不会**被绕过。
+  postinstall_check_config
 
   # 7) systemd。
   if [ -d /etc/systemd/system ]; then

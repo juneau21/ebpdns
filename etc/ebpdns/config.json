@@ -12,30 +12,35 @@
   },
   "web_root": "",
   "dns_port": 53,
-  "cache_size": 16384,
+  "cache_size": 131072,
   "cache_policy": "tinylfu",
   "cache_partitions": null,
+  "cache_save_interval": 60,
   "ttl": 300,
-  "ttl_min": 0,
-  "ttl_max": 0,
+  "ttl_min": 5,
+  "ttl_max": 300,
   "neg_ttl_max": 60,
   "rfc8020_infer": true,
   "rfc8020_max_labels": 8,
   "config_version": 2,
   "udp_workers": 0,
   "single_flight": true,
-  "warmup": { "enabled": true, "queries": 3, "timeout_ms": 3000 },
+  "warmup": {
+    "enabled": true,
+    "queries": 3,
+    "timeout_ms": 3000
+  },
   "serve_stale": true,
-  "stale_ttl": 120,
+  "stale_ttl": 604800,
   "cache_persist": true,
   "persist_ttl": 0,
   "prefetch": true,
-  "kernel_direct": true,
+  "kernel_direct": false,
   "kernel_cache": false,
   "kernel_cache_iface": "auto",
-  "kernel_cache_max": 65536,
-  "hook": "XDP 原生",
-  "map_type": "LRU_HASH",
+  "kernel_cache_max": 131072,
+  "hook": "xdp",
+  "map_type": "lru",
   "percpu": true,
   "speed_test": true,
   "speed_interval_ms": 2000,
@@ -60,21 +65,23 @@
   "adaptive_timeout_min_ms": 1500,
   "rating_sr_floor": 0.5,
   "ipv6": true,
-  "prefer_ipv4": false,
+  "prefer_ipv4": true,
   "ipv4_first": true,
   "edns": true,
   "edns_udp_size": 1232,
   "edns_client_max_size": 1232,
   "edns_client_subnet": "",
-  "padding": false,
+  "padding": true,
   "dnssec_0x20": true,
   "rebind_protection": true,
   "health_check_interval": 30,
   "health_probe_domain": "www.baidu.com",
   "health_probe_timeout_ms": 2000,
-  "bootstrap_dns": "192.168.0.235:53",
+  "bootstrap_dns": [
+    "223.5.5.5:53"
+  ],
   "log_level": "info",
-  "log_format": "text",
+  "log_format": "plain",
   "rule_sub_interval": 3600,
   "upstreams": [
     {
@@ -163,7 +170,7 @@
       "port": 443,
       "url": "/dns-query",
       "group": "global",
-      "enabled": false
+      "enabled": true
     },
     {
       "id": "google-doh3",
@@ -328,7 +335,7 @@
       "port": 53,
       "url": "",
       "group": "domestic",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "lan235tcp",
@@ -339,7 +346,7 @@
       "port": 53,
       "url": "",
       "group": "domestic",
-      "enabled": true
+      "enabled": false
     }
   ],
   "rules": [],
