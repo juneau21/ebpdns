@@ -1,0 +1,34 @@
+[package]
+name = "ebpdns-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns 解析编排（对齐 Python resolver.py）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+ebpdns-cache = { workspace = true }
+ebpdns-rules = { workspace = true }
+ebpdns-upstream = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+# **2.1.49（AUD-13）**：规则指纹改用 SHA-256（非密码学 FNV-1a 可被构造碰撞）。
+sha2 = "0.11.0"
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "answer_bench"
+harness = false

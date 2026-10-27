@@ -1,0 +1,38 @@
+[package]
+name = "ebpdns-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns LRU+TTL 缓存与持久化（对齐 Python cache.py）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+ebpdns-fs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+# A4 独立基准专用：暴露 `TinyLfuCache::new_with_policy`，让基准能在**同一份实现**上
+# 对比三段比例/晋升闸门。默认关闭 → 生产构建的公开 API 与行为完全不变。
+bench-policy = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "tinylfu_trace"
+harness = false
+# 基准自身不参与 `cargo test`（避免把 1e6 次回放塞进全量测试门槛）。
+test = false
+required-features = ["bench-policy"]

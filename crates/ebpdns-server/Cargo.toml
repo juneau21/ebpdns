@@ -1,0 +1,53 @@
+[package]
+name = "ebpdns-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns HTTP/REST + WebSocket API 与静态资源（对齐 Python api.py/server.py）"
+
+[dependencies]
+ebpdns-fs = { workspace = true }
+ebpdns-proto = { workspace = true }
+ebpdns-resolver = { workspace = true }
+ebpdns-cache = { workspace = true }
+ebpdns-rules = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+# DNS 监听（dns.rs）：只有 socket2 能在 bind 前设 IPV6_V6ONLY=1（tokio/std 的 bind
+# 不带该开关）——否则本机 `[::]:53` 会连 IPv4 的 53 端口一起占住，
+# `0.0.0.0:53` 随即 EADDRINUSE，「双栈同端口」无法成立。
+#
+# **2.1.16（功能 1）**：加 `features = ["all"]` —— `Socket::set_reuse_port` 在
+# socket2 0.5 里属于 `all` 特性门禁的 Unix 扩展（与 `set_reuse_address` 不同，
+# 后者裸默认可用）。`SO_REUSEPORT` 是"每地址 N 个收包 socket、内核按 flow 哈希
+# 分流到多核"的前提，必须在 bind **之前** 设置（bind 后设不生效）。
+socket2 = { workspace = true, features = ["all"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# 2.1.22 阶段一：提交记录的逐 part 摘要（**已在 lock 里**：quinn/rustls 的传递依赖 0.11.0）
+sha2 = "0.11.0"
+rust-embed = { workspace = true }
+parking_lot = { workspace = true }
+url = { workspace = true }
+# 规则订阅（subscribe.rs）：同步阻塞 HTTP 客户端，调用点统一包在
+# tokio::task::spawn_blocking 内；features=["rustls"] → rustls(ring)+webpki-roots 严格校验。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# **2.1.25**：`api.rs` 的 `/api/status.top_upstreams` 等价性用例需要注入一份**真实**
+# `UpstreamRuntime`（把健康计数打进去才能造出非零 `queries`）。**dev-only**：
+# 不进入发布二进制的依赖图（`ebpdns-upstream` 本就在工作区、且是 `ebpdns-resolver`
+# 的直接依赖，因此 `Cargo.lock` 不新增任何包）。
+ebpdns-upstream = { workspace = true }
+# **2.1.46**：`rebind_blocked` 正向测试需要驱动真实的 axum 中间件（`oneshot`）。
+# 该 crate 已在工作区依赖图中（axum 自身依赖），不新增锁文件包。
+tower = { workspace = true }
+
+[features]
+default = []
+# 嵌入前端 dist（打包/发布时启用）
+embed-frontend = []

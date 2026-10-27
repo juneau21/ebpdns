@@ -1,0 +1,12 @@
+[package]
+name = "ebpdns-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns 崩溃安全文件写入原语（tmp→fsync→rename→fsync(dir) 的单一实现）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
