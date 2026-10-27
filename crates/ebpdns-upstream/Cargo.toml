@@ -1,0 +1,25 @@
+[package]
+name = "ebpdns-upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns 六协议上游 + 连接池 + 健康检查（对齐 Python upstream/quic_upstream/probe）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+quinn = { workspace = true }
+webpki-roots = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
