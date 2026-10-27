@@ -1,0 +1,60 @@
+[package]
+name = "ebpdns-web"
+# 与根 workspace 的 [workspace.package] version 保持一致（**版本号不在此注释里写死**，
+# 见 2.1.16 修复项 12：注释写死版本号必然随发版变成"旧版本残留"）。
+# 前端**显示**的版本不读这里，而是由 build.rs 从根 Cargo.toml 注入
+# `EBPDNS_VERSION`（单一来源），页脚/关于页因此不会漂移。
+version = "2.1.49"
+edition = "2021"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+authors = ["ebpdns"]
+description = "ebpdns Web 控制台（Leptos CSR → WASM，逐页复刻 v1.9.162 web/index.html）"
+build = "build.rs"
+
+# 独立 workspace：web/ 已从根 rust200/Cargo.toml 的 members 中 exclude，
+# 这里给一个空 [workspace]，避免被根 native workspace（含 axum/tokio）污染。
+[workspace]
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures-lite = "2"
+url = "2"
+console_error_panic_hook = "0.1"
+log = "0.4"
+console_log = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Location",
+    "Storage",
+    "Navigator",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "Element",
+    "Node",
+    "Event",
+    "EventTarget",
+    "MouseEvent",
+    "KeyboardEvent",
+    "ScrollToOptions",
+    "VisibilityState",
+] }
+
+# WASM 体积优先；与根 workspace 一致的发布 profile（thin LTO，2 核机器编译更友好）。
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+panic = "abort"

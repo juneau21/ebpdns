@@ -1,0 +1,69 @@
+[Unit]
+Description=ebpdns local recursive DNS (Rust v2.1.49)
+Documentation=https://github.com/ebpdns/ebpdns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ebpdns
+Group=ebpdns
+WorkingDirectory=/var/lib/ebpdns
+ExecStart=/usr/local/bin/ebpdns --config /etc/ebpdns/config.json --foreground
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# /api/restart 以退出码 3 退出，交由 systemd 自动拉起。
+RestartPreventExitStatus=0
+SuccessExitStatus=0
+
+# 仅需绑定 53 等低端口（2.1.29 起内核态缓存已移除，不再申请其它能力）。
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# 安全加固。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+# `ProtectSystem=strict` 把整个文件系统挂成只读，必须显式列出运行期要写的目录：
+#   /etc/ebpdns    —— config.json / rules_local.json / rules_sub.json 的原子写回
+#                     （配置保存、规则 CRUD、订阅元信息；v1.9.162 单元同样是这个路径）
+#   /var/lib/ebpdns—— 缓存持久化
+# 漏掉 /etc/ebpdns 会让所有保存操作 `Permission denied (os error 13)` → 控制台 500。
+ReadWritePaths=/etc/ebpdns /var/lib/ebpdns
+StateDirectory=ebpdns
+ConfigurationDirectory=ebpdns
+# 与 `install.sh` 的 `chmod 750 /etc/ebpdns` 一致：显式声明目录模式，否则 systemd 用
+# 默认 0755，而目录已存在且是 750 → 每次启动都打
+# `ConfigurationDirectory 'ebpdns' already exists but the mode is different.
+#  (File system: 750 ConfigurationDirectoryMode: 755)`（误导性告警，且重启不消除）。
+ConfigurationDirectoryMode=0750
+
+# **A6（2.1.9）：fd 软限必须显式抬到 65535。**
+#
+# 现象（2.1.8 真机实测）：单元里**没有任何 LimitNOFILE 行** → systemd 只给内核默认的
+# 硬限 524288 / **软限 1024**。`/proc/<pid>/limits` 实测
+#   `Max open files   1024   524288   files`
+# 即进程**只能开 1024 个 fd**。这与连接复用池叠加后风险很高：
+#   - 每个 DoH/DoT 上游键（`(proto,host,port,path)`）可留 ≤ MAX_CONN(4) 个连接；
+#   - 上游数量 × 每键连接 + 客户端 TCP 连接（每连接 1 fd，连接槽 256）
+#     + QUIC 每上游 endpoint/连接 fd；
+#   - 一旦触顶就是 `Too many open files` → **全部上游随机失败**（比"慢"更难归因，
+#     且日志里往往只看到零散 IO 错误）。
+# 抬到 65535（远低于硬限 524288，不触碰内核上限，也不需要 CAP_SYS_RESOURCE）后，
+# fd 不再是瓶颈；配合 `pool.rs` 的空闲连接总量上限（MAX_TOTAL_IDLE=256），
+# 高并发下 fd 占用有确定上界。
+#
+# 与既有沙箱项**无冲突**：`LimitNOFILE` 属于 rlimit 设置，与
+# `ProtectSystem`/`PrivateTmp`/`RestrictNamespaces` 等命名空间/挂载项正交；
+# `systemd-analyze verify` 通过（见 2.1.9 报告 A6 段）。
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
