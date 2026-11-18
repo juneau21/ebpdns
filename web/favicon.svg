@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- ebpdns favicon: 深色圆角面板 + DNS 解析地球仪 + 解析波纹 -->
+  <rect width="48" height="48" rx="10" fill="#0d141e"/>
+  <circle cx="24" cy="24" r="12.5" fill="none" stroke="#2ee6c8" stroke-width="2"/>
+  <!-- 经线 -->
+  <ellipse cx="24" cy="24" rx="5.5" ry="12.5" fill="none" stroke="#2ee6c8" stroke-width="1.4" opacity="0.85"/>
+  <!-- 纬线 -->
+  <line x1="11.5" y1="24" x2="36.5" y2="24" stroke="#2ee6c8" stroke-width="1.4" opacity="0.85"/>
+  <ellipse cx="24" cy="24" rx="12.5" ry="5" fill="none" stroke="#2ee6c8" stroke-width="1.2" opacity="0.6"/>
+  <!-- 解析点: 域名请求 → 应答 -->
+  <circle cx="24" cy="24" r="2.2" fill="#ffb454"/>
+  <path d="M35 13 q4 2 5 6" fill="none" stroke="#5b8def" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M13 35 q-4 -2 -5 -6" fill="none" stroke="#45d98c" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

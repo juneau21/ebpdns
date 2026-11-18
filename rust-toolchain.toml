@@ -1,0 +1,10 @@
+# Rust 工具链固定配置（ebpdns Rust 版；**刻意不写版本号** —— 见 2.1.17 修复项 8：
+# 带版本号的注释每次发版都会变成"旧版本残留"，且任何门禁都发现不了。
+# 版本单一来源 = 根 Cargo.toml 的 [workspace.package] version）。
+# 默认使用 stable。
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["wasm32-unknown-unknown"]
+
+# 前端构建还需 wasm-bindgen-cli（与 wasm-bindgen 版本一致）。

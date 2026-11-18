@@ -1,0 +1,13 @@
+[package]
+name = "pollsim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 独立 crate：用 include! 复用 web/src/poll_policy.rs（前端运行时同一份策略代码），
+# 在 native 上以假时钟统计 /api/* 请求数。空 [workspace] 避免挂到根 workspace。
+[workspace]
+
+[[bin]]
+name = "pollsim"
+path = "src/main.rs"
