@@ -1,0 +1,25 @@
+[package]
+name = "ebpdns-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns 规则引擎（对齐 Python resolver 规则段 + 订阅解析）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+once_cell = { workspace = true }
+lru = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "rule_bench"
+harness = false
