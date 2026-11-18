@@ -1,0 +1,34 @@
+[package]
+name = "ebpdns-upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns 四协议上游（UDP/TCP/DoH/DoH3）+ 连接池 + 健康检查（对齐 Python upstream/quic_upstream/probe）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+quinn = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pemfile = { workspace = true }
+sha2 = "0.11.0"
+base64 = "0.22"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+# **2.1.50（P0-3）**：DoH 出站 HTTP/2 多路复用（h2 客户端 on tokio-rustls TLS）。
+h2 = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tempfile = "3"
