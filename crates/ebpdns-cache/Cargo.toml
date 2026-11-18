@@ -1,0 +1,26 @@
+[package]
+name = "ebpdns-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ebpdns LRU+TTL 缓存与持久化（对齐 Python cache.py）"
+
+[dependencies]
+ebpdns-proto = { workspace = true }
+ebpdns-fs = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "cache_bench"
+harness = false
